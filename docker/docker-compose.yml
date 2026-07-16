@@ -1,0 +1,226 @@
+# 7-core-node + redis + 3-signer stack -- the full topology from the plan doc
+# (../doc/weekly-integration-test-plan.md, section 3b), built on top of the minimal
+# 1-tapyrusd predecessor stack that was verified end-to-end (see the plan doc section 8
+# and README.md "Docker Compose -- verified end-to-end").
+#
+# STATUS: verified end-to-end. Brought up for real (all 7 core nodes + redis + 3
+# signer-set-a containers), with real ceremony output (see README.md "Docker Compose
+# -- 7-node topology" for the full writeup): getpeerinfo on every node confirmed the
+# P2P graph matches the intended topology exactly (each -a node has exactly its -b
+# sibling as a peer, each -b node has its -a parent plus core-7, core-7 has exactly
+# the three -b nodes), and the signer network produced real signed blocks that
+# propagated to all 7 nodes -- including core-7, which has no signer attached and
+# only ever saw those blocks via P2P relay (confirmed via core-7's own UpdateTip log
+# lines). Two real bugs were found and fixed along the way -- see "CONNECT/LISTEN
+# DESIGN" and "COMMAND OVERRIDE" below.
+#
+# CORE IMAGE: uses tapyrus/tapyrusd:master-local, built locally from tapyrus-core's
+# real master branch (not the published :v0.7.1 tag) -- see README.md "Building
+# tapyrusd from tapyrus-core master" for how, and why building it locally had
+# previously appeared broken (stale local image tag, not a real bug). Re-verified
+# the full topology + ceremony against this master build with identical results to
+# the v0.7.1 run (same peer counts, chain advanced to height 1 across all 7 nodes).
+#
+# Topology (plan doc section 3b):
+#   first layer:  core-1a, core-2a, core-3a  -- each is the RPC target for one signer
+#                 (signer-0 -> core-1a, signer-1 -> core-2a, signer-2 -> core-3a)
+#   second layer: core-1b, core-2b, core-3b  -- each P2P-connected only to its
+#                 corresponding first-layer node
+#   core-7:       P2P-connected to ALL THREE second-layer nodes (core-1b, core-2b,
+#                 core-3b) -- the plan doc's own wording ("any two ... e.g.") only
+#                 specifies two, which would leave core-3a/core-3b as an isolated
+#                 island with no path to the other 5 nodes. Connecting to all three
+#                 keeps the network connected, which the sync/lifecycle/reorg scenario
+#                 steps depend on. Deliberate deviation from the doc's literal wording --
+#                 confirmed with the team, not an oversight.
+#
+# All 7 nodes stay on this one flat compose network (not segmented into separate
+# Docker networks per edge) -- deliberately, per the plan doc, so a future adversary
+# node (connecting P2P to two first-layer nodes) remains buildable without rework.
+#
+# CONNECT/LISTEN DESIGN, READ BEFORE EDITING -- found live, not documented anywhere
+# upstream: tapyrus-core (like the bitcoind it forks) auto-disables listening the
+# moment -connect is set at all (`InitParameterInteraction: -connect set ->
+# setting -listen=0`). An earlier draft of this file put -connect on BOTH ends of
+# every edge (to symmetrically restrict each node's own outbound dialing) -- that
+# silently gave every node -listen=0, so NEITHER end of any edge could ever accept
+# the other's inbound connection, and every node spun forever on
+# "connect() ... Connection refused". Confirmed by checking node logs directly.
+#
+# Fixed topology, one -connect per edge (the "child" dials its "parent"), with an
+# explicit -listen=1 added back wherever a node also needs to accept an inbound edge:
+#   - core-1a/2a/3a: no -connect at all -- nothing else to restrict (discover=0
+#     already in the image's default tapyrus.conf, no addnode configured), and they
+#     only ever need to ACCEPT the inbound connection from their -b sibling, which
+#     plain default listen=1 (untouched, since they never set -connect) already covers.
+#   - core-1b/2b/3b: `-connect=core-Na` (dials its first-layer parent) PLUS an
+#     explicit `-listen=1` (to undo the auto-disable) since core-7 also needs to dial
+#     IN to each of these.
+#   - core-7: `-connect=core-1b -connect=core-2b -connect=core-3b` (dials all three
+#     second-layer nodes) -- no -listen=1 needed, nothing ever dials into core-7.
+#
+# COMMAND OVERRIDE (separate issue, also found live): tapyrus/tapyrusd:master-local's
+# entrypoint.sh does NOT exec "$@" -- it does `exec bash -c "$*"` against the image's
+# default CMD (`tapyrusd -datadir=${DATA_DIR} -conf=${CONF_DIR}/tapyrus.conf`), and
+# docker-compose's `command:` REPLACES that default CMD entirely rather than appending
+# to it. So every core-* service with a command override below must repeat that full
+# default command verbatim and then append its own flags -- a bare
+# `command: [-connect=core-1b]` was tried first and crashed every such container
+# (`bash -c "-connect=core-1b"` -> "invalid option"), confirmed live.
+# `${DATA_DIR}`/`${CONF_DIR}` are escaped as `$${DATA_DIR}`/`$${CONF_DIR}` so docker
+# compose passes them through literally for entrypoint.sh's own bash -c to expand at
+# container-start time, instead of compose itself substituting them (empty, since
+# those vars only exist inside the container) at config-parse time.
+#
+# How to bring this up: same ceremony steps as before (see README.md "Try it"), but
+# assemble-signer-configs.sh now needs a per-signer RPC-host file (one first-layer core
+# node per signer), not a single shared host -- see that script's usage comment.
+services:
+  redis:
+    image: redis:5.0-alpine
+    command: redis-server
+
+  # --- first layer: one per signer, each an RPC target. No -connect needed --
+  # (see "CONNECT/LISTEN DESIGN" above) -- these just accept their -b sibling's
+  # inbound connection via plain default listen=1.
+  core-1a:
+    image: tapyrus/tapyrusd:master-local
+    environment:
+      GENESIS_BLOCK_WITH_SIG: ${GENESIS_BLOCK_WITH_SIG}
+    ports:
+      - '12381:12381'
+
+  core-2a:
+    image: tapyrus/tapyrusd:master-local
+    environment:
+      GENESIS_BLOCK_WITH_SIG: ${GENESIS_BLOCK_WITH_SIG}
+    ports:
+      - '12383:12381'
+
+  core-3a:
+    image: tapyrus/tapyrusd:master-local
+    environment:
+      GENESIS_BLOCK_WITH_SIG: ${GENESIS_BLOCK_WITH_SIG}
+    ports:
+      - '12385:12381'
+
+  # --- second layer: dials its first-layer parent, and re-enables listen=1 --
+  # so core-7 can also dial in to it.
+  core-1b:
+    image: tapyrus/tapyrusd:master-local
+    environment:
+      GENESIS_BLOCK_WITH_SIG: ${GENESIS_BLOCK_WITH_SIG}
+    command: tapyrusd -datadir=$${DATA_DIR} -conf=$${CONF_DIR}/tapyrus.conf -connect=core-1a -listen=1
+    ports:
+      - '12382:12381'
+
+  core-2b:
+    image: tapyrus/tapyrusd:master-local
+    environment:
+      GENESIS_BLOCK_WITH_SIG: ${GENESIS_BLOCK_WITH_SIG}
+    command: tapyrusd -datadir=$${DATA_DIR} -conf=$${CONF_DIR}/tapyrus.conf -connect=core-2a -listen=1
+    ports:
+      - '12384:12381'
+
+  core-3b:
+    image: tapyrus/tapyrusd:master-local
+    environment:
+      GENESIS_BLOCK_WITH_SIG: ${GENESIS_BLOCK_WITH_SIG}
+    command: tapyrusd -datadir=$${DATA_DIR} -conf=$${CONF_DIR}/tapyrus.conf -connect=core-3a -listen=1
+    ports:
+      - '12386:12381'
+
+  # --- node 7: dials all three second-layer nodes; nothing dials into it, so
+  # no -listen=1 override needed here.
+  core-7:
+    image: tapyrus/tapyrusd:master-local
+    environment:
+      GENESIS_BLOCK_WITH_SIG: ${GENESIS_BLOCK_WITH_SIG}
+    command: >-
+      tapyrusd -datadir=$${DATA_DIR} -conf=$${CONF_DIR}/tapyrus.conf
+      -connect=core-1b -connect=core-2b -connect=core-3b
+    ports:
+      - '12387:12381'
+
+  # --- signer-set-a: RPC target is each signer's first-layer node ----------
+  signer-0:
+    image: tapyrus-signer:federation-setup-review
+    volumes:
+      - ../runtime/signers/node-0:/etc/tapyrus
+    depends_on:
+      - redis
+      - core-1a
+
+  signer-1:
+    image: tapyrus-signer:federation-setup-review
+    volumes:
+      - ../runtime/signers/node-1:/etc/tapyrus
+    depends_on:
+      - redis
+      - core-2a
+
+  signer-2:
+    image: tapyrus-signer:federation-setup-review
+    volumes:
+      - ../runtime/signers/node-2:/etc/tapyrus
+    depends_on:
+      - redis
+      - core-3a
+
+  # --- tapyrus-seeder: previously deferred out of v1 scope (see plan doc section 1/6 --
+  # container DNS already handles peer discovery for this test, so the seeder was never
+  # load-bearing) -- added back for its own coverage. Crawls the network starting from
+  # core-1a and serves the resulting address list over DNS. -i/-s use OUR dev network id
+  # (1905960821, port 12383 -- see tapyrusd's default [dev] tapyrus.conf) and P2P port,
+  # not the image's default ENTRYPOINT (which hardcodes chaintope's real production
+  # seed/network id) -- entrypoint is fully overridden below rather than appended to,
+  # since this image's ENTRYPOINT is a plain JSON-array exec form (no bash -c wrapper
+  # like tapyrusd's, so no COMMAND OVERRIDE gotcha here). -h/-n/-m are placeholder
+  # values -- harmless, since nothing outside this compose network ever queries them.
+  #
+  # Image built locally from a patched branch (`docker-build-fix`, on top of this repo's
+  # own local `tapyrus-seeder` checkout) -- the upstream Dockerfile/source as-is has FOUR
+  # real bugs, all found and fixed here, all confirmed live:
+  #   1. Build failure: Alpine 3.7's g++ rejects a designated-initializer used for
+  #      `struct msghdr` in dns.cpp as "non-trivial" (not architecture-specific -- fails
+  #      identically on linux/arm64 and linux/amd64). Fixed with plain field assignment
+  #      instead of the designated initializer (same semantics).
+  #   2. Runtime segfault on first real connection: `char filename[25]` in main.cpp is
+  #      too small for its own sprintf format strings (`tapyrusdnsstats_%d.log` alone
+  #      needs up to 31 bytes for a 10-digit network id) -- overflows even for the
+  #      image's own default hardcoded production network id, not just ours. Caught by
+  #      Alpine/musl's fortified sprintf (SIGTRAP), confirmed via gdb + a core dump.
+  #      Fixed by bumping both `filename` buffers to 64 bytes.
+  #   3/4. Two data races (intermittent crash, ~1/3 of runs, even after fixes 1-2) found
+  #      with a ThreadSanitizer build on ubuntu:22.04 (musl/Alpine has weak TSan support,
+  #      so this diagnostic step used a separate glibc-based build, same source): (a)
+  #      dns.cpp's global `listenSocket` was checked-and-created with no synchronization
+  #      across the 4 concurrent DNS threads -- fixed with a mutex. (b) main.cpp's
+  #      per-crawler-thread `ThreadCrawler_options` was stack-allocated inside the
+  #      spawning loop, reused by the next iteration before the new thread reliably read
+  #      it -- fixed by heap-allocating it (never freed, matching this process's existing
+  #      long-running-daemon style for its DNS-thread options).
+  # VERIFIED END-TO-END after all four fixes: 8/8 consecutive docker-compose restarts
+  # stayed up (vs. failing on the first run pre-fix-1/2, then ~1/3 of restarts pre-fix-3/4);
+  # 0 ThreadSanitizer races across 8 runs (vs. 3 races on every run before); `dig` against
+  # the running container returned a real discovered peer address once the crawl had run
+  # long enough to vet one.
+  seeder:
+    image: tapyrus-seeder:integration-test
+    entrypoint:
+      - tapyrusseed
+      - -i
+      - '1905960821'
+      - -s
+      - '1905960821:core-1a:12383'
+      - -h
+      - seed.tapyrus-integration-tests.local
+      - -n
+      - ns.tapyrus-integration-tests.local
+      - -m
+      - test.tapyrus-integration-tests.local
+    ports:
+      - '5390:53/udp'
+      - '5390:53/tcp'
+    depends_on:
+      - core-1a
