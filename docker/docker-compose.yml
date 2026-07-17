@@ -1,25 +1,11 @@
-# 7-core-node + redis + 3-signer stack -- the full topology from the plan doc
-# (../doc/weekly-integration-test-plan.md, section 3b), built on top of the minimal
-# 1-tapyrusd predecessor stack that was verified end-to-end (see the plan doc section 8
-# and README.md "Docker Compose -- verified end-to-end").
+# 7-core-node + redis + 3-signer stack --
 #
 # STATUS: verified end-to-end. Brought up for real (all 7 core nodes + redis + 3
-# signer-set-a containers), with real ceremony output (see README.md "Docker Compose
-# -- 7-node topology" for the full writeup): getpeerinfo on every node confirmed the
-# P2P graph matches the intended topology exactly (each -a node has exactly its -b
-# sibling as a peer, each -b node has its -a parent plus core-7, core-7 has exactly
-# the three -b nodes), and the signer network produced real signed blocks that
-# propagated to all 7 nodes -- including core-7, which has no signer attached and
-# only ever saw those blocks via P2P relay (confirmed via core-7's own UpdateTip log
-# lines). Two real bugs were found and fixed along the way -- see "CONNECT/LISTEN
-# DESIGN" and "COMMAND OVERRIDE" below.
+# signer-set-a containers). Two real bugs were found and fixed along the way --
+# see "CONNECT/LISTEN DESIGN" and "COMMAND OVERRIDE" below.
 #
 # CORE IMAGE: uses tapyrus/tapyrusd:master-local, built locally from tapyrus-core's
-# real master branch (not the published :v0.7.1 tag) -- see README.md "Building
-# tapyrusd from tapyrus-core master" for how, and why building it locally had
-# previously appeared broken (stale local image tag, not a real bug). Re-verified
-# the full topology + ceremony against this master build with identical results to
-# the v0.7.1 run (same peer counts, chain advanced to height 1 across all 7 nodes).
+# real master branch.
 #
 # Topology (plan doc section 3b):
 #   first layer:  core-1a, core-2a, core-3a  -- each is the RPC target for one signer
@@ -38,43 +24,7 @@
 # Docker networks per edge) -- deliberately, per the plan doc, so a future adversary
 # node (connecting P2P to two first-layer nodes) remains buildable without rework.
 #
-# CONNECT/LISTEN DESIGN, READ BEFORE EDITING -- found live, not documented anywhere
-# upstream: tapyrus-core (like the bitcoind it forks) auto-disables listening the
-# moment -connect is set at all (`InitParameterInteraction: -connect set ->
-# setting -listen=0`). An earlier draft of this file put -connect on BOTH ends of
-# every edge (to symmetrically restrict each node's own outbound dialing) -- that
-# silently gave every node -listen=0, so NEITHER end of any edge could ever accept
-# the other's inbound connection, and every node spun forever on
-# "connect() ... Connection refused". Confirmed by checking node logs directly.
 #
-# Fixed topology, one -connect per edge (the "child" dials its "parent"), with an
-# explicit -listen=1 added back wherever a node also needs to accept an inbound edge:
-#   - core-1a/2a/3a: no -connect at all -- nothing else to restrict (discover=0
-#     already in the image's default tapyrus.conf, no addnode configured), and they
-#     only ever need to ACCEPT the inbound connection from their -b sibling, which
-#     plain default listen=1 (untouched, since they never set -connect) already covers.
-#   - core-1b/2b/3b: `-connect=core-Na` (dials its first-layer parent) PLUS an
-#     explicit `-listen=1` (to undo the auto-disable) since core-7 also needs to dial
-#     IN to each of these.
-#   - core-7: `-connect=core-1b -connect=core-2b -connect=core-3b` (dials all three
-#     second-layer nodes) -- no -listen=1 needed, nothing ever dials into core-7.
-#
-# COMMAND OVERRIDE (separate issue, also found live): tapyrus/tapyrusd:master-local's
-# entrypoint.sh does NOT exec "$@" -- it does `exec bash -c "$*"` against the image's
-# default CMD (`tapyrusd -datadir=${DATA_DIR} -conf=${CONF_DIR}/tapyrus.conf`), and
-# docker-compose's `command:` REPLACES that default CMD entirely rather than appending
-# to it. So every core-* service with a command override below must repeat that full
-# default command verbatim and then append its own flags -- a bare
-# `command: [-connect=core-1b]` was tried first and crashed every such container
-# (`bash -c "-connect=core-1b"` -> "invalid option"), confirmed live.
-# `${DATA_DIR}`/`${CONF_DIR}` are escaped as `$${DATA_DIR}`/`$${CONF_DIR}` so docker
-# compose passes them through literally for entrypoint.sh's own bash -c to expand at
-# container-start time, instead of compose itself substituting them (empty, since
-# those vars only exist inside the container) at config-parse time.
-#
-# How to bring this up: same ceremony steps as before (see README.md "Try it"), but
-# assemble-signer-configs.sh now needs a per-signer RPC-host file (one first-layer core
-# node per signer), not a single shared host -- see that script's usage comment.
 services:
   redis:
     image: redis:5.0-alpine
