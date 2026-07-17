@@ -10,10 +10,11 @@ Legend: `[x]` done and verified -- `[~]` verified by hand, not yet wired into CI
 
 ## Milestone 1 -- Repo scaffolding
 
-- [x] `config/repos.env` + `scripts/checkout-repos.sh` (all 3 repos: tapyrus-core, tapyrus-signer, tapyrus-seeder -- each ref independently configurable via CI variable)
-- [x] `scripts/generate-dev-secrets.sh` (aggpubkey ceremony)
-- [x] `scripts/sign-genesis.sh` (genesis-signing ceremony)
-- [x] `scripts/assemble-signer-configs.sh` (per-node `federations.toml` + `tapyrus-signer.toml`)
+- [x] `config/repos.py` + `scripts/checkout_repos.py` (all 3 repos: tapyrus-core, tapyrus-signer, tapyrus-seeder -- each ref independently configurable via CI variable)
+- [x] `scripts/generate_dev_secrets.py` (aggpubkey ceremony)
+- [x] `scripts/sign_genesis.py` (genesis-signing ceremony)
+- [x] `scripts/assemble_signer_configs.py` (per-node `federations.toml` + `tapyrus-signer.toml`)
+- [x] All four scripts use Python (class-based: `RepoCheckout`, `AggpubkeyCeremony`, `GenesisSigningCeremony`, `SignerConfigAssembler`), plus a uniform leveled/timestamped logger (`scripts/lib/log.py`) shared across all of them
 - [x] `docker/docker-compose.yml` (7-core-node + redis + 3-signer + seeder topology)
 - [x] `.github/workflows/weekly-integration-test.yml` skeleton (steps present, most bodies are TODO placeholders)
 - [x] Repo pushed to its real GitHub home (`chaintope/tapyrus-integration-tests`)
@@ -26,6 +27,7 @@ Legend: `[x]` done and verified -- `[~]` verified by hand, not yet wired into CI
 - [x] `tapyrus-seeder` integrated as a compose service; four real upstream bugs found and fixed (build failure, sprintf buffer overflow, two data races), verified via 8/8 clean restarts + 0 TSan races + live `dig` resolution
 - [x] Signer RPC-connectivity requirement confirmed: `tapyrus-signerd` needs a live RPC connection to its own core node even as a non-master over Redis (no Redis-only fallback)
 - [x] Reorg (scenario step 8): full two-group fork-and-reconverge run for real, confirmed via `getchaintips` (`valid-fork`, correct `branchlen`)
+- [x] Re-verified fresh, end-to-end, through the new Python scripts (not the original bash scripts)
 
 See [`work-done.md`](work-done.md) for the full transcripts.
 
@@ -34,17 +36,17 @@ See [`work-done.md`](work-done.md) for the full transcripts.
 - [ ] Per-node transaction generation (TPC + colored-coin mix, deterministic PRNG seeding) -- blocks today only ever contain the coinbase transaction
 - [ ] Per-node lifecycle orchestrator (RPC health/height/mempool query, stop, restart, confirm resync)
 - [ ] Max-block-size (xfield) change -- push, confirm an over-limit block is rejected and an in-limit block is accepted
-- [ ] Aggpubkey rotation handoff -- `--xfield` `sign`/`computesig` flow (current federation signs off on the new one) and a `federations.toml` writer that can append a second entry (today's `assemble-signer-configs.sh` only ever writes one `[[federation]]` entry)
+- [ ] Aggpubkey rotation handoff -- `--xfield` `sign`/`computesig` flow (current federation signs off on the new one) and a `federations.toml` writer that can append a second entry (today's `assemble_signer_configs.py` only ever writes one `[[federation]]` entry)
 
 ## Milestone 4 -- Wire verified/built pieces into actual CI
 
 Each of these corresponds to a `TODO` placeholder step in
 `.github/workflows/weekly-integration-test.yml`:
 
-- [x] `tapyrus-seeder` checkout in CI (`SEEDER_REPO_URL`/`SEEDER_REPO_REF` added to `config/repos.env`, wired into `checkout-repos.sh` and the `seeder_repo_ref` CI variable)
-- [ ] `tapyrus-seeder` image build in CI -- still a TODO placeholder step; needs the actual `docker build` invocation against `workdir/tapyrus-seeder`, and `SEEDER_REPO_REF` overridden to a branch with the fixes in `work-done.md` once one is pushed
-- [ ] Unsigned genesis build step (`tapyrus-genesis`) -- decide native binary vs. `docker run` against the built image for a CI runner, not yet verified either way
-- [ ] Topology-convergence wait step -- poll `getconnectioncount` on all 7 nodes for the expected 1/2/1/2/1/2/3 pattern; add compose healthchecks + `depends_on: condition: service_healthy`
+- [x] `tapyrus-seeder` checkout in CI (`SEEDER_REPO_URL`/`SEEDER_REPO_REF` added to `config/repos.py`, wired into `checkout_repos.py` and the `seeder_repo_ref` CI variable)
+- [x] `tapyrus-seeder` image build in CI -- inline `docker build` (same `DOCKER_BUILD_PLATFORM` pattern as the core/signer builds), tagged `tapyrus-seeder:integration-test` to match `docker/docker-compose.yml`'s `seeder` service. Will still fail until `seeder_repo_ref` is overridden to a branch with the fixes in `work-done.md` -- `SEEDER_REPO_REF` defaults to `master`, which lacks them.
+- [x] Unsigned genesis build step (`tapyrus-genesis`) -- resolved toward `docker run --entrypoint tapyrus-genesis` against the already-built `tapyrus/tapyrusd:master-local` image (bypassing the image's daemon-oriented `entrypoint.sh` entirely), rather than a native binary from a second, separately-built copy -- guarantees the unsigned genesis matches the exact tapyrus-core commit under test. Not yet run against a real CI runner.
+- [x] Topology-convergence wait step -- `scripts/wait_for_topology.py` (`TopologyWaiter` class) polls `getconnectioncount` on all 7 nodes' published RPC ports for the expected 1/2/1/2/1/2/3 pattern, with a timeout and per-node mismatch reporting. Tested against fake local RPC servers (converge-over-time, timeout, and unreachable-node paths). Still open: `docker/docker-compose.yml` doesn't yet have compose-level healthchecks + `depends_on: condition: service_healthy` (plan doc section 3 step 6) -- this script is a CI-level equivalent, but the compose-file enhancement itself is separate, unstarted work.
 - [ ] Orchestrator step for per-node tx/query/lifecycle + max-block-size change (depends on Milestone 3 pieces existing first)
 - [ ] Reorg scripted as a reusable CI step (recipe is verified by hand -- see `work-done.md` -- but every command was typed against a live stack, not captured as a script)
 - [ ] Rotation step scripted (signer-set-b ceremony + `--xfield` handoff + config regen/restart at scheduled height)
@@ -55,19 +57,10 @@ Each of these corresponds to a `TODO` placeholder step in
 
 - [x] Dedicated repo exists (`chaintope/tapyrus-integration-tests`)
 - [ ] Team review/sign-off on the design in `weekly-integration-test-plan.md`
-- [ ] Decide `tapyrus-signer` source: point `config/repos.env` at `chaintope/tapyrus-signer`'s own `master` (confirmed to already have the ceremony, see plan doc section 1/5) instead of the `Naviabheeman` fork's `163_federationChangeTomlSetup` branch
+- [ ] Switch `tapyrus-signer` source to `master`: `chaintope/tapyrus-signer`'s own `master` already has the base ceremony (createkey/createnodevss/aggregate/genesis-signing, confirmed nearly identical, see plan doc section 1/5) -- `163_federationChangeTomlSetup` is only actually required for federation CHANGE/rotation (`--xfield` sign/computesig, multi-entry `federations.toml`), which `master` doesn't have yet. Switch `config/repos.py`'s default once this integration test has validated `163_federationChangeTomlSetup`'s rotation support for real (Milestone 3/4's rotation items) and that work has landed on `master`.
 - [ ] Slack webhook URL provisioned as a GitHub Actions secret
 - [ ] Confirm a GitHub-hosted runner (`ubuntu-latest`) has enough CPU/disk for 7 core nodes + 3 signers + redis, or move to self-hosted
 
-## Housekeeping -- resolved
-
-- ~~`config/repos.env` pointed at a nonexistent `doc/proposals/weekly-integration-test-plan.md`
-  path and a since-moved `README.md`.~~ Fixed: comments now point at
-  `doc/weekly-integration-test-plan.md` and `doc/legacy-readme.md`.
-- ~~`config/repos.env`'s header comment claimed tapyrus-seeder was "intentionally not
-  included yet".~~ Fixed: all three repos (`SIGNER_REPO_*` / `CORE_REPO_*` /
-  `SEEDER_REPO_*`) are now defined there, each independently configurable via a CI
-  variable (`core_repo_ref` / `signer_repo_ref` / `seeder_repo_ref`).
 
 ## Non-goals for v1
 

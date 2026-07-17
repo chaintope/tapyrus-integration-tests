@@ -1,26 +1,63 @@
 # Scripts reference
 
-What each script/config file under `scripts/` and `config/` does, in the order the CI
-workflow calls them. See the root [`README.md`](../README.md) for how these fit into
-the overall CI flow, and [`weekly-integration-test-plan.md`](weekly-integration-test-plan.md)
-section 4a for the full ceremony design these scripts implement.
+What each script/config file under `scripts/` and `config/` does: usage, arguments,
+output, and known limitations, in the order the CI workflow calls them. See the root
+[`README.md`](../README.md) for how these fit into the overall CI flow,
+[`weekly-integration-test-plan.md`](weekly-integration-test-plan.md) section 4a for
+the full ceremony design these scripts implement, and [`work-done.md`](work-done.md)
+for gotchas found the hard way, bugs fixed, and design-decision rationale.
 
-## `config/repos.env`
+All scripts are Python 3 (stdlib only, no third-party dependencies), executable
+directly (`./scripts/<name>.py ...`) or via `python3 scripts/<name>.py ...`. Every
+script that does subprocess or network I/O is `asyncio`-based, and runs independent
+operations concurrently (e.g. checking out 3 repos, or polling 7 nodes) rather than
+looping over them one at a time -- see [`README.md`](../README.md)'s "Developer
+notes" for the convention. `assemble_signer_configs.py` is the one exception: it's
+pure local file I/O with nothing to overlap, so it stays a plain synchronous script.
 
-Default checkout targets for the three repos this test spans, sourced by
-`checkout-repos.sh`. Each repo's `*_REF` is independently configurable per CI run --
+## `scripts/lib/`
+
+Shared code the four scripts below import rather than duplicate:
+
+- `lib/log.py` -- the uniform, leveled, timestamped logger (`log.step/info/warn/error`)
+  every script uses for its own narration. Separate from container log collection (the
+  workflow's "Collect logs" step, which pulls each container's own log via
+  `docker logs`) -- this is for the scripts' own output, so every step reads the same
+  way regardless of which script produced it. Stays plain synchronous `print()` --
+  writing a short line to stdout/stderr isn't I/O worth overlapping with anything, so
+  it doesn't follow the async convention below.
+- `lib/ceremony.py` -- the `TapyrusSetupCeremony` base class (`_run_setup`, shared by
+  `generate_dev_secrets.py`'s `AggpubkeyCeremony` and `sign_genesis.py`'s
+  `GenesisSigningCeremony`), the standalone `extract_vss_for()` helper (also used
+  directly by `assemble_signer_configs.py`, which doesn't run `tapyrus-setup` itself),
+  and `require_executable()`. `_run_setup` is `async def`, via
+  `asyncio.create_subprocess_exec`.
+- `lib/rpc.py` -- `CoreRpcClient`, a minimal Tapyrus Core JSON-RPC client (stdlib
+  `urllib`, no `requests` dependency) used by `wait_for_topology.py` today and
+  intended for the per-node tx/lifecycle orchestrator and rotation-confirmation step
+  once those are built. `call()` is `async def`; since stdlib has no async HTTP
+  client, it wraps the blocking `urllib` call in `asyncio.to_thread` so multiple
+  calls can still run concurrently. Raises `RpcUnreachable` (connection refused,
+  timeout -- treat as "not ready yet") separately from `RpcError` (the node answered
+  with a JSON-RPC error).
+
+## `config/repos.py`
+
+Default checkout targets for the three repos this test spans, read by
+`checkout_repos.py`. Each repo's `*_REF` is independently configurable per CI run --
 see the root `README.md`'s variable table (`core_repo_ref` / `signer_repo_ref` /
-`seeder_repo_ref`). The `${VAR:-default}` pattern below means: if the CI workflow has
-already exported the variable (via its job-level `env:` block, itself driven by the
-matching `workflow_dispatch` input), that value wins; otherwise the default here
-applies -- so this file's defaults are also what a schedule-triggered run (no
-`inputs` context) and any local/manual invocation fall back to.
+`seeder_repo_ref`). `ReposConfig` resolves each field via `os.environ.get(name,
+default)` when constructed: if the CI workflow has already exported the variable (via
+its job-level `env:` block, itself driven by the matching `workflow_dispatch` input),
+that value wins; otherwise the default here applies -- so this file's defaults are
+also what a schedule-triggered run (no `inputs` context) and any local/manual
+invocation fall back to.
 
 - `SIGNER_REPO_URL` / `SIGNER_REPO_REF` -- default
   `https://github.com/Naviabheeman/tapyrus-signer.git` @ `163_federationChangeTomlSetup`,
   the branch with a working `tapyrus-setup` ceremony CLI. Override both to use the
   locally-patched `federation-setup-review` branch (toolchain + `gmp-mpfr-sys` fixes,
-  see `legacy-readme.md` "Dockerfile notes"), e.g.:
+  see `work-done.md`), e.g.:
   `SIGNER_REPO_URL=/path/to/local/tapyrus-signer SIGNER_REPO_REF=federation-setup-review`.
 - `CORE_REPO_URL` / `CORE_REPO_REF` -- default
   `https://github.com/chaintope/tapyrus-core.git` @ `master`.
@@ -31,15 +68,16 @@ applies -- so this file's defaults are also what a schedule-triggered run (no
   `docker-build-fix` branch today. Override `SEEDER_REPO_REF` (and `SEEDER_REPO_URL` if
   testing locally) once a fixed branch is pushed somewhere reachable.
 
-Any variable can be overridden by exporting it before running `checkout-repos.sh`.
+Any variable can be overridden by exporting it before running `checkout_repos.py`.
 
-## `scripts/checkout-repos.sh`
+## `scripts/checkout_repos.py`
 
 Clones (or updates) `tapyrus-signer`, `tapyrus-core`, and `tapyrus-seeder` into
 `./workdir/` (gitignored), so the Docker builds and `cargo build` have something to
-build from.
+build from. Implemented as a `RepoCheckout` class; all three repos are checked out
+**concurrently** via `asyncio.gather`, not one after another.
 
-- **Usage**: `./scripts/checkout-repos.sh` (no arguments -- reads `config/repos.env`,
+- **Usage**: `./scripts/checkout_repos.py` (no arguments -- reads `config/repos.py`,
   overridable via env vars as above).
 - **Behavior**: for each repo, if `./workdir/<name>` already has a `.git` dir, fetches
   and checks out the configured ref (`FETCH_HEAD`) in place; otherwise does a shallow
@@ -47,15 +85,21 @@ build from.
   if the ref isn't a branch/tag (e.g. a raw commit sha).
 - **Output**: `workdir/tapyrus-signer/`, `workdir/tapyrus-core/`, `workdir/tapyrus-seeder/`,
   each left at its requested ref (short sha + subject line printed for confirmation).
+  Also runs `git submodule update --init --recursive` on each repo (needed for
+  `tapyrus-core`'s vendored `secp256k1`; a harmless no-op for the other two).
 
-## `scripts/generate-dev-secrets.sh`
+## `scripts/generate_dev_secrets.py`
 
 Runs the real `tapyrus-setup` federation-setup ceremony (steps 1-3 of the ceremony:
 `createkey` -> `createnodevss` -> `aggregate`) for a throwaway signer set. Produces a
 shared aggregated public key -- fully offline, no core node or Redis involved.
+Implemented as `AggpubkeyCeremony(TapyrusSetupCeremony)`. Within each of the three
+steps, all N signers' `tapyrus-setup` calls run **concurrently** (`asyncio.gather`) --
+only the three steps themselves are sequential, since each depends on the previous
+step's output (e.g. `aggregate` needs every signer's `createnodevss` result first).
 
-- **Usage**: `./scripts/generate-dev-secrets.sh <set-name> <node-count> <threshold> [tapyrus-setup-bin]`
-- **Example**: `./scripts/generate-dev-secrets.sh signer-set-a 3 2`
+- **Usage**: `./scripts/generate_dev_secrets.py <set-name> <node-count> <threshold> [tapyrus-setup-bin]`
+- **Example**: `./scripts/generate_dev_secrets.py signer-set-a 3 2`
 - `tapyrus-setup-bin` defaults to `workdir/tapyrus-signer/target/release/tapyrus-setup`
   (build it first with `cd workdir/tapyrus-signer && cargo build --release`).
 - **Guards**: refuses to run if `threshold > node-count`, if the binary isn't
@@ -69,20 +113,20 @@ shared aggregated public key -- fully offline, no core node or Redis involved.
     `node-<i>/node-secret-share.hex` (mode 600) -- per-signer key material
   - `raw/nodevss_from_<i>.txt` -- raw `createnodevss` stdout per sender, kept for the
     genesis-signing step and for audit/debugging
-- **Gotcha baked in**: `createnodevss` output lines (`<receiver_pubkey>:<vss_hex>`) are
-  sorted by receiver pubkey (BTreeMap iteration), not `--public-key` argument order --
-  the script's `extract_vss_for()` helper matches by actual pubkey, never by line
-  position, to avoid an opaque `InvalidSS` error.
 - Called twice per full scenario run: once for `signer-set-a` (the initial federation)
   and again for `signer-set-b` (the rotation target, scenario step 6).
 
-## `scripts/sign-genesis.sh`
+## `scripts/sign_genesis.py`
 
 Runs the genesis-signing half of the ceremony (steps 4-7: `createblockvss` -> `sign` ->
 `computesig`) against an unsigned genesis block hex, for a signer set
-`generate-dev-secrets.sh` already produced.
+`generate_dev_secrets.py` already produced. Implemented as
+`GenesisSigningCeremony(TapyrusSetupCeremony)`. Same concurrency shape as
+`generate_dev_secrets.py`: all N signers' `createblockvss`/`sign` calls run
+concurrently within each step; `computesig` is a single call (signer-0 only), so
+there's nothing to parallelize there.
 
-- **Usage**: `./scripts/sign-genesis.sh <set-name> <unsigned-genesis-hex-file> <output-file> [tapyrus-setup-bin]`
+- **Usage**: `./scripts/sign_genesis.py <set-name> <unsigned-genesis-hex-file> <output-file> [tapyrus-setup-bin]`
 - The unsigned genesis hex is produced separately by tapyrus-core's own tool (no
   private key -- nobody holds one for a threshold-signed federation):
 
@@ -92,29 +136,30 @@ Runs the genesis-signing half of the ceremony (steps 4-7: `createblockvss` -> `s
   ```
 
 - **Required env var**: `TAPYRUS_SETUP_THRESHOLD=<n>` -- the same threshold
-  `generate-dev-secrets.sh` was run with (not persisted anywhere else, so it must be
+  `generate_dev_secrets.py` was run with (not persisted anywhere else, so it must be
   passed again explicitly rather than guessed).
 - **Requires** `secrets/<set-name>/` to already exist: `pubkeys.txt`,
   `node-<i>/{signer.key,node-secret-share.hex}`, `raw/nodevss_from_<i>.txt`.
 - **Output**: the signed genesis block hex at `<output-file>` (e.g.
   `secrets/<set-name>/genesis.hex`) -- copy it to `<tapyrus-core-datadir>/genesis.dat` to
   use it.
-- **Gotcha baked in**: `computesig`'s `--sig`/`--block-vss`/`--node-vss` arrays must all
-  be the full signer count (not just `threshold`) -- enforced by an `assert_eq!` in the
-  source, so the script always passes all N signers' values even though only
-  `threshold` are cryptographically necessary. `computesig` itself is always run by
-  `node-0` (hardcoded -- see `weekly-integration-test-plan.md` section 4a, step 6, for
-  why a "designated signer" is a v1 limitation, not an oversight).
+- **Known limitation**: `computesig` always runs with `node-0`'s own key material
+  (hardcoded) -- a fixed "designated signer", not configurable.
 
-## `scripts/assemble-signer-configs.sh`
+## `scripts/assemble_signer_configs.py`
 
 Writes each signer node's `federations.toml` + `tapyrus-signer.toml`, ready to
-bind-mount into a `tapyrus-signerd` container at `/etc/tapyrus`.
+bind-mount into a `tapyrus-signerd` container at `/etc/tapyrus`. Implemented as
+`SignerConfigAssembler` -- doesn't run `tapyrus-setup` at all, only reads the
+`raw/*.txt` files a prior `generate_dev_secrets.py` run already produced (via the same
+`extract_vss_for()` helper `generate_dev_secrets.py` and `sign_genesis.py` use). The
+one script in `scripts/` that's plain synchronous, not `asyncio`-based -- pure local
+file reads/writes, no subprocess or network I/O to run concurrently.
 
 - **Usage**:
 
   ```sh
-  ./scripts/assemble-signer-configs.sh <set-name> <threshold> <core-rpc-hosts-file> \
+  ./scripts/assemble_signer_configs.py <set-name> <threshold> <core-rpc-hosts-file> \
     <core-rpc-port> <core-rpc-user> <core-rpc-pass> <redis-host> <redis-port> \
     <addresses-file> [output-dir]
   ```
@@ -143,12 +188,39 @@ bind-mount into a `tapyrus-signerd` container at `/etc/tapyrus`.
   `--xfield` handoff, which this script doesn't yet support (tracked in
   `doc/project-plan.md` Milestone 3).
 
+## `scripts/wait_for_topology.py`
+
+Polls every core-* node's RPC port until the 7-node topology (plan doc section 4b)
+has fully converged -- each node's own `getconnectioncount` matches the pattern the
+`-connect` graph is supposed to produce (the `1/2/1/2/1/2/3` sequence in the root
+README's variable table), not just "all 7 containers are up". Implemented as
+`TopologyWaiter`, using `lib/rpc.py`'s `CoreRpcClient`. All 7 nodes are polled
+**concurrently** each attempt (`asyncio.gather`) -- one slow or unreachable node
+doesn't delay checking the other 6.
+
+- **Usage**: `./scripts/wait_for_topology.py [--timeout-seconds N] [--poll-interval-seconds N]`
+  (defaults: 300s timeout, 5s poll interval).
+- Node names, host-published RPC ports, and expected connection counts are hardcoded
+  (see `docker/docker-compose.yml`'s port mappings) -- not configurable per-run, since
+  the 7-node topology itself is wired 1:1 to exactly 3 signers (see the root
+  `README.md`'s variable table).
+- **`CORE_RPC_USER` / `CORE_RPC_PASS` env vars** (defaults `rpcuser` / `rpcpassword`)
+  -- match the workflow's existing job-level env vars of the same names.
+- A node that isn't reachable yet (connection refused -- still starting) is treated
+  the same as a wrong connection count: "not converged yet", not a hard failure,
+  until the timeout is hit.
+- **On timeout**: logs every still-mismatched node's actual vs. expected state, then
+  exits 1.
+- Note: `docker/docker-compose.yml` doesn't yet have the compose-level healthcheck +
+  `depends_on: condition: service_healthy` guidance from the same plan doc step --
+  this script is a CI-level equivalent (arguably stronger, since it confirms real P2P
+  peer counts rather than just RPC reachability), but the compose-file enhancement
+  itself is separate, unstarted work.
+
 ## `docker/docker-compose.yml`
 
 Not a script, but the other piece every scenario run depends on -- the 7-core-node +
 `redis` + 3-signer + `seeder` stack described in `weekly-integration-test-plan.md`
 section 4b. Brought up in two stages (core nodes first, to mint coinbase addresses;
-signers second, once `assemble-signer-configs.sh` has consumed those addresses) -- see
-the root `README.md`'s CI step 5 and the file's own inline comments for the
-`-connect`/`-listen` topology design and the `command:` override gotcha specific to the
-`tapyrus/tapyrusd` image's entrypoint.
+signers second, once `assemble_signer_configs.py` has consumed those addresses) -- see
+the root `README.md`'s CI step 5.
