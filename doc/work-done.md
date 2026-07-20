@@ -157,6 +157,17 @@ done-vs-outstanding progress, and [`scripts.md`](scripts.md) for what each scrip
   a 2019 Redis DKG-round prototype; `expose-aggpubkey-file`, a patch on top of it) were
   early, superseded investigation -- kept on their own branches for history, not part
   of the current plan.
+- **`getnewaddress` right after `docker compose up -d` needs a retry, not a single
+  shot** (flagged in PR review, not caught by local testing since a local Docker daemon
+  usually has the containers' RPC servers up well before the next command runs): a
+  container reported "running" only means the process started, not that `tapyrusd`'s
+  RPC server has finished initializing -- a bare `curl` can hit connection-refused. A
+  naive `curl | jq -r .result` pipeline also masks this: `jq` prints the string `"null"`
+  for a failed/empty response and the pipeline still exits 0, so a bad address could
+  reach `/tmp/addrs.txt` silently. Fixed by replacing the inline bash/curl/jq loop with
+  `scripts/collect_coinbase_addresses.py`, which retries each node via
+  `lib/rpc.py`'s `RpcUnreachable` until it answers (or times out loudly) and raises on
+  an empty address instead of writing one.
 
 ## Reorg -- full run transcript
 
@@ -215,6 +226,36 @@ threshold-signing their own blocks from a common tip, reconnected, and confirmed
 - **Secrets scope**: this repo only ever generates local dev secrets
   (`generate_dev_secrets.py`); it never provisions real GitHub secrets. The only
   actual CI secret needed is the Slack webhook URL.
+- **`pull_request`/`push` smoke trigger, scoped to this repo's own changes**: added so
+  a change to `scripts/**`, `docker/**`, `config/**`, or the workflow itself is
+  validated before merge, not just discovered on the following Sunday's scheduled run.
+  This is deliberately read as a different concern from `weekly-integration-test-plan.md`
+  section 6's "not on every PR" non-goal: that non-goal is about running the full-scale
+  scenario against every PR opened on `tapyrus-core`/`tapyrus-signer` (cost/runtime
+  prohibitive), not about validating this repo's own, rarely-changing PRs. The smoke
+  trigger runs the identical job at reduced scale (`chain_height_before_reorg`,
+  `reorg_loser_blocks`/`reorg_winner_margin`, `tx_total_count`, `tx_interval_seconds`,
+  `rotation_height_offset` all drop to smaller fallbacks, keyed off `github.event_name`
+  since `pull_request`/`push` runs have no `inputs` context) and a shorter
+  `timeout-minutes` (60 vs. 360). Currently these scaled-down variables don't change
+  anything observable, since the steps that consume them (per-node tx, reorg, rotation)
+  are still TODO placeholders -- wired in now so the smoke run is already fast once
+  Milestone 3/4 lands, rather than needing a second pass then. Not yet verified against
+  a real GitHub Actions run (this repo's local testing can't exercise `on:` trigger
+  behavior) -- worth confirming `inputs.<name> || (...)` evaluates as expected on a
+  `pull_request` event on the first real PR.
+- **`workflow_dispatch` inputs have no `default:`**: every default used to be written
+  twice -- once as the input's `default:`, once as the `env:` block's `|| 'literal'`
+  fallback -- a real drift risk if one got updated without the other (flagged in PR
+  review). `workflow_dispatch.inputs.*.default` can't hold an expression, and
+  `schedule`/`pull_request`/`push` runs have no `inputs` context at all, so there was no
+  way to make `env:` read the input's declared default programmatically -- the literal
+  had to live somewhere outside the input either way. Chose to remove it from the input
+  side rather than the env side: `env:` keeps `inputs.x || 'literal'` as the one place
+  each default is written, and every input's `description:` now states its default in
+  words instead. A manual dispatch run left blank resolves to the exact same value
+  `schedule` uses -- the only visible change is the dispatch form showing blank fields
+  instead of pre-filled ones.
 
 ## Full local end-to-end verification (Tier 3 test)
 

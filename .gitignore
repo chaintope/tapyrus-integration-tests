@@ -1,5 +1,6 @@
 /secrets/
 /workdir/
 /runtime/
+/logs/
 __pycache__/
 *.pyc

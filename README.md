@@ -22,9 +22,16 @@ implemented vs. still outstanding.
 
 ## CI workflow overview
 
-The workflow (`weekly-integration-test.yml`) runs on a weekly schedule (Sunday 03:00 UTC
-/ Sunday 12:00 noon JST) and on demand via `workflow_dispatch`. A single
-`integration-test` job runs these steps in order:
+The workflow (`weekly-integration-test.yml`) has two trigger shapes:
+
+- **`schedule`** (Sunday 03:00 UTC / Sunday 12:00 noon JST) and **`workflow_dispatch`**
+  (on demand) run the full-scale scenario -- the defaults in the variable table below.
+- **`pull_request`** and **`push`** to `main` (path-filtered to `scripts/**`,
+  `docker/**`, `config/**`, `.github/workflows/**`) run the same job at a smaller
+  "smoke" scale, so a change to this repo's own scripts/compose/workflow is validated
+  before the following Sunday's run rather than after. See `doc/work-done.md` for why.
+
+A single `integration-test` job runs these steps in order:
 
 1. **Checkout this repo**, then checkout `tapyrus-core` + `tapyrus-signer` +
    `tapyrus-seeder` (`scripts/checkout_repos.py`) -- each repo's ref is independently
@@ -37,7 +44,8 @@ The workflow (`weekly-integration-test.yml`) runs on a weekly schedule (Sunday 0
 4. **Genesis signing**: build the unsigned genesis via `tapyrus-genesis` *(not yet
    scripted)*, then sign it with `scripts/sign_genesis.py`.
 5. **Bring the network up**: `docker compose up` redis + the 7 core nodes, collect a
-   coinbase address from each first-layer node, assemble each signer's config with
+   coinbase address from each first-layer node (`scripts/collect_coinbase_addresses.py`,
+   retries until each node's RPC is actually up), assemble each signer's config with
    `scripts/assemble_signer_configs.py`, then bring up the 3 signer-set-a containers.
 6. **Wait for topology convergence** -- poll each node's peer count against the expected
    pattern *(not yet scripted)*.
@@ -63,9 +71,16 @@ list of what's left.
 
 ## Variables available to change during a run
 
-Every variable below is a `workflow_dispatch` input with a literal fallback in the `env:`
-block, so scheduled runs get the same defaults a manual run would without overriding
-anything.
+Every variable below is a `workflow_dispatch` input. The default in the table is defined
+in exactly one place, the workflow's `env:` block (`inputs.x || 'literal'`) -- not
+repeated on the input itself, since `workflow_dispatch` input `default:` fields can't
+hold an expression and `schedule`/`pull_request`/`push` runs have no `inputs` context to
+read one from anyway. A manual dispatch run that leaves a field blank gets the same
+value schedule does; the dispatch form just won't show it pre-filled. `pull_request`/
+`push` runs use smaller "smoke" values for the reorg/tx/rotation variables instead of
+the full-scale defaults below (see the workflow's `env:` block) -- irrelevant today since
+the steps that consume them are still TODO placeholders, but wired in now for when they
+land.
 
 | Variable | Default | Controls |
 | --- | --- | --- |

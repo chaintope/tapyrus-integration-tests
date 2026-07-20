@@ -2,88 +2,108 @@
 # See doc/weekly-integration-test-plan.md section 3 for the full step-by-step design,
 # doc/work-done.md for known issues/lessons learnt/design decisions, and
 # doc/project-plan.md for tracked progress.
+#
+# schedule/workflow_dispatch run the full-scale scenario; pull_request/push (to this
+# repo itself, path-filtered) run the same flow at smoke scale -- see the env: block
+# below and doc/work-done.md.
 name: Weekly Cross-Repo Integration Test
 
 on:
   schedule:
     - cron: '0 3 * * 0' # Sunday 03:00 UTC / Sunday 12:00 noon JST
+  # Inputs deliberately have no `default:` -- GitHub Actions doesn't let that field
+  # hold an expression, and schedule/pull_request/push runs have no `inputs` context at
+  # all, so a workflow_dispatch-only default couldn't be shared with those triggers
+  # anyway. Every actual default lives in the env: block below instead, in one place --
+  # leave a field blank on a manual dispatch and you get the same value schedule uses.
   workflow_dispatch:
     inputs:
       core_repo_ref:
-        description: 'tapyrus-core ref (branch/tag/sha)'
-        default: 'master'
+        description: 'tapyrus-core ref (branch/tag/sha) -- default: master'
       signer_repo_ref:
-        description: 'tapyrus-signer ref (branch/tag/sha)'
-        default: '163_federationChangeTomlSetup'
+        description: 'tapyrus-signer ref (branch/tag/sha) -- default: 163_federationChangeTomlSetup'
       seeder_repo_ref:
-        description: 'tapyrus-seeder ref (branch/tag/sha)'
-        default: 'master'
+        description: 'tapyrus-seeder ref (branch/tag/sha) -- default: master'
 
       # --- reorg shape ---
       chain_height_before_reorg:
-        description: 'Baseline chain height to reach (with all 7 nodes connected) before splitting for the reorg'
-        default: '30'
+        description: 'Baseline chain height to reach (all 7 nodes connected) before splitting for the reorg -- default: 30 (5 on pull_request/push)'
       reorg_loser_blocks:
-        description: 'Blocks the losing group builds past the baseline'
-        default: '10'
+        description: 'Blocks the losing group builds past the baseline -- default: 10 (2 on pull_request/push)'
       reorg_winner_margin:
-        description: 'Extra blocks the winning group builds beyond reorg_loser_blocks (winner total = loser + margin)'
-        default: '2'
+        description: 'Extra blocks the winning group builds beyond reorg_loser_blocks -- default: 2 (1 on pull_request/push)'
 
       # --- transaction mix ---
       tx_total_count:
-        description: 'Total number of transactions generated across the run'
-        default: '20'
+        description: 'Total number of transactions generated across the run -- default: 20 (4 on pull_request/push)'
       tx_tpc_percent:
-        description: 'Percent of tx_total_count that are plain TPC transfers (remainder is colored-coin transactions)'
-        default: '30'
+        description: 'Percent of tx_total_count that are plain TPC transfers (remainder is colored-coin) -- default: 30'
       tx_interval_seconds:
-        description: 'Seconds between each generated transaction'
-        default: '30'
+        description: 'Seconds between each generated transaction -- default: 30 (2 on pull_request/push)'
 
       # --- block interval ---
       round_duration_seconds:
-        description: 'tapyrus-signerd round-duration'
-        default: '60'
+        description: 'tapyrus-signerd round-duration -- default: 60'
 
       # --- rotation (scenario step 6) ---
       rotation_height_offset:
-        description: 'Blocks ahead of the current tip to schedule signer-set-b''s takeover height'
-        default: '10'
+        description: 'Blocks ahead of the current tip to schedule signer-set-b''s takeover height -- default: 10 (3 on pull_request/push)'
 
       # --- max block size change (scenario step 7) ---
       max_block_size_new:
-        description: 'New max-block-size value pushed via the xfield change'
-        default: '2000000'
+        description: 'New max-block-size value pushed via the xfield change -- default: 2000000'
 
       # --- determinism ---
       prng_seed_base:
-        description: 'Base seed for per-node PRNGs (combined with node index)'
-        default: ''
+        description: 'Base seed for per-node PRNGs (combined with node index) -- default: github.run_id'
 
       # --- misc ---
       network_id:
-        description: 'Tapyrus dev network id, used for genesis/seeder/RPC network selection'
-        default: '1905960821'
+        description: 'Tapyrus dev network id, used for genesis/seeder/RPC network selection -- default: 1905960821'
       slack_log_tail_lines:
-        description: 'Lines of the implicated container''s log to inline in the Slack failure report'
-        default: '100'
+        description: 'Lines of the implicated container''s log to inline in the Slack failure report -- default: 100'
       docker_build_platform:
         description: 'Docker --platform for image builds; leave empty for the runner''s native platform'
-        default: ''
+
+  # Smoke run for changes to this repo's own scripts/compose/workflow -- proves the
+  # pipeline still works end-to-end without waiting for Sunday's full-scale run to find
+  # out. Not the plan doc section 6 "not on every PR" non-goal: that's about the
+  # full-scale scenario running against every tapyrus-core/tapyrus-signer PR, which
+  # stays out of scope. This repo changes rarely, so validating its own PRs is cheap.
+  pull_request:
+    paths:
+      - 'scripts/**'
+      - 'docker/**'
+      - 'config/**'
+      - '.github/workflows/**'
+  push:
+    branches:
+      - main
+    paths:
+      - 'scripts/**'
+      - 'docker/**'
+      - 'config/**'
+      - '.github/workflows/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CORE_REPO_REF: ${{ inputs.core_repo_ref || 'master' }}
   SIGNER_REPO_REF: ${{ inputs.signer_repo_ref || '163_federationChangeTomlSetup' }}
   SEEDER_REPO_REF: ${{ inputs.seeder_repo_ref || 'master' }}
-  CHAIN_HEIGHT_BEFORE_REORG: ${{ inputs.chain_height_before_reorg || '30' }}
-  REORG_LOSER_BLOCKS: ${{ inputs.reorg_loser_blocks || '10' }}
-  REORG_WINNER_MARGIN: ${{ inputs.reorg_winner_margin || '2' }}
-  TX_TOTAL_COUNT: ${{ inputs.tx_total_count || '20' }}
+  CHAIN_HEIGHT_BEFORE_REORG: ${{ inputs.chain_height_before_reorg || ((github.event_name == 'pull_request' || github.event_name == 'push') && '5' || '30') }}
+  REORG_LOSER_BLOCKS: ${{ inputs.reorg_loser_blocks || ((github.event_name == 'pull_request' || github.event_name == 'push') && '2' || '10') }}
+  REORG_WINNER_MARGIN: ${{ inputs.reorg_winner_margin || ((github.event_name == 'pull_request' || github.event_name == 'push') && '1' || '2') }}
+  TX_TOTAL_COUNT: ${{ inputs.tx_total_count || ((github.event_name == 'pull_request' || github.event_name == 'push') && '4' || '20') }}
   TX_TPC_PERCENT: ${{ inputs.tx_tpc_percent || '30' }}
-  TX_INTERVAL_SECONDS: ${{ inputs.tx_interval_seconds || '30' }}
+  TX_INTERVAL_SECONDS: ${{ inputs.tx_interval_seconds || ((github.event_name == 'pull_request' || github.event_name == 'push') && '2' || '30') }}
   ROUND_DURATION: ${{ inputs.round_duration_seconds || '60' }}
-  ROTATION_HEIGHT_OFFSET: ${{ inputs.rotation_height_offset || '10' }}
+  ROTATION_HEIGHT_OFFSET: ${{ inputs.rotation_height_offset || ((github.event_name == 'pull_request' || github.event_name == 'push') && '3' || '10') }}
   MAX_BLOCK_SIZE_NEW: ${{ inputs.max_block_size_new || '2000000' }}
   PRNG_SEED_BASE: ${{ inputs.prng_seed_base || github.run_id }}
   NETWORK_ID: ${{ inputs.network_id || '1905960821' }}
@@ -96,7 +116,7 @@ env:
 jobs:
   integration-test:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: ${{ (github.event_name == 'pull_request' || github.event_name == 'push') && 60 || 360 }}
     steps:
       - name: Checkout this repo
         uses: actions/checkout@v4
@@ -142,11 +162,7 @@ jobs:
             docker compose up -d redis core-1a core-1b core-2a core-2b core-3a core-3b core-7
       - name: Collect coinbase addresses from each first-layer node
         run: |
-          for port in 12381 12383 12385; do
-            curl -s --user "$CORE_RPC_USER:$CORE_RPC_PASS" --data-binary \
-              '{"jsonrpc":"1.0","id":"t","method":"getnewaddress","params":[]}' \
-              -H 'content-type: text/plain;' "http://127.0.0.1:$port/" | jq -r .result
-          done > /tmp/addrs.txt
+          ./scripts/collect_coinbase_addresses.py 12381 12383 12385 --output /tmp/addrs.txt
           printf 'core-1a\ncore-2a\ncore-3a\n' > /tmp/core-rpc-hosts.txt
       - name: Assemble signer-set-a configs
         run: |

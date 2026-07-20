@@ -17,7 +17,7 @@ pure local file I/O with nothing to overlap, so it stays a plain synchronous scr
 
 ## `scripts/lib/`
 
-Shared code the four scripts below import rather than duplicate:
+Shared code the scripts below import rather than duplicate:
 
 - `lib/log.py` -- the uniform, leveled, timestamped logger (`log.step/info/warn/error`)
   every script uses for its own narration. Separate from container log collection (the
@@ -33,10 +33,11 @@ Shared code the four scripts below import rather than duplicate:
   and `require_executable()`. `_run_setup` is `async def`, via
   `asyncio.create_subprocess_exec`.
 - `lib/rpc.py` -- `CoreRpcClient`, a minimal Tapyrus Core JSON-RPC client (stdlib
-  `urllib`, no `requests` dependency) used by `wait_for_topology.py` today and
-  intended for the per-node tx/lifecycle orchestrator and rotation-confirmation step
-  once those are built. `call()` is `async def`; since stdlib has no async HTTP
-  client, it wraps the blocking `urllib` call in `asyncio.to_thread` so multiple
+  `urllib`, no `requests` dependency) used by `collect_coinbase_addresses.py` and
+  `wait_for_topology.py` today, and intended for the per-node tx/lifecycle orchestrator
+  and rotation-confirmation step once those are built. `call()` is `async def`; since
+  stdlib has no async HTTP client, it wraps the blocking `urllib` call in
+  `asyncio.to_thread` so multiple
   calls can still run concurrently. Raises `RpcUnreachable` (connection refused,
   timeout -- treat as "not ready yet") separately from `RpcError` (the node answered
   with a JSON-RPC error).
@@ -187,6 +188,21 @@ file reads/writes, no subprocess or network I/O to run concurrently.
   (scenario step 6) needs a second entry appended with a `signature` field from the
   `--xfield` handoff, which this script doesn't yet support (tracked in
   `doc/project-plan.md` Milestone 3).
+
+## `scripts/collect_coinbase_addresses.py`
+
+Collects one coinbase payout address from each first-layer core-* node's wallet
+(`getnewaddress`), retrying each node until its RPC actually answers instead of
+assuming `docker compose up -d` returning means the RPC server is ready. Also fails
+loudly (non-zero exit) on an empty address instead of writing a blank line to the
+output file.
+
+- **Usage**: `./scripts/collect_coinbase_addresses.py <port> [<port> ...] [--output FILE] [--timeout-seconds N] [--poll-interval-seconds N]`
+  (defaults: `./runtime/addrs.txt`, 120s per-node timeout, 3s poll interval).
+- Ports run **concurrently** (`asyncio.gather`), same convention as the rest of
+  `scripts/`. **`CORE_RPC_USER` / `CORE_RPC_PASS` env vars** match the workflow's
+  existing job-level env vars.
+- **Output**: one address per line, in the same order as the ports given.
 
 ## `scripts/wait_for_topology.py`
 

@@ -47,11 +47,42 @@ Each of these corresponds to a `TODO` placeholder step in
 - [x] `tapyrus-seeder` image build in CI -- inline `docker build` (same `DOCKER_BUILD_PLATFORM` pattern as the core/signer builds), tagged `tapyrus-seeder:integration-test` to match `docker/docker-compose.yml`'s `seeder` service. Will still fail until `seeder_repo_ref` is overridden to a branch with the fixes in `work-done.md` -- `SEEDER_REPO_REF` defaults to `master`, which lacks them.
 - [x] Unsigned genesis build step (`tapyrus-genesis`) -- resolved toward `docker run --entrypoint tapyrus-genesis` against the already-built `tapyrus/tapyrusd:master-local` image (bypassing the image's daemon-oriented `entrypoint.sh` entirely), rather than a native binary from a second, separately-built copy -- guarantees the unsigned genesis matches the exact tapyrus-core commit under test. Not yet run against a real CI runner.
 - [x] Topology-convergence wait step -- `scripts/wait_for_topology.py` (`TopologyWaiter` class) polls `getconnectioncount` on all 7 nodes' published RPC ports for the expected 1/2/1/2/1/2/3 pattern, with a timeout and per-node mismatch reporting. Tested against fake local RPC servers (converge-over-time, timeout, and unreachable-node paths). Still open: `docker/docker-compose.yml` doesn't yet have compose-level healthchecks + `depends_on: condition: service_healthy` (plan doc section 3 step 6) -- this script is a CI-level equivalent, but the compose-file enhancement itself is separate, unstarted work.
+- [x] RPC-readiness retry for the coinbase-address-collection step -- `scripts/collect_coinbase_addresses.py` (flagged in PR review against commit `4d0a384`: the prior inline `curl | jq` loop had no retry and could silently write an empty/null address). Tested against fake RPC servers (immediate, delayed-then-ready, empty-result, and unreachable-timeout paths).
 - [ ] Orchestrator step for per-node tx/query/lifecycle + max-block-size change (depends on Milestone 3 pieces existing first)
 - [ ] Reorg scripted as a reusable CI step (recipe is verified by hand -- see `work-done.md` -- but every command was typed against a live stack, not captured as a script)
 - [ ] Rotation step scripted (signer-set-b ceremony + `--xfield` handoff + config regen/restart at scheduled height)
 - [ ] Rotation-confirmation step
 - [ ] Slack report step (pass/fail, run metadata, both aggpubkeys, failure log tail) -- needs a Slack webhook secret provisioned (see Milestone 5)
+
+## PR review response (against commit `4d0a384`)
+
+Most of this review's blocking findings turned out to already be fixed by `1aca161`
+(scripts/ and `doc/work-done.md` committed, `.gitignore` added, duplicated README
+content removed from the plan doc). What was still open, now fixed:
+
+- [x] Stale "plan doc section 3b" references (actual topology section is 4b) --
+  `docker/docker-compose.yml`, `scripts/assemble_signer_configs.py`.
+- [x] `.gitignore` missing `logs/` (the "Collect logs" step's local output dir).
+- [x] No RPC-readiness wait before `getnewaddress` -- see `scripts/collect_coinbase_addresses.py` above.
+- [x] `pull_request`/`push` triggers (path-filtered, smoke-scale) so this repo's own changes are validated pre-merge -- see `work-done.md`'s Design decisions.
+- [x] `permissions: contents: read` and a `concurrency:` group added to the workflow.
+- [x] Duplicated defaults between `workflow_dispatch.inputs.*.default` and the `env:`
+  fallback literal -- `default:` removed from all 16 inputs (can't hold an expression
+  anyway); `env:` is now the sole place each default is written. A manual dispatch left
+  blank resolves the same value schedule uses; the dispatch form just shows blank
+  fields instead of pre-filled ones (each input's `description:` states the default in
+  words instead). See `work-done.md`'s Design decisions.
+
+Not changed, flagged as an intentional divergence from the review's suggestion:
+
+- **`SIGNER_REPO_URL` still defaults to the `Naviabheeman` fork**, not
+  `chaintope/tapyrus-signer`. This is deliberate, not an oversight the review caught --
+  see the Milestone 5 item below and `work-done.md`'s Known issues: the fork branch is
+  the only place the federation-CHANGE/rotation ceremony (`--xfield`, multi-entry
+  `federations.toml`) exists today. Switching to `chaintope/tapyrus-signer`'s `master`
+  now would silently drop rotation coverage, not just point at a "more canonical" repo.
+  Switch once `163_federationChangeTomlSetup`'s rotation support is validated by this
+  test and lands upstream.
 
 ## Milestone 5 -- Team/repo readiness
 
@@ -61,10 +92,11 @@ Each of these corresponds to a `TODO` placeholder step in
 - [ ] Slack webhook URL provisioned as a GitHub Actions secret
 - [ ] Confirm a GitHub-hosted runner (`ubuntu-latest`) has enough CPU/disk for 7 core nodes + 3 signers + redis, or move to self-hosted
 
-
 ## Non-goals for v1
 
 - Adversarial-node topology exploit (topology is designed to allow this later without rework)
 - Performance/load testing
 - Signer fault tolerance (Byzantine signers, below-threshold signer count)
-- Running on every PR (weekly + on-demand only, by design)
+- Running the full-scale scenario on every `tapyrus-core`/`tapyrus-signer` PR (weekly +
+  on-demand only, by design). Does not cover this repo's own PRs -- those now run a
+  smoke-scale pass, see "PR review response" above.

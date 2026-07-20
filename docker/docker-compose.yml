@@ -7,7 +7,7 @@
 # CORE IMAGE: uses tapyrus/tapyrusd:master-local, built locally from tapyrus-core's
 # real master branch.
 #
-# Topology (plan doc section 3b):
+# Topology (plan doc section 4b):
 #   first layer:  core-1a, core-2a, core-3a  -- each is the RPC target for one signer
 #                 (signer-0 -> core-1a, signer-1 -> core-2a, signer-2 -> core-3a)
 #   second layer: core-1b, core-2b, core-3b  -- each P2P-connected only to its

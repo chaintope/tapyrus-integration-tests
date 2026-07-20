@@ -10,7 +10,7 @@ Usage:
 
 <core-rpc-hosts-file>: one RPC host (container DNS name, e.g. core-1a) per line, N
 lines -- each signer gets its OWN core node as RPC target, per the 7-core-node
-topology in doc/weekly-integration-test-plan.md section 3b (signer-0 -> core-1a,
+topology in doc/weekly-integration-test-plan.md section 4b (signer-0 -> core-1a,
 signer-1 -> core-2a, signer-2 -> core-3a), not one shared host. Port/user/pass are
 shared across all core nodes.
 
