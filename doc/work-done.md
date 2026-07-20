@@ -51,8 +51,66 @@ done-vs-outstanding progress, and [`scripts.md`](scripts.md) for what each scrip
   runner, add macOS (native arm64) and x86_64 nodes to the runner mix, so each
   platform builds natively instead of relying on `DOCKER_BUILD_PLATFORM`-forced QEMU
   emulation on a mismatched runner architecture.
+- **`scripts/generate_traffic.py`'s two remaining hardcoded assumptions worth
+  revisiting eventually**: `FUNDING_AMOUNT_TPC`/`TOKEN_ISSUE_AMOUNT`/etc. (module
+  constants) were picked conservatively and worked fine at `round_count=2` in the local
+  E2E run, but haven't been stress-tested at a larger round count where the
+  balance-shortfall top-up mechanic would trigger much more often. Also, `_all_colors()`
+  only knows about colors this script's own run issued -- rerunning it against a stack
+  that already has colors from a previous run (as happened once during local testing)
+  leaves those older colors untouched and unverified, which is fine (they're just not
+  this run's concern) but worth knowing if wallet balances look richer than expected.
 
 ## Lessons learnt (bugs found and fixed, gotchas)
+
+- **`scripts/generate_traffic.py` verified end-to-end against a real 7-node stack**
+  (`round_count=2`, all three colored-coin types, real `getconnectioncount`-converged
+  topology) -- confirmed the three RPC assumptions flagged when the script was first
+  written, and found three additional real bugs along the way, all fixed:
+  1. **The colored-address round-trip works as read from source**: a receiver calling
+     `getnewaddress("", colorHex)` to mint a receiving address for a specific color,
+     handed back to the sender for `transfertoken`, worked cleanly with no
+     timing/ordering issues -- confirmed via correct round-robin routing observed live
+     (e.g. `core-7`'s issued color landing in exactly the node its round-robin offset
+     predicted).
+  2. **`issuetoken`'s NON_REISSUABLE/NFT path does accept an unconfirmed self-send
+     input** -- `_seed_plain_utxo`'s immediate (no-wait) self-send-then-issue worked for
+     every node that hit that path, confirming the source reading (explicit UTXO
+     selection via `coin_control.Select(out)` only checks `ISMINE_SPENDABLE`, no
+     confirmation-depth check).
+  3. **`gettransaction`'s fee is NOT a top-level field, and has two different shapes**
+     depending on transaction type (confirmed directly against a live node's JSON, not
+     guessed): a plain TPC send nests `"fee"` inside its own `category="send"` detail
+     entry; a transaction that also moves a colored output puts the fee in a *separate*
+     detail entry tagged `category="fee"` instead, and the send/receive entries in that
+     case carry no `"fee"` key of their own. The first version of `_apply_fee` only
+     handled the second shape, so every plain TPC round-robin send was silently
+     recording a fee of 0 -- invisible at `round_count=2` until the drift accumulated
+     enough to fail the ledger assertion (see below for how this was caught). Fixed by
+     checking both shapes.
+  4. **Funding-phase timing: waiting for one more block isn't enough.** The original
+     design waited for a single new block before funding the 4 non-earning nodes from
+     `core-1a`/`2a`/`3a`'s coinbase. But with 3 signers rotating as block proposer, one
+     new block only credits *one* of those three -- the other two can still have zero
+     balance, causing `sendtoaddress` to fail with HTTP 500 (confirmed live: this
+     produced real funding failures on the first attempt at this fix). Fixed by polling
+     each funding source's actual `getbalance` instead of assuming a fixed block count
+     -- `_wait_for_funding_source_balances`.
+  5. **`core-1a`/`2a`/`3a`'s TPC balance can't be predicted by this script's own
+     ledger, and that's expected, not a bug**: these 3 nodes are each credited a fresh
+     50 TPC `"generate"`-category transaction (confirmed via `listtransactions`) every
+     time they propose a block as that round's federation master -- entirely
+     independent of anything `generate_traffic.py` does, and not something it can
+     predict in advance (block proposer rotation is internal to `tapyrus-signerd`).
+     Excluded these 3 nodes' TPC from the exact-ledger assertion; their colored
+     balances (never coinbase-derived) stay fully asserted, and their TPC is still
+     logged for visibility.
+  6. **Re-running the script against a stack that still has state from a previous run
+     produces a real but misleading mismatch**: doing this during testing left the 4
+     non-earning nodes' actual on-chain balance about 1.0 TPC higher than the second
+     run's from-zero ledger expected (the first run's leftover funding balance).
+     Not a script bug -- CI only ever runs this once per freshly-brought-up stack --
+     but worth knowing if re-running locally without tearing the stack down first.
 
 - **Git submodule init** (found via a real full local build, not inspection):
   `tapyrus-core` vendors `secp256k1` as a git submodule. `checkout_repos.py`'s
@@ -296,13 +354,13 @@ threshold-signing their own blocks from a common tip, reconnected, and confirmed
   scenario against every PR opened on `tapyrus-core`/`tapyrus-signer` (cost/runtime
   prohibitive), not about validating this repo's own, rarely-changing PRs. The smoke
   trigger runs the identical job at reduced scale (`chain_height_before_reorg`,
-  `reorg_loser_blocks`/`reorg_winner_margin`, `tx_total_count`, `tx_interval_seconds`,
+  `reorg_loser_blocks`/`reorg_winner_margin`, `tx_round_count`,
   `rotation_height_offset` all drop to smaller fallbacks, keyed off `github.event_name`
   since `pull_request`/`push` runs have no `inputs` context) and a shorter
-  `timeout-minutes` (60 vs. 360). Currently these scaled-down variables don't change
-  anything observable, since the steps that consume them (per-node tx, reorg, rotation)
-  are still TODO placeholders -- wired in now so the smoke run is already fast once
-  Milestone 3/4 lands, rather than needing a second pass then. Not yet verified against
+  `timeout-minutes` (60 vs. 360). `tx_round_count` is the one of these already wired to
+  a real step (`generate_traffic.py`); the reorg/rotation variables still aren't
+  consumed by anything -- wired in now so the smoke run is already fast once Milestone
+  3/4 finishes landing them, rather than needing a second pass then. Not yet verified against
   a real GitHub Actions run (this repo's local testing can't exercise `on:` trigger
   behavior) -- worth confirming `inputs.<name> || (...)` evaluates as expected on a
   `pull_request` event on the first real PR.
@@ -318,6 +376,42 @@ threshold-signing their own blocks from a common tip, reconnected, and confirmed
   words instead. A manual dispatch run left blank resolves to the exact same value
   `schedule` uses -- the only visible change is the dispatch form showing blank fields
   instead of pre-filled ones.
+- **`generate_traffic.py`'s round-count-only design**: everything (block-height budget,
+  transaction count) derives from one number, `tx_round_count`, rather than independent
+  knobs for total tx count and send interval. Earlier drafts had a separate
+  `tx_interval_seconds` (pacing between sends from the same node) and `tx_total_count`
+  -- both dropped once the design settled on exactly one send per node per round: with
+  no sequence of same-node sends within a round, there's nothing left for an interval to
+  pace, and the total is just `round_count * 14` (7 nodes x {TPC, colored}) by
+  construction, so a separate total would only ever have to agree with that derived
+  number or drift from it.
+- **Colored-coin balance shortfall mints instead of skipping**: rather than issue every
+  node's full lifetime token supply once at the start (all colored-coin activity then
+  front-loaded into one phase, nothing but transfers for the rest of the run), each node
+  only ever holds a small working balance (`TOKEN_ISSUE_AMOUNT`/`TOKEN_TOPUP_AMOUNT` =
+  3). A round where the sender doesn't have enough issues/reissues more instead of
+  transferring -- still exactly one transaction for that node, so total tx count per
+  round stays fixed at 14 regardless of how many nodes hit a shortfall that round. This
+  is also why NFT nodes (forced to `value=1`) end up minting a fresh NFT color on almost
+  every other round -- expected, not a bug: they transfer their one unit away, then have
+  zero until the next mint.
+- **Top-up timing needs no cross-round lookahead**: an earlier draft of this design
+  considered checking one round ahead (during round K's settle phase, top up for round
+  K+1's send) specifically to avoid a same-round top-up-then-spend needing to chain onto
+  its own unconfirmed output. Dropped once the source read showed `issuetoken`'s
+  NON_REISSUABLE/NFT path selects its input UTXO explicitly
+  (`coin_control.Select(out)`) and only checks `IsMine(...) == ISMINE_SPENDABLE` --  no
+  confirmation-depth check -- so spending a same-round unconfirmed self-send is expected
+  to work, confirmed live in the local E2E run (see Lessons learnt above). A shortfall
+  now just substitutes a mint for that round's transfer, with no phase held back a round
+  to accommodate it.
+- **Per-transaction fee tracked via `gettransaction`, not predicted**: the ledger's TPC
+  bookkeeping reads each transaction's actual fee back from `gettransaction` right after
+  broadcasting it, rather than trying to predict it from a fee rate and an assumed tx
+  size. Fee-rate-based prediction would have needed tx vsize to be near-constant across
+  every transaction shape this script produces (plain TPC send, colored transfer,
+  REISSUABLE's 2-tx issuance, NON_REISSUABLE/NFT's single-tx issuance) to stay accurate
+  -- reading the real fee sidesteps needing that assumption to hold at all.
 
 ## Full local end-to-end verification (Tier 3 test)
 

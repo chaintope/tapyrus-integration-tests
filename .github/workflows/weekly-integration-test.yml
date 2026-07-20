@@ -18,9 +18,12 @@ on:
   # leave a field blank on a manual dispatch and you get the same value schedule uses.
   # GitHub Actions caps workflow_dispatch at 10 inputs -- exceeding it makes the whole
   # workflow file invalid (startup_failure on every trigger, not just workflow_dispatch).
-  # tx_total_count/tx_tpc_percent/tx_interval_seconds/rotation_height_offset/
-  # max_block_size_new/prng_seed_base are dropped to stay at 10: their consuming steps
-  # are all still commented-out/TODO (Milestone 3/4), so nothing else changes. Their
+  # tx_total_count/tx_tpc_percent/tx_interval_seconds/tx_round_count/
+  # rotation_height_offset/max_block_size_new/prng_seed_base are dropped to stay at
+  # 10: their consuming steps are all still commented-out/TODO (Milestone 3/4), so
+  # nothing else changes -- generate_traffic.py (tx_round_count) is fully built and
+  # verified (see doc/work-done.md), but its step is still disabled along with the
+  # rest of the signers-never-brought-up block, so it's in the same boat for now. Their
   # env: fallback literals stay below, ready for when a Milestone 3/4 step needs one --
   # add it back then, or as a single JSON "overrides" input / repo vars if the list
   # would otherwise exceed 10 again.
@@ -91,9 +94,7 @@ env:
   CHAIN_HEIGHT_BEFORE_REORG: ${{ inputs.chain_height_before_reorg || ((github.event_name == 'pull_request' || github.event_name == 'push') && '5' || '30') }}
   REORG_LOSER_BLOCKS: ${{ inputs.reorg_loser_blocks || ((github.event_name == 'pull_request' || github.event_name == 'push') && '2' || '10') }}
   REORG_WINNER_MARGIN: ${{ inputs.reorg_winner_margin || ((github.event_name == 'pull_request' || github.event_name == 'push') && '1' || '2') }}
-  TX_TOTAL_COUNT: ${{ inputs.tx_total_count || ((github.event_name == 'pull_request' || github.event_name == 'push') && '4' || '20') }}
-  TX_TPC_PERCENT: ${{ inputs.tx_tpc_percent || '30' }}
-  TX_INTERVAL_SECONDS: ${{ inputs.tx_interval_seconds || ((github.event_name == 'pull_request' || github.event_name == 'push') && '2' || '30') }}
+  TX_ROUND_COUNT: ${{ inputs.tx_round_count || ((github.event_name == 'pull_request' || github.event_name == 'push') && '2' || '5') }}
   ROUND_DURATION: ${{ inputs.round_duration_seconds || '60' }}
   ROTATION_HEIGHT_OFFSET: ${{ inputs.rotation_height_offset || ((github.event_name == 'pull_request' || github.event_name == 'push') && '3' || '10') }}
   MAX_BLOCK_SIZE_NEW: ${{ inputs.max_block_size_new || '2000000' }}
@@ -167,8 +168,11 @@ jobs:
       - name: Bring up tapyrus-seeder
         run: echo "TODO -- image is built above but the seeder service is never started (no docker compose up includes it) and there's no dig-based pass/fail check -- see doc/project-plan.md Milestone 4"
       # Commented out for this smoke run: only validating up through tapyrusd startup
-      # confirmation (finding #2), then falling straight through to teardown. Restore
-      # once Milestone 3/4's per-node/reorg/rotation scripting lands for real.
+      # confirmation (finding #2), then falling straight through to teardown -- none of
+      # this can run anyway with signer-set-a never brought up. Traffic generation
+      # (scripts/generate_traffic.py) is built and verified against a live stack
+      # already (see doc/work-done.md); the rest is still genuinely unbuilt (Milestone
+      # 3/4). Restore this whole block once the smoke run brings signers up for real.
       # - name: Assemble signer-set-a configs
       #   run: |
       #     ROUND_DURATION="$ROUND_DURATION" ./scripts/assemble_signer_configs.py signer-set-a 2 \
@@ -179,7 +183,10 @@ jobs:
       #     GENESIS_BLOCK_WITH_SIG=$(cat ../secrets/signer-set-a/genesis.hex) \
       #       docker compose up -d signer-0 signer-1 signer-2
 
-      # - name: Per-node tx/query/stop-restart + max-block-size change
+      # - name: Generate round-robin TPC + colored-coin traffic
+      #   run: ./scripts/generate_traffic.py "$TX_ROUND_COUNT"
+
+      # - name: Per-node query/stop-restart + max-block-size change
       #   run: echo "TODO -- not yet scripted -- see doc/project-plan.md Milestone 3/4"
 
       # - name: Reorg

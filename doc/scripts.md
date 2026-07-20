@@ -276,6 +276,30 @@ doesn't delay checking the other 6.
   peer counts rather than just RPC reachability), but the compose-file enhancement
   itself is separate, unstarted work.
 
+## `scripts/generate_traffic.py`
+
+Drives round-robin TPC + colored-coin traffic across all 7 nodes and confirms every
+node's wallet balance (TPC and every colored type in play) after each block. Everything
+is derived from a single `--round-count`: each round spans 3 block-heights (send, check,
+settle), polled the same way across all 7 nodes -- see the script's own docstring for
+the full design (funding the 4 nodes with no coinbase income, the per-node colored-type
+assignment, and the balance-shortfall top-up mechanic). Implemented as `TrafficNode` +
+`TrafficGenerator`.
+
+- **Usage**: `./scripts/generate_traffic.py <round-count>`
+- Requires the 7-node topology already converged (`wait_for_topology.py`) and
+  signer-set-a producing blocks.
+- **Output**: none written to disk -- verification results are logged; a settle-height
+  balance mismatch raises `TrafficGenerationError` (non-zero exit) after all rounds run,
+  listing every mismatch found, not just the first.
+- Verified end-to-end against a real 7-node stack (`round_count=2`, all three
+  colored-coin types) -- see `doc/work-done.md`'s Lessons learnt for the bugs this
+  found and fixed (a `gettransaction` fee-shape gap, a funding-phase timing gap).
+- **Known limitation**: `core-1a`/`2a`/`3a`'s TPC balance is intentionally excluded from
+  the settle-height assertion (logged, not asserted) -- they receive ongoing coinbase
+  income whenever they propose a block, at a rate this script can't predict in advance.
+  Their colored balances stay fully asserted.
+
 ## `docker/docker-compose.yml`
 
 Not a script, but the other piece every scenario run depends on -- the 7-core-node +

@@ -50,10 +50,13 @@ A single `integration-test` job runs these steps in order:
    retries until each node's RPC is actually up).
 6. **Bring up signers and per-node activity**: assemble each signer's config with
    `scripts/assemble_signer_configs.py`, bring up the 3 signer-set-a containers,
-   transactions, RPC health/height/mempool queries, and stop/restart/resync for every
-   node, plus the max-block-size (xfield) change *(not yet scripted -- and currently
-   commented out in the workflow entirely, signers included, pending Milestone 3/4;
-   see `doc/project-plan.md`)*.
+   round-robin TPC + colored-coin traffic across all 7 nodes with balances confirmed
+   after each block (`scripts/generate_traffic.py` -- built and verified against a
+   live stack, see `doc/work-done.md`), RPC health/height/mempool queries, and
+   stop/restart/resync for every node, plus the max-block-size (xfield) change
+   *(the query/lifecycle/max-block-size pieces are still not yet scripted -- and the
+   whole step is currently commented out in the workflow, signers included, pending
+   Milestone 3/4; see `doc/project-plan.md`)*.
 7. **Reorg**: split the network into two groups, let each build its own real
    threshold-signed fork, reconnect, and confirm convergence via `getchaintips`
    *(recipe verified by hand -- see `doc/work-done.md`; not yet scripted as a reusable
@@ -110,11 +113,16 @@ override per-run yet.
 | `docker_build_platform` | *(empty, runner-native)* | Docker `--platform` for image builds -- local verification only ever used `linux/arm64` |
 
 Not yet real inputs (env-literal only, no per-run override -- see above): `tx_total_count`
-(`20`), `tx_tpc_percent` (`30`), `tx_interval_seconds` (`30`), `rotation_height_offset`
+(`20`), `tx_tpc_percent` (`30`), `tx_interval_seconds` (`30`), `tx_round_count` (`5`,
+`scripts/generate_traffic.py`'s round-robin send/check/settle cycle count -- each is 3
+block-heights and 14 transactions, 7 nodes x {TPC send, colored send-or-mint}, so this
+alone determines the tx/block/height totals for that step), `rotation_height_offset`
 (`10`), `max_block_size_new` (`2000000`), `prng_seed_base` (`github.run_id`). All feed
-steps that are still commented-out/TODO (Milestone 3/4) -- reintroduce as real inputs
-once one of those lands, if the 10-input budget allows, or via a JSON "overrides"
-input / repo vars otherwise.
+steps that are still commented-out/TODO (Milestone 3/4) -- `generate_traffic.py`
+itself is fully built and verified (see `doc/work-done.md`), but its step is disabled
+along with the rest of the signers-never-brought-up block for now. Reintroduce as real
+inputs once a step lands for real, if the 10-input budget allows, or via a JSON
+"overrides" input / repo vars otherwise.
 
 Not configurable per-run at all (hardcoded): the RPC port/user/pass (`12381` /
 `rpcuser` / `rpcpassword`), and the signer count (3) / threshold (2) -- the 7-node

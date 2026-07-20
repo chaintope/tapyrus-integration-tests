@@ -33,7 +33,7 @@ See [`work-done.md`](work-done.md) for the full transcripts.
 
 ## Milestone 3 -- Scenario mechanics not yet built at all
 
-- [ ] Per-node transaction generation (TPC + colored-coin mix, deterministic PRNG seeding) -- blocks today only ever contain the coinbase transaction
+- [x] Per-node transaction generation -- `scripts/generate_traffic.py` (`TrafficNode` + `TrafficGenerator`). Round-robin TPC + colored-coin (REISSUABLE/NON_REISSUABLE/NFT mix, one type per node) sends across all 7 nodes, everything derived from a single round count (`tx_round_count`); balance verified against a tracked ledger after every block. Verified end-to-end against a real 7-node stack (`round_count=2`) -- three bugs found and fixed along the way, see `work-done.md`'s Lessons learnt. Wired into the workflow (`Generate round-robin TPC + colored-coin traffic` step).
 - [ ] Per-node lifecycle orchestrator (RPC health/height/mempool query, stop, restart, confirm resync)
 - [ ] Max-block-size (xfield) change -- push, confirm an over-limit block is rejected and an in-limit block is accepted
 - [ ] Aggpubkey rotation handoff -- `--xfield` `sign`/`computesig` flow (current federation signs off on the new one) and a `federations.toml` writer that can append a second entry (today's `assemble_signer_configs.py` only ever writes one `[[federation]]` entry)
@@ -48,7 +48,11 @@ Each of these corresponds to a `TODO` placeholder step in
 - [x] Unsigned genesis build step (`tapyrus-genesis`) -- resolved toward `docker run --entrypoint tapyrus-genesis` against the already-built `tapyrus/tapyrusd:master-local` image (bypassing the image's daemon-oriented `entrypoint.sh` entirely), rather than a native binary from a second, separately-built copy -- guarantees the unsigned genesis matches the exact tapyrus-core commit under test. Not yet run against a real CI runner.
 - [x] Topology-convergence wait step -- `scripts/wait_for_topology.py` (`TopologyWaiter` class) polls `getconnectioncount` on all 7 nodes' published RPC ports for the expected 1/2/1/2/1/2/3 pattern, with a timeout and per-node mismatch reporting. **Not yet exercised against real or fake nodes** -- its own polling/convergence/timeout logic has no automated test; only the `CoreRpcClient` it's built on (see below) has been verified for real. Still open: `docker/docker-compose.yml` doesn't yet have compose-level healthchecks + `depends_on: condition: service_healthy` (plan doc section 3 step 6) -- this script is a CI-level equivalent, but the compose-file enhancement itself is separate, unstarted work.
 - [x] RPC-readiness retry for the coinbase-address-collection step -- `scripts/collect_coinbase_addresses.py` (flagged in PR review against commit `4d0a384`: the prior inline `curl | jq` loop had no retry and could silently write an empty/null address). **Verified against a real `tapyrusd` container**: the happy path (`getnewaddress` against an already-up node) and, at the shared `CoreRpcClient` level, a successful call and the HTTP 401-\>`RpcError` misclassification fix (see `work-done.md`). The retry-after-initial-unreachable, empty-result, and timeout-never-reachable paths are **not yet covered** by any automated test, real or fake -- this was previously (inaccurately) documented as "tested against fake RPC servers"; no such tests ever existed in this repo (see the original PR review's finding).
-- [ ] Orchestrator step for per-node tx/query/lifecycle + max-block-size change (depends on Milestone 3 pieces existing first)
+- [x] Transaction-generation step wired in (`generate_traffic.py`, see Milestone 3) --
+  currently commented out in the workflow alongside the rest of the
+  signers-never-brought-up block (see "PR review response (round 2)"); re-enable once
+  that block is restored.
+- [ ] Orchestrator step for per-node query/lifecycle + max-block-size change (depends on the remaining Milestone 3 pieces existing first)
 - [ ] Reorg scripted as a reusable CI step (recipe is verified by hand -- see `work-done.md` -- but every command was typed against a live stack, not captured as a script)
 - [ ] Rotation step scripted (signer-set-b ceremony + `--xfield` handoff + config regen/restart at scheduled height)
 - [ ] Rotation-confirmation step
