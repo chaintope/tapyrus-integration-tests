@@ -54,20 +54,25 @@ that value wins; otherwise the default here applies -- so this file's defaults a
 also what a schedule-triggered run (no `inputs` context) and any local/manual
 invocation fall back to.
 
-- `SIGNER_REPO_URL` / `SIGNER_REPO_REF` -- default
-  `https://github.com/Naviabheeman/tapyrus-signer.git` @ `163_federationChangeTomlSetup`,
-  the branch with a working `tapyrus-setup` ceremony CLI. Override both to use the
-  locally-patched `federation-setup-review` branch (toolchain + `gmp-mpfr-sys` fixes,
-  see `work-done.md`), e.g.:
-  `SIGNER_REPO_URL=/path/to/local/tapyrus-signer SIGNER_REPO_REF=federation-setup-review`.
+- `SIGNER_REPO_URL` / `SIGNER_REPO_REF` -- **TEMPORARY default**
+  `https://github.com/Naviabheeman/tapyrus-signer.git` @ `master-build-fix`, tracking
+  unmerged [`chaintope/tapyrus-signer#172`](https://github.com/chaintope/tapyrus-signer/pull/172)
+  (the `gmp-mpfr-sys` self-test skip that lets `cargo build --release` succeed --
+  `chaintope/tapyrus-signer`'s own `master` doesn't build out of the box, see
+  `work-done.md`). Switch back to `https://github.com/chaintope/tapyrus-signer.git` @
+  `master` once #172 merges. For federation-change/rotation testing (`--xfield`
+  sign/computesig, multi-entry `federations.toml`), override both to
+  `https://github.com/Naviabheeman/tapyrus-signer.git` @ `163_federationChangeToml`
+  instead, e.g.:
+  `SIGNER_REPO_URL=https://github.com/Naviabheeman/tapyrus-signer.git SIGNER_REPO_REF=163_federationChangeToml`.
 - `CORE_REPO_URL` / `CORE_REPO_REF` -- default
   `https://github.com/chaintope/tapyrus-core.git` @ `master`.
-- `SEEDER_REPO_URL` / `SEEDER_REPO_REF` -- default
-  `https://github.com/chaintope/tapyrus-seeder.git` @ `master`. **Note**: `master`
-  does not include the four bug fixes documented in `doc/work-done.md` (build failure,
-  sprintf buffer overflow, two data races) -- those only exist on a local, unpushed
-  `docker-build-fix` branch today. Override `SEEDER_REPO_REF` (and `SEEDER_REPO_URL` if
-  testing locally) once a fixed branch is pushed somewhere reachable.
+- `SEEDER_REPO_URL` / `SEEDER_REPO_REF` -- **TEMPORARY default**
+  `https://github.com/Naviabheeman/tapyrus-seeder.git` @ `docker-build-fix`, tracking
+  unmerged [`chaintope/tapyrus-seeder#5`](https://github.com/chaintope/tapyrus-seeder/pull/5)
+  (the four build/runtime bug fixes documented in `doc/work-done.md` --
+  `chaintope/tapyrus-seeder`'s own `master` lacks them). Switch back to
+  `https://github.com/chaintope/tapyrus-seeder.git` @ `master` once #5 merges.
 
 Any variable can be overridden by exporting it before running `checkout_repos.py`.
 
@@ -82,8 +87,10 @@ build from. Implemented as a `RepoCheckout` class; all three repos are checked o
   overridable via env vars as above).
 - **Behavior**: for each repo, if `./workdir/<name>` already has a `.git` dir, fetches
   and checks out the configured ref (`FETCH_HEAD`) in place; otherwise does a shallow
-  `--branch <ref> --single-branch` clone, falling back to a full clone + `checkout <ref>`
-  if the ref isn't a branch/tag (e.g. a raw commit sha).
+  `--branch <ref> --single-branch --depth 1` clone, falling back to a full clone +
+  `checkout <ref>` if the ref isn't a branch/tag (e.g. a raw commit sha) -- `--depth 1`
+  only applies to the first attempt, so the full-clone fallback (which needs complete
+  history to `checkout` an arbitrary sha) is unaffected.
 - **Output**: `workdir/tapyrus-signer/`, `workdir/tapyrus-core/`, `workdir/tapyrus-seeder/`,
   each left at its requested ref (short sha + subject line printed for confirmation).
   Also runs `git submodule update --init --recursive` on each repo (needed for
@@ -132,20 +139,50 @@ there's nothing to parallelize there.
   private key -- nobody holds one for a threshold-signed federation):
 
   ```sh
-  tapyrus-genesis -dev -signblockpubkey=$(cat secrets/<set-name>/aggregated-public-key.txt) \
+  tapyrus-genesis -signblockpubkey=$(cat secrets/<set-name>/aggregated-public-key.txt) \
     > /tmp/unsigned-genesis.hex
   ```
 
+  No `-dev` -- prod mode is the default when it's omitted, and genesis creation itself
+  needs no network id either way (verified against a real container; see
+  `work-done.md`).
 - **Required env var**: `TAPYRUS_SETUP_THRESHOLD=<n>` -- the same threshold
   `generate_dev_secrets.py` was run with (not persisted anywhere else, so it must be
   passed again explicitly rather than guessed).
 - **Requires** `secrets/<set-name>/` to already exist: `pubkeys.txt`,
   `node-<i>/{signer.key,node-secret-share.hex}`, `raw/nodevss_from_<i>.txt`.
 - **Output**: the signed genesis block hex at `<output-file>` (e.g.
-  `secrets/<set-name>/genesis.hex`) -- copy it to `<tapyrus-core-datadir>/genesis.dat` to
-  use it.
+  `secrets/<set-name>/genesis.hex`) -- load it via `tapyrus/tapyrusd`'s
+  `GENESIS_BLOCK_WITH_SIG` env var (see `docker/docker-compose.yml`); its
+  `entrypoint.sh` writes it to `<datadir>/genesis.<network_id>` itself (see
+  `render_tapyrus_conf.py` below and `work-done.md`).
 - **Known limitation**: `computesig` always runs with `node-0`'s own key material
   (hardcoded) -- a fixed "designated signer", not configurable.
+
+## `scripts/render_tapyrus_conf.py`
+
+Renders `docker/generated/tapyrus.conf` (gitignored), the one conf file every
+`core-*` service mounts (see `docker/docker-compose.yml`). Plain synchronous script --
+just string formatting and a file write, nothing to overlap.
+
+- **Usage**: `./scripts/render_tapyrus_conf.py [output-file]` (default:
+  `docker/generated/tapyrus.conf`).
+- **Reads env vars**: `NETWORK_ID` (default `1905960821`), `CORE_RPC_USER`/
+  `CORE_RPC_PASS` (defaults `rpcuser`/`rpcpassword`) -- same job-level env vars the
+  other steps already use.
+- **Why this exists**: `tapyrus/tapyrusd`'s own `entrypoint.sh` only auto-generates a
+  conf if none is mounted at `${CONF_DIR}/tapyrus.conf`, and the auto-generated one
+  hardcodes `dev=1`/`[dev]`/`networkid=1905960821` -- so without this script,
+  `NETWORK_ID` had nowhere to go and every node silently ran that one fixed dev
+  network regardless of what it was set to (see `work-done.md`). This renders a
+  prod-mode conf instead (paired with dropping `-dev` from `tapyrus-genesis`, see
+  `sign_genesis.py` above), with `networkid=$NETWORK_ID` -- verified against a real
+  container: `getblockchaininfo` reports `"mode": "prod"` and `"chain":
+  "<NETWORK_ID>"`.
+- **Known limitation**: not wired into the `seeder` service's `-i`/`-s` flags (still
+  hardcoded to `1905960821` in `docker/docker-compose.yml`) -- deliberately, since the
+  seeder isn't brought up by any `docker compose up` invocation yet at all (see
+  `project-plan.md` Milestone 4).
 
 ## `scripts/assemble_signer_configs.py`
 
@@ -165,6 +202,8 @@ file reads/writes, no subprocess or network I/O to run concurrently.
     <addresses-file> [output-dir]
   ```
 
+- `<threshold>` is parsed as `int` (argparse `type=int`) -- a non-numeric value fails
+  loudly at parse time instead of landing unvalidated in the generated TOML.
 - `<core-rpc-hosts-file>`: one RPC host (container DNS name) per line, N lines -- each
   signer targets its **own** first-layer core node in the 7-node topology
   (`signer-0 -> core-1a`, `signer-1 -> core-2a`, `signer-2 -> core-3a`), not one shared

@@ -46,7 +46,8 @@ class RepoCheckout:
     async def _clone(self, repo, dest):
         log.info(f"{repo.name}: cloning {repo.url} @ {repo.ref} -> {dest}")
         returncode, _, _ = await self._run(
-            "git", "clone", "--branch", repo.ref, "--single-branch", repo.url, str(dest),
+            "git", "clone", "--branch", repo.ref, "--single-branch", "--depth", "1",
+            repo.url, str(dest),
             check=False,
         )
         if returncode != 0:

@@ -5,7 +5,7 @@ unsigned genesis block hex.
 
 The unsigned genesis hex itself is NOT produced here -- build it separately with
 tapyrus-core's own tool, using the aggpubkey generate_dev_secrets.py already wrote:
-    tapyrus-genesis -dev -signblockpubkey=$(cat secrets/<set-name>/aggregated-public-key.txt)
+    tapyrus-genesis -signblockpubkey=$(cat secrets/<set-name>/aggregated-public-key.txt)
 (no -signblockprivatekey -- nobody holds a single private key for a threshold-signed
 federation; that's the whole point of this ceremony).
 
@@ -16,7 +16,7 @@ Usage:
     ./scripts/sign_genesis.py <set-name> <unsigned-genesis-hex-file> <output-file> [tapyrus-setup-bin]
 
 Example:
-    tapyrus-genesis -dev -signblockpubkey=$(cat secrets/signer-set-a/aggregated-public-key.txt) \\
+    tapyrus-genesis -signblockpubkey=$(cat secrets/signer-set-a/aggregated-public-key.txt) \\
       > /tmp/unsigned-genesis.hex
     ./scripts/sign_genesis.py signer-set-a /tmp/unsigned-genesis.hex secrets/signer-set-a/genesis.hex
 
@@ -204,7 +204,11 @@ async def main():
     args.output_file.write_text(signed_genesis)
 
     log.info(f"done. signed genesis block written to {args.output_file}")
-    log.info("load it into tapyrus-core by copying it to <datadir>/genesis.dat")
+    log.info(
+        "load it via tapyrus/tapyrusd's GENESIS_BLOCK_WITH_SIG env var (see "
+        "docker/docker-compose.yml) -- its entrypoint.sh writes it to "
+        "<datadir>/genesis.<network_id> itself; see doc/work-done.md"
+    )
 
 
 if __name__ == "__main__":

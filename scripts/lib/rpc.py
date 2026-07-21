@@ -53,6 +53,12 @@ class CoreRpcClient:
         try:
             with urllib.request.urlopen(request, timeout=self._timeout_seconds) as response:
                 payload = json.loads(response.read())
+        except urllib.error.HTTPError as exc:
+            # The node answered (wrong RPC credentials, malformed request, ...) --
+            # HTTPError is a URLError subclass, so it must be caught here, ahead of
+            # the URLError branch below, or it would be misclassified as "not
+            # reachable yet" and retried forever instead of surfacing the real error.
+            raise RpcError(f"{method} against {self._url}: HTTP {exc.code} {exc.reason}") from exc
         except (urllib.error.URLError, ConnectionError, TimeoutError) as exc:
             raise RpcUnreachable(f"{method} against {self._url}: {exc}") from exc
 

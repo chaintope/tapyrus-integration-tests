@@ -12,17 +12,25 @@ done-vs-outstanding progress, and [`scripts.md`](scripts.md) for what each scrip
 
 ## Known issues (open)
 
-- **`tapyrus-seeder` fails to build on the default `SEEDER_REPO_REF=master`** --
-  reproduced for real (local full E2E test): fails on bug #1 below (Alpine g++
-  rejecting a designated-initializer in `dns.cpp`). All four fixes only exist on a
-  local, unpushed `docker-build-fix` branch today. Override `SEEDER_REPO_REF` (and
-  `SEEDER_REPO_URL` if testing locally) once a fixed branch is pushed somewhere
-  reachable.
-- **`tapyrus-signer` doesn't build out of the box** -- neither the
-  `163_federationChangeTomlSetup` branch nor `chaintope/tapyrus-signer`'s own `master`
-  has the toolchain pin or GMP fix (see Lessons learnt below) committed. Applied by
-  hand to the disposable `workdir/` checkout for local testing; not yet committed
-  anywhere reachable (only on a local, unpushed `federation-setup-review` branch).
+- **`tapyrus-seeder`'s `master` fails to build** -- reproduced for real (local full
+  E2E test): fails on bug #1 below (Alpine g++ rejecting a designated-initializer in
+  `dns.cpp`). All four fixes are up as
+  [`chaintope/tapyrus-seeder#5`](https://github.com/chaintope/tapyrus-seeder/pull/5),
+  not yet merged. **`SEEDER_REPO_REF`/`SEEDER_REPO_URL` default to the PR's own
+  branch** (`Naviabheeman/tapyrus-seeder` @ `docker-build-fix`) so at least one CI
+  trigger can go green before #5 merges -- switch back to `chaintope/tapyrus-seeder` @
+  `master` once it does.
+- **`tapyrus-signer`'s `master` fails to build on Apple Silicon** -- the vendored
+  `gmp-mpfr-sys` build runs GMP's own test suite, which segfaults/aborts there. Fix
+  (skip the self-test via the `c-no-tests` feature) is up as
+  [`chaintope/tapyrus-signer#172`](https://github.com/chaintope/tapyrus-signer/pull/172),
+  not yet merged. Turned out the toolchain pin originally suspected as also-needed
+  (rustc 1.76+ breaking a `rustc-serialize` lifetime-checking case) isn't required --
+  `master` already carries a `rustc-serialize` 0.3.25 bump that avoids it; only the
+  GMP self-test skip was actually needed. **`SIGNER_REPO_REF`/`SIGNER_REPO_URL`
+  default to the PR's own branch** (`Naviabheeman/tapyrus-signer` @
+  `master-build-fix`) so at least one CI trigger can go green before #172 merges --
+  switch back to `chaintope/tapyrus-signer` @ `master` once it does.
 - **GitHub-hosted `ubuntu-latest` runner's CPU/disk sufficiency is unconfirmed** for 7
   core nodes + 3 signers + redis + seeder running concurrently -- may need
   self-hosted.
@@ -31,13 +39,14 @@ done-vs-outstanding progress, and [`scripts.md`](scripts.md) for what each scrip
   `scripts/wait_for_topology.py` is a CI-level equivalent -- arguably stronger, since
   it confirms real P2P peer counts rather than just RPC reachability -- but the
   compose-file enhancement itself is separate, unstarted work.
-- **`163_federationChangeTomlSetup` is only actually required for federation
-  change/rotation** (the `--xfield` sign/computesig flow, multi-entry
+- **`163_federationChangeToml` (Naviabheeman fork) is only actually required for
+  federation change/rotation** (the `--xfield` sign/computesig flow, multi-entry
   `federations.toml`) -- `chaintope/tapyrus-signer`'s own `master` already has the base
   ceremony (createkey/createnodevss/aggregate/genesis-signing, confirmed nearly
-  identical). Switch `config/repos.py`'s signer default to `master` once this
-  integration test has validated `163_federationChangeTomlSetup`'s rotation support
-  for real and that work lands upstream.
+  identical). Override `SIGNER_REPO_URL`/`SIGNER_REPO_REF` to that fork+branch when
+  testing rotation (Milestone 3/4's rotation items) -- see the current
+  `SIGNER_REPO_REF`/`SIGNER_REPO_URL` default above for what the default is *today*
+  (temporarily the `#172` PR branch, not `master`, until it merges).
 - **Signer count (3) / threshold (2) is hardcoded**, not a per-run variable -- the
   7-node topology in `docker-compose.yml` is wired 1:1 to exactly 3 signers; changing
   the count means redesigning the topology, not just passing a different number.
@@ -88,8 +97,9 @@ done-vs-outstanding progress, and [`scripts.md`](scripts.md) for what each scrip
   appending to it -- a bare `command: [-connect=core-1b]` crashes every such container
   (`bash -c "-connect=core-1b"` -> invalid option). Fixed by having every `command:`
   override repeat the full default invocation and append its own flags.
-- **`tapyrus-seeder`'s four real upstream bugs**, found and fixed on a local
-  `docker-build-fix` branch, all confirmed live:
+- **`tapyrus-seeder`'s four real upstream bugs**, found and fixed in
+  [`chaintope/tapyrus-seeder#5`](https://github.com/chaintope/tapyrus-seeder/pull/5),
+  all confirmed live:
   1. Build failure -- Alpine 3.7's g++ rejects a designated-initializer used for
      `struct msghdr` in `dns.cpp` as "non-trivial" (not architecture-specific). Fixed
      with plain field assignment instead.
@@ -131,11 +141,6 @@ done-vs-outstanding progress, and [`scripts.md`](scripts.md) for what each scrip
   signing an aggpubkey rotation or max-block-size change instead of a genesis block --
   real, present in code, undocumented upstream. This is the actual mechanism behind
   the federation-rotation design decision below.
-- **`gmp-mpfr-sys`'s Cargo.lock can drift**: building with an unpinned/newer toolchain
-  first silently upgrades the lock file format and re-resolves the `tapyrus` dependency
-  from crates.io instead of the git tag the committed lock specifies; pinning back to
-  1.70.0 afterward then fails to parse the newer lock file. Fix: `git checkout HEAD --
-  Cargo.lock` before rebuilding with the pinned toolchain, if this happens.
 - **On macOS, building tapyrus-signer outside Docker also needs `brew install gmp` +
   `LIBRARY_PATH=/opt/homebrew/lib`** for the linker to find the system `libgmp` a
   transitive dependency wants (separate from the vendored `gmp-mpfr-sys` build above).
@@ -206,6 +211,26 @@ threshold-signing their own blocks from a common tip, reconnected, and confirmed
   none of that daemon machinery, and reusing the already-built image guarantees the
   unsigned genesis matches the exact tapyrus-core commit under test, rather than a
   second, separately-built copy. Verified against a real image in a full local test.
+- **How `NETWORK_ID` actually reaches `tapyrusd`, and why it didn't before**: found by
+  reading `tapyrus/tapyrusd`'s own `entrypoint.sh` (there's no `-networkid` flag on
+  `tapyrus-genesis`, but `tapyrusd` itself has one). The entrypoint only
+  auto-generates a `tapyrus.conf` if none is mounted at `${CONF_DIR}/tapyrus.conf` --
+  the auto-generated one hardcodes `dev=1`/`[dev]`/`networkid=1905960821` -- and
+  separately, greps `networkid=` out of *whichever* conf ends up there to decide which
+  `${DATA_DIR}/genesis.<network_id>` file to write `GENESIS_BLOCK_WITH_SIG` into and
+  which `tapyrusd` then loads. Since nothing ever mounted a conf of our own, every
+  node always ran that one fixed dev network regardless of `NETWORK_ID`. Fixed by
+  `scripts/render_tapyrus_conf.py`, which renders a prod-mode conf (no `-dev` on the
+  `tapyrus-genesis` call either -- verified genesis creation itself needs no network
+  id, prod is simply what you get by omitting `-dev`) with `networkid=$NETWORK_ID`,
+  mounted into all 7 core-* services. Verified against a real container with a network
+  id other than the old hardcoded default: `getblockchaininfo` reports `"mode":
+  "prod"`, `"chain": "<the overridden id>"`, genesis loads correctly, `getnewaddress`
+  and a deliberately-wrong-credentials call both behave as expected. Not wired into
+  the seeder -- it isn't brought up by any `docker compose up` invocation yet at all
+  (see Known issues/Milestone 4), so wiring `NETWORK_ID` into it now would just be
+  another way for it to silently drift from the daemons' actual network id the moment
+  an override is used.
 - **All scripts are Python** (stdlib only, no third-party dependencies), converted
   from an earlier bash version -- class-based (`RepoCheckout`, `AggpubkeyCeremony`,
   `GenesisSigningCeremony`, `SignerConfigAssembler`, `TopologyWaiter`), sharing a

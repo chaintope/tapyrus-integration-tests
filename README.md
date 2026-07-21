@@ -71,22 +71,27 @@ list of what's left.
 
 ## Variables available to change during a run
 
-Every variable below is a `workflow_dispatch` input. The default in the table is defined
-in exactly one place, the workflow's `env:` block (`inputs.x || 'literal'`) -- not
-repeated on the input itself, since `workflow_dispatch` input `default:` fields can't
-hold an expression and `schedule`/`pull_request`/`push` runs have no `inputs` context to
-read one from anyway. A manual dispatch run that leaves a field blank gets the same
-value schedule does; the dispatch form just won't show it pre-filled. `pull_request`/
-`push` runs use smaller "smoke" values for the reorg/tx/rotation variables instead of
-the full-scale defaults below (see the workflow's `env:` block) -- irrelevant today since
-the steps that consume them are still TODO placeholders, but wired in now for when they
-land.
+Every variable below is a `workflow_dispatch` input. `workflow_dispatch` input
+`default:` fields can't hold an expression, and `schedule`/`pull_request`/`push` runs
+have no `inputs` context to read one from anyway, so no default is set on the inputs
+themselves. Two different mechanisms supply one when a field is left blank (a manual
+dispatch run that leaves a field blank gets the same value schedule does either way):
+
+- `core_repo_ref`/`signer_repo_ref`/`seeder_repo_ref` fall back to
+  [`config/repos.py`](config/repos.py)'s own default for that repo -- the single
+  source of truth for these three, not restated here (see that file for the current
+  values and why).
+- Every other variable below falls back to a literal in the workflow's `env:` block
+  (`inputs.x || 'literal'`), shown in the table below. `pull_request`/`push` runs use
+  smaller "smoke" values for the reorg/tx/rotation variables instead of the full-scale
+  defaults below (see the workflow's `env:` block) -- irrelevant today since the steps
+  that consume them are still TODO placeholders, but wired in now for when they land.
 
 | Variable | Default | Controls |
 | --- | --- | --- |
-| `core_repo_ref` | `master` | `tapyrus-core` branch/tag/sha to check out |
-| `signer_repo_ref` | `163_federationChangeTomlSetup` | `tapyrus-signer` branch/tag/sha to check out |
-| `seeder_repo_ref` | `master` | `tapyrus-seeder` branch/tag/sha to check out |
+| `core_repo_ref` | see `config/repos.py` | `tapyrus-core` branch/tag/sha to check out |
+| `signer_repo_ref` | see `config/repos.py` | `tapyrus-signer` branch/tag/sha to check out (override to `163_federationChangeToml` on the `Naviabheeman` fork to test rotation) |
+| `seeder_repo_ref` | see `config/repos.py` | `tapyrus-seeder` branch/tag/sha to check out |
 | `chain_height_before_reorg` | `30` | Baseline height to reach (all 7 nodes connected) before splitting for the reorg |
 | `reorg_loser_blocks` | `10` | Blocks the losing group builds past the baseline |
 | `reorg_winner_margin` | `2` | Extra blocks the winning group builds beyond `reorg_loser_blocks` (winner total = loser + margin, so a tie/shorter-winner is structurally impossible) |

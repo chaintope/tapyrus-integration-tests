@@ -19,11 +19,11 @@ on:
   workflow_dispatch:
     inputs:
       core_repo_ref:
-        description: 'tapyrus-core ref (branch/tag/sha) -- default: master'
+        description: 'tapyrus-core ref (branch/tag/sha) -- leave blank for config/repos.py''s default'
       signer_repo_ref:
-        description: 'tapyrus-signer ref (branch/tag/sha) -- default: 163_federationChangeTomlSetup'
+        description: 'tapyrus-signer ref (branch/tag/sha) -- leave blank for config/repos.py''s default; override to 163_federationChangeToml on the Naviabheeman fork to test rotation'
       seeder_repo_ref:
-        description: 'tapyrus-seeder ref (branch/tag/sha) -- default: master'
+        description: 'tapyrus-seeder ref (branch/tag/sha) -- leave blank for config/repos.py''s default'
 
       # --- reorg shape ---
       chain_height_before_reorg:
@@ -59,7 +59,7 @@ on:
 
       # --- misc ---
       network_id:
-        description: 'Tapyrus dev network id, used for genesis/seeder/RPC network selection -- default: 1905960821'
+        description: 'Tapyrus network id (prod mode -- see doc/work-done.md), used by every core-* node''s rendered tapyrus.conf and the genesis.<id> file tapyrusd looks for -- default: 1905960821. Not yet wired into the seeder (deferred, see the "Bring up tapyrus-seeder" step)'
       slack_log_tail_lines:
         description: 'Lines of the implicated container''s log to inline in the Slack failure report -- default: 100'
       docker_build_platform:
@@ -67,35 +67,33 @@ on:
 
   # Smoke run for changes to this repo's own scripts/compose/workflow -- proves the
   # pipeline still works end-to-end without waiting for Sunday's full-scale run to find
-  # out. Not the plan doc section 6 "not on every PR" non-goal: that's about the
-  # full-scale scenario running against every tapyrus-core/tapyrus-signer PR, which
-  # stays out of scope. This repo changes rarely, so validating its own PRs is cheap.
+  # out.
   pull_request:
-    paths:
-      - 'scripts/**'
-      - 'docker/**'
-      - 'config/**'
-      - '.github/workflows/**'
+    paths-ignore:
+      - 'doc/**'
   push:
     branches:
-      - main
-    paths:
-      - 'scripts/**'
-      - 'docker/**'
-      - 'config/**'
-      - '.github/workflows/**'
+      - '**'
+    paths-ignore:
+      - 'doc/**'
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # event_name is part of the key so a push-triggered smoke run can't cancel an
+  # in-progress schedule-triggered full-scale run (both would otherwise share the same
+  # github.ref on main).
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
-  CORE_REPO_REF: ${{ inputs.core_repo_ref || 'master' }}
-  SIGNER_REPO_REF: ${{ inputs.signer_repo_ref || '163_federationChangeTomlSetup' }}
-  SEEDER_REPO_REF: ${{ inputs.seeder_repo_ref || 'master' }}
+  # No literal fallback here (unlike the smoke-scale variables below) -- an
+  # unset/blank ref resolves to config/repos.py's own default, the single source of
+  # truth for these three, rather than a second copy of the same value living here.
+  CORE_REPO_REF: ${{ inputs.core_repo_ref }}
+  SIGNER_REPO_REF: ${{ inputs.signer_repo_ref }}
+  SEEDER_REPO_REF: ${{ inputs.seeder_repo_ref }}
   CHAIN_HEIGHT_BEFORE_REORG: ${{ inputs.chain_height_before_reorg || ((github.event_name == 'pull_request' || github.event_name == 'push') && '5' || '30') }}
   REORG_LOSER_BLOCKS: ${{ inputs.reorg_loser_blocks || ((github.event_name == 'pull_request' || github.event_name == 'push') && '2' || '10') }}
   REORG_WINNER_MARGIN: ${{ inputs.reorg_winner_margin || ((github.event_name == 'pull_request' || github.event_name == 'push') && '1' || '2') }}
@@ -116,7 +114,11 @@ env:
 jobs:
   integration-test:
     runs-on: ubuntu-latest
-    timeout-minutes: ${{ (github.event_name == 'pull_request' || github.event_name == 'push') && 60 || 360 }}
+    # Smoke: 3h. Full: 6h. Generous headroom for a cold run's full C++ tapyrus-core
+    # Docker build + a signer image build + a native `cargo build --release` (with its
+    # own vendored GMP build) back to back, on a 2-core runner -- worth re-measuring
+    # against a real run and tightening back down once actual timings are in.
+    timeout-minutes: ${{ (github.event_name == 'pull_request' || github.event_name == 'push') && 180 || 360 }}
     steps:
       - name: Checkout this repo
         uses: actions/checkout@v4
@@ -133,10 +135,10 @@ jobs:
         run: |
           docker build ${DOCKER_BUILD_PLATFORM:+--platform "$DOCKER_BUILD_PLATFORM"} \
             -t tapyrus/tapyrusd:master-local -f workdir/tapyrus-core/Dockerfile workdir/tapyrus-core
-      - name: Build tapyrus-signer image (tapyrus-signer:federation-setup-review)
+      - name: Build tapyrus-signer image (tapyrus-signer:integration-test)
         run: |
           docker build ${DOCKER_BUILD_PLATFORM:+--platform "$DOCKER_BUILD_PLATFORM"} \
-            -t tapyrus-signer:federation-setup-review workdir/tapyrus-signer
+            -t tapyrus-signer:integration-test workdir/tapyrus-signer
       - name: Build tapyrus-seeder image (tapyrus-seeder:integration-test)
         run: |
           docker build ${DOCKER_BUILD_PLATFORM:+--platform "$DOCKER_BUILD_PLATFORM"} \
@@ -150,11 +152,13 @@ jobs:
       - name: Build unsigned genesis
         run: |
           docker run --rm --entrypoint tapyrus-genesis tapyrus/tapyrusd:master-local \
-            -dev -signblockpubkey=$(cat secrets/signer-set-a/aggregated-public-key.txt) \
+            -signblockpubkey=$(cat secrets/signer-set-a/aggregated-public-key.txt) \
             > /tmp/unsigned-genesis.hex
       - name: Sign genesis (section 4a steps 4-7)
         run: TAPYRUS_SETUP_THRESHOLD=2 ./scripts/sign_genesis.py signer-set-a /tmp/unsigned-genesis.hex secrets/signer-set-a/genesis.hex
 
+      - name: Render tapyrus.conf (prod mode, NETWORK_ID wired through)
+        run: ./scripts/render_tapyrus_conf.py
       - name: Bring up redis + 7 core nodes
         run: |
           cd docker
@@ -164,32 +168,37 @@ jobs:
         run: |
           ./scripts/collect_coinbase_addresses.py 12381 12383 12385 --output /tmp/addrs.txt
           printf 'core-1a\ncore-2a\ncore-3a\n' > /tmp/core-rpc-hosts.txt
-      - name: Assemble signer-set-a configs
-        run: |
-          ROUND_DURATION="$ROUND_DURATION" ./scripts/assemble_signer_configs.py signer-set-a 2 \
-            /tmp/core-rpc-hosts.txt "$CORE_RPC_PORT" "$CORE_RPC_USER" "$CORE_RPC_PASS" redis 6379 /tmp/addrs.txt
-      - name: Bring up signer-set-a
-        run: |
-          cd docker
-          GENESIS_BLOCK_WITH_SIG=$(cat ../secrets/signer-set-a/genesis.hex) \
-            docker compose up -d signer-0 signer-1 signer-2
+      - name: Bring up tapyrus-seeder
+        run: echo "TODO -- image is built above but the seeder service is never started (no docker compose up includes it) and there's no dig-based pass/fail check -- see doc/project-plan.md Milestone 4"
+      # Commented out for this smoke run: only validating up through tapyrusd startup
+      # confirmation (finding #2), then falling straight through to teardown. Restore
+      # once Milestone 3/4's per-node/reorg/rotation scripting lands for real.
+      # - name: Assemble signer-set-a configs
+      #   run: |
+      #     ROUND_DURATION="$ROUND_DURATION" ./scripts/assemble_signer_configs.py signer-set-a 2 \
+      #       /tmp/core-rpc-hosts.txt "$CORE_RPC_PORT" "$CORE_RPC_USER" "$CORE_RPC_PASS" redis 6379 /tmp/addrs.txt
+      # - name: Bring up signer-set-a
+      #   run: |
+      #     cd docker
+      #     GENESIS_BLOCK_WITH_SIG=$(cat ../secrets/signer-set-a/genesis.hex) \
+      #       docker compose up -d signer-0 signer-1 signer-2
 
-      - name: Wait for topology to converge
-        run: ./scripts/wait_for_topology.py
+      # - name: Wait for topology to converge
+      #   run: ./scripts/wait_for_topology.py
 
-      - name: Per-node tx/query/stop-restart + max-block-size change
-        run: echo "TODO -- not yet scripted -- see doc/project-plan.md Milestone 3/4"
+      # - name: Per-node tx/query/stop-restart + max-block-size change
+      #   run: echo "TODO -- not yet scripted -- see doc/project-plan.md Milestone 3/4"
 
-      - name: Reorg
-        run: echo "TODO -- not yet scripted -- see doc/project-plan.md Milestone 3/4"
+      # - name: Reorg
+      #   run: echo "TODO -- not yet scripted -- see doc/project-plan.md Milestone 3/4"
 
-      - name: Generate signer-set-b aggpubkey (offline ceremony)
-        run: ./scripts/generate_dev_secrets.py signer-set-b 3 2
-      - name: Sign off rotation handoff + regenerate federations.toml (both entries)
-        run: echo "TODO -- not yet scripted -- see doc/project-plan.md Milestone 3/4"
+      # - name: Generate signer-set-b aggpubkey (offline ceremony)
+      #   run: ./scripts/generate_dev_secrets.py signer-set-b 3 2
+      # - name: Sign off rotation handoff + regenerate federations.toml (both entries)
+      #   run: echo "TODO -- not yet scripted -- see doc/project-plan.md Milestone 3/4"
 
-      - name: Confirm rotation took effect
-        run: echo "TODO -- not yet scripted -- see doc/project-plan.md Milestone 4"
+      # - name: Confirm rotation took effect
+      #   run: echo "TODO -- not yet scripted -- see doc/project-plan.md Milestone 4"
 
       - name: Collect logs
         if: always()
@@ -209,6 +218,6 @@ jobs:
         if: always()
         run: cd docker && docker compose down
 
-      - name: Send Slack report
-        if: always()
-        run: echo "TODO -- not yet scripted -- see doc/project-plan.md Milestone 4"
+      # - name: Send Slack report
+      #   if: always()
+      #   run: echo "TODO -- not yet scripted -- see doc/project-plan.md Milestone 4"

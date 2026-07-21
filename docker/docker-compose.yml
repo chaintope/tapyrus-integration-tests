@@ -24,6 +24,9 @@
 # Docker networks per edge) -- deliberately, per the plan doc, so a future adversary
 # node (connecting P2P to two first-layer nodes) remains buildable without rework.
 #
+# NETWORK/CONF: each core-* node mounts ./generated/tapyrus.conf (gitignored, rendered
+# by scripts/render_tapyrus_conf.py before `docker compose up` -- see the workflow)
+# with networkid=$NETWORK_ID -- see doc/work-done.md.
 #
 services:
   redis:
@@ -37,6 +40,8 @@ services:
     image: tapyrus/tapyrusd:master-local
     environment:
       GENESIS_BLOCK_WITH_SIG: ${GENESIS_BLOCK_WITH_SIG}
+    volumes:
+      - ./generated/tapyrus.conf:/etc/tapyrus/tapyrus.conf
     ports:
       - '12381:12381'
 
@@ -44,6 +49,8 @@ services:
     image: tapyrus/tapyrusd:master-local
     environment:
       GENESIS_BLOCK_WITH_SIG: ${GENESIS_BLOCK_WITH_SIG}
+    volumes:
+      - ./generated/tapyrus.conf:/etc/tapyrus/tapyrus.conf
     ports:
       - '12383:12381'
 
@@ -51,6 +58,8 @@ services:
     image: tapyrus/tapyrusd:master-local
     environment:
       GENESIS_BLOCK_WITH_SIG: ${GENESIS_BLOCK_WITH_SIG}
+    volumes:
+      - ./generated/tapyrus.conf:/etc/tapyrus/tapyrus.conf
     ports:
       - '12385:12381'
 
@@ -60,6 +69,8 @@ services:
     image: tapyrus/tapyrusd:master-local
     environment:
       GENESIS_BLOCK_WITH_SIG: ${GENESIS_BLOCK_WITH_SIG}
+    volumes:
+      - ./generated/tapyrus.conf:/etc/tapyrus/tapyrus.conf
     command: tapyrusd -datadir=$${DATA_DIR} -conf=$${CONF_DIR}/tapyrus.conf -connect=core-1a -listen=1
     ports:
       - '12382:12381'
@@ -68,6 +79,8 @@ services:
     image: tapyrus/tapyrusd:master-local
     environment:
       GENESIS_BLOCK_WITH_SIG: ${GENESIS_BLOCK_WITH_SIG}
+    volumes:
+      - ./generated/tapyrus.conf:/etc/tapyrus/tapyrus.conf
     command: tapyrusd -datadir=$${DATA_DIR} -conf=$${CONF_DIR}/tapyrus.conf -connect=core-2a -listen=1
     ports:
       - '12384:12381'
@@ -76,6 +89,8 @@ services:
     image: tapyrus/tapyrusd:master-local
     environment:
       GENESIS_BLOCK_WITH_SIG: ${GENESIS_BLOCK_WITH_SIG}
+    volumes:
+      - ./generated/tapyrus.conf:/etc/tapyrus/tapyrus.conf
     command: tapyrusd -datadir=$${DATA_DIR} -conf=$${CONF_DIR}/tapyrus.conf -connect=core-3a -listen=1
     ports:
       - '12386:12381'
@@ -86,6 +101,8 @@ services:
     image: tapyrus/tapyrusd:master-local
     environment:
       GENESIS_BLOCK_WITH_SIG: ${GENESIS_BLOCK_WITH_SIG}
+    volumes:
+      - ./generated/tapyrus.conf:/etc/tapyrus/tapyrus.conf
     command: >-
       tapyrusd -datadir=$${DATA_DIR} -conf=$${CONF_DIR}/tapyrus.conf
       -connect=core-1b -connect=core-2b -connect=core-3b
@@ -94,7 +111,7 @@ services:
 
   # --- signer-set-a: RPC target is each signer's first-layer node ----------
   signer-0:
-    image: tapyrus-signer:federation-setup-review
+    image: tapyrus-signer:integration-test
     volumes:
       - ../runtime/signers/node-0:/etc/tapyrus
     depends_on:
@@ -102,7 +119,7 @@ services:
       - core-1a
 
   signer-1:
-    image: tapyrus-signer:federation-setup-review
+    image: tapyrus-signer:integration-test
     volumes:
       - ../runtime/signers/node-1:/etc/tapyrus
     depends_on:
@@ -110,20 +127,18 @@ services:
       - core-2a
 
   signer-2:
-    image: tapyrus-signer:federation-setup-review
+    image: tapyrus-signer:integration-test
     volumes:
       - ../runtime/signers/node-2:/etc/tapyrus
     depends_on:
       - redis
       - core-3a
 
-  # --- tapyrus-seeder: previously deferred out of v1 scope (see plan doc section 1/6 --
-  # container DNS already handles peer discovery for this test, so the seeder was never
-  # load-bearing) -- added back for its own coverage. Crawls the network starting from
-  # core-1a and serves the resulting address list over DNS. -i/-s use OUR dev network id
-  # (1905960821, port 12383 -- see tapyrusd's default [dev] tapyrus.conf) and P2P port,
-  # not the image's default ENTRYPOINT (which hardcodes chaintope's real production
-  # seed/network id) -- entrypoint is fully overridden below rather than appended to,
+  # --- tapyrus-seeder: Crawls the network starting from core-1a and serves the resulting
+  # address list over DNS. -i/-s NETWORK_ID (core-*'s  networkid -- the
+  # seeder service is never actually brought up yet (see the workflow's "Bring up
+  # tapyrus-seeder" TODO step)
+  # entrypoint is fully overridden below rather than appended to,
   # since this image's ENTRYPOINT is a plain JSON-array exec form (no bash -c wrapper
   # like tapyrusd's, so no COMMAND OVERRIDE gotcha here). -h/-n/-m are placeholder
   # values -- harmless, since nothing outside this compose network ever queries them.
