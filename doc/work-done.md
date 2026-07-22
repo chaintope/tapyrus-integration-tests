@@ -271,6 +271,51 @@ threshold-signing their own blocks from a common tip, reconnected, and confirmed
    group A's block count exactly). `core-3a` (winning side throughout) showed a single
    active tip, as expected.
 
+**Scripted as `scripts/simulate_reorg.py`, re-verified end-to-end via the script (not
+by hand) at smoke scale** (`CHAIN_HEIGHT_BEFORE_REORG=5 REORG_LOSER_BLOCKS=2
+REORG_WINNER_MARGIN=1`, `ROUND_DURATION=60`): baseline reached height 5 with an
+identical tip on all 7 nodes; group A split off and built a 2-block fork to height 7
+(tip `04fe1a6d30e9...`); group B came back at the baseline tip, redis force-recreated
+fresh, all 3 signers repointed to `core-3a` and restarted; group B built a 3-block
+fork to height 8 (baseline + loser + margin, tip `f8087edd7ae4...`); group A
+reconnected and the topology reconverged in 3 polling attempts (~10s); `getchaintips`
+on every ex-group-A node (`core-1a`/`1b`/`2a`/`2b`) showed exactly two tips -- `active`
+matching group B's tip, `valid-fork` matching group A's tip with `branchlen=2` exactly
+-- and `core-3a` showed a single active tip. Total real runtime ~12.5 minutes (block
+production can only come from the live signer round-robin process at `ROUND_DURATION`
+cadence -- no instant-mining shortcut exists here, see `scripts.md`). First run of the
+new script standalone, first try, no fixes needed -- the recipe's own precision (exact
+heights, exact `branchlen`) left little room for the kind of subtle bugs earlier
+scripts in this repo turned up on their first live run. A real bug *did* turn up one
+step later, though, once this script started running after `generate_traffic.py`
+instead of alone -- see the next entry.
+
+- **`CHAIN_HEIGHT_BEFORE_REORG` must be a floor, not an assumed starting point --
+  found the moment `simulate_reorg.py` ran after `generate_traffic.py` in the same
+  job instead of standalone**: `_build_baseline` originally waited until height >=
+  `CHAIN_HEIGHT_BEFORE_REORG`, then computed the loser/winner fork targets from that
+  *same literal input value* (`baseline_height + loser_blocks`, etc.), not from
+  whatever height was actually reached. Harmless in isolation (nothing else was
+  producing blocks, so the literal value and the actual height matched). But wiring
+  `generate_traffic.py` in first meant the chain was typically already well past that
+  floor by the time the reorg step started -- confirmed live: `CHAIN_HEIGHT_BEFORE_REORG`
+  computed as `TX_ROUND_COUNT + 2 = 4`, but traffic generation had already pushed the
+  chain to height 11. Computing the losing-fork target from the literal `4` would have
+  given target `6` -- already exceeded by the existing height 11 -- so `_build_losing_fork`
+  would have returned immediately with group A having built *zero* new blocks past the
+  split: a silent no-op "reorg" that would still report success. Fixed: `_wait_for_height`
+  now returns the height actually reached (not just `None`/success), and `_build_baseline`
+  reassigns `self._baseline_height` to that real value before the loser/winner targets
+  are computed from it. Verified live: with the fix, the same scenario correctly logged
+  `baseline confirmed: all 7 nodes at height 11` and computed the losing-fork target as
+  `13` (11+2), and the full reorg completed correctly end-to-end afterward (`getchaintips`
+  showing the exact expected `branchlen`/active/valid-fork pattern on every ex-group-A
+  node). Lesson: a script verified correct in isolation can still hide an assumption
+  ("nothing else changes the world between my start and my first check") that only
+  breaks once it's composed with something else that changes that world first --
+  worth deliberately testing new orchestration scripts back-to-back with whatever
+  will really precede them in CI, not just standalone.
+
 ## Design decisions
 
 - **`tapyrus-genesis` invocation in CI**: runs via
@@ -326,6 +371,46 @@ threshold-signing their own blocks from a common tip, reconnected, and confirmed
   topology to converge" step exists specifically to catch this class of bug and now
   runs unconditionally (it only depends on the 7 core nodes, not signers, so it isn't
   gated behind the signers-never-brought-up block -- see "PR review response").
+- **`generate_traffic.py` "passed" while generating zero real transactions, because
+  `estimatesmartfee` has no history on a brand-new chain and `fallbackfee` defaults to
+  disabled** -- found running the actual traffic-generation step against a freshly
+  brought-up 7-node stack (signers included) for the first time on a real multi-round
+  run: every single funding/send/issuance call across both rounds failed with `-4 Fee
+  estimation failed. Fallbackfee is disabled. Wait a few blocks or enable
+  -fallbackfee.` (the four non-earning nodes then also failed downstream with `-8
+  Insufficient token balance in wallet`, since they were never funded). The script
+  still **exited 0** and logged "all N round(s) settled with balances matching the
+  ledger" -- its ledger-vs-reality assertion can't distinguish "real activity,
+  correctly tracked" from "total failure, trivially consistent" (both a never-funded
+  node's ledger entry and its actual RPC balance stay at exactly `0.0`). A green run
+  of this step is not by itself evidence traffic was generated -- check the log for
+  `round TPC send skipped` / `round colored action failed` warnings, not just the
+  final exit code. `tapyrusd --help` shows `-fallbackfee=<amt>` with "(default:
+  0.0002)" in its description, but that's documenting the example value, not the
+  actual default state -- the real default is disabled (0), matching Bitcoin Core's
+  own mainnet-safety convention; confirmed live (the exact error message says so, and
+  setting it changes behavior). Fixed by adding `fallbackfee=0.0002` to
+  `render_tapyrus_conf.py`'s rendered conf (safe to enable unconditionally here --
+  there's no real fee market on a throwaway dev chain to misjudge). Verified for real:
+  the same `sendtoaddress` call against a still-empty wallet now fails with the
+  *expected* `-8 Insufficient token balance` instead of `-4 Fee estimation failed`,
+  confirming fee estimation no longer blocks it (a real balance is still required, as
+  it should be) -- `estimatesmartfee` itself still reports "Insufficient data", which
+  is fine, since `fallbackfee` is exactly the documented escape hatch for that case.
+  Also added `dbcache=64` (450MB default is pure overhead for 7 concurrent containers
+  running a chain with a handful of blocks), `maxorphantx=20` (100 default is sized
+  for a real internet-facing node; this network's only peers are the other 6 fixed
+  `-connect` targets, but kept above 0 since the planned reorg step can transiently
+  orphan real transactions), and `mempoolexpiry=2` (hours; 336h/2-week default targets
+  a long-running production node, not a several-hour CI job). **Re-verified with a
+  full `generate_traffic.py` run** (not just the isolated `sendtoaddress` check
+  above), immediately before enabling both it and `simulate_reorg.py` in the
+  workflow: `tx_round_count=2` at smoke scale, zero `round TPC send skipped` / `round
+  colored action failed` warnings across both rounds (previously every single one
+  failed), real funding/issuance/transfer/topup activity throughout (including a
+  NON_REISSUABLE/NFT color rotation via the topup-mints-fresh-color path), settled
+  with balances matching the ledger for real this time, not vacuously. Chain reached
+  height 11 in ~12 minutes.
 - **All scripts are Python** (stdlib only, no third-party dependencies), converted
   from an earlier bash version -- class-based (`RepoCheckout`, `AggpubkeyCeremony`,
   `GenesisSigningCeremony`, `SignerConfigAssembler`, `TopologyWaiter`), sharing a
@@ -353,10 +438,12 @@ threshold-signing their own blocks from a common tip, reconnected, and confirmed
   section 6's "not on every PR" non-goal: that non-goal is about running the full-scale
   scenario against every PR opened on `tapyrus-core`/`tapyrus-signer` (cost/runtime
   prohibitive), not about validating this repo's own, rarely-changing PRs. The smoke
-  trigger runs the identical job at reduced scale (`chain_height_before_reorg`,
-  `reorg_loser_blocks`/`reorg_winner_margin`, `tx_round_count`,
-  `rotation_height_offset` all drop to smaller fallbacks, keyed off `github.event_name`
-  since `pull_request`/`push` runs have no `inputs` context) and a shorter
+  trigger runs the identical job at reduced scale (`reorg_loser_blocks`/
+  `reorg_winner_margin`, `tx_round_count`, `rotation_height_offset` all drop to
+  smaller fallbacks, keyed off `github.event_name` since `pull_request`/`push` runs
+  have no `inputs` context -- `chain_height_before_reorg` isn't in that list anymore;
+  it's always derived from `tx_round_count`, so it shrinks along with it automatically
+  rather than needing its own fallback) and a shorter
   `timeout-minutes` (60 vs. 360). `tx_round_count` is the one of these already wired to
   a real step (`generate_traffic.py`); the reorg/rotation variables still aren't
   consumed by anything -- wired in now so the smoke run is already fast once Milestone

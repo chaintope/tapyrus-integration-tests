@@ -33,10 +33,27 @@ See [`work-done.md`](work-done.md) for the full transcripts.
 
 ## Milestone 3 -- Scenario mechanics not yet built at all
 
-- [x] Per-node transaction generation -- `scripts/generate_traffic.py` (`TrafficNode` + `TrafficGenerator`). Round-robin TPC + colored-coin (REISSUABLE/NON_REISSUABLE/NFT mix, one type per node) sends across all 7 nodes, everything derived from a single round count (`tx_round_count`); balance verified against a tracked ledger after every block. Verified end-to-end against a real 7-node stack (`round_count=2`) -- three bugs found and fixed along the way, see `work-done.md`'s Lessons learnt. Wired into the workflow (`Generate round-robin TPC + colored-coin traffic` step).
+- [x] Per-node transaction generation -- `scripts/generate_traffic.py` (`TrafficNode` + `TrafficGenerator`). Round-robin TPC + colored-coin (REISSUABLE/NON_REISSUABLE/NFT mix, one type per node) sends across all 7 nodes, everything derived from a single round count (`tx_round_count`); balance verified against a tracked ledger after every block. Wired into the workflow (`Generate round-robin TPC + colored-coin traffic` step). Re-verified end-to-end with the `fallbackfee` fix in place (see `work-done.md`'s Lessons learnt): zero send/issuance failures across 2 full rounds, real balance changes throughout, settled correctly.
+- [ ] `generate_traffic.py`'s settle-height ledger assertion can't distinguish "real activity, correctly tracked" from "total failure, trivially consistent" (see above) -- worth a hard floor (e.g. assert at least N successful sends/mints happened this run, not just that tracked-vs-actual balances agree) so a fully-broken run fails loudly instead of exiting 0.
 - [ ] Per-node lifecycle orchestrator (RPC health/height/mempool query, stop, restart, confirm resync)
 - [ ] Max-block-size (xfield) change -- push, confirm an over-limit block is rejected and an in-limit block is accepted
 - [ ] Aggpubkey rotation handoff -- `--xfield` `sign`/`computesig` flow (current federation signs off on the new one) and a `federations.toml` writer that can append a second entry (today's `assemble_signer_configs.py` only ever writes one `[[federation]]` entry)
+- [x] Verify live transactions aren't lost during a reorg -- `scripts/simulate_reorg.py`
+  now injects one canary TPC transaction into group A right after the split (input
+  predates the fork point, so it can't legitimately conflict with anything group B
+  does), lets it confirm only on the losing fork, and after reconnection asserts it's
+  either re-confirmed or back in the mempool -- not vanished. Deliberately the simple
+  case only; see below for what's deferred.
+- [ ] **Deferred**: harder transaction-survival-at-reorg cases beyond the simple
+  canary above -- (a) a dependent-transaction chain (a second transaction spending
+  the canary's own output, both confirmed only post-split), to check whether the
+  mempool correctly cascades multiple orphaned transactions back in, not just a
+  single one; (b) a deliberate conflicting double-spend of the same input on both
+  forks, to confirm the losing side's version is correctly (not buggily) dropped,
+  distinguishing "lost because it conflicted" from "lost due to a bug"; (c) whether
+  an orphaned colored-coin issuance (`issuetoken`) that returns to the mempool keeps
+  its original color id correctly, or whether that identity can drift on
+  reconfirmation -- tapyrus-specific, no Bitcoin-Core precedent to lean on.
 
 ## Milestone 4 -- Wire verified/built pieces into actual CI
 
@@ -48,12 +65,31 @@ Each of these corresponds to a `TODO` placeholder step in
 - [x] Unsigned genesis build step (`tapyrus-genesis`) -- resolved toward `docker run --entrypoint tapyrus-genesis` against the already-built `tapyrus/tapyrusd:master-local` image (bypassing the image's daemon-oriented `entrypoint.sh` entirely), rather than a native binary from a second, separately-built copy -- guarantees the unsigned genesis matches the exact tapyrus-core commit under test. Not yet run against a real CI runner.
 - [x] Topology-convergence wait step -- `scripts/wait_for_topology.py` (`TopologyWaiter` class) polls `getconnectioncount` on all 7 nodes' published RPC ports for the expected 1/2/1/2/1/2/3 pattern, with a timeout and per-node mismatch reporting. **Not yet exercised against real or fake nodes** -- its own polling/convergence/timeout logic has no automated test; only the `CoreRpcClient` it's built on (see below) has been verified for real. Still open: `docker/docker-compose.yml` doesn't yet have compose-level healthchecks + `depends_on: condition: service_healthy` (plan doc section 3 step 6) -- this script is a CI-level equivalent, but the compose-file enhancement itself is separate, unstarted work.
 - [x] RPC-readiness retry for the coinbase-address-collection step -- `scripts/collect_coinbase_addresses.py` (flagged in PR review against commit `4d0a384`: the prior inline `curl | jq` loop had no retry and could silently write an empty/null address). **Verified against a real `tapyrusd` container**: the happy path (`getnewaddress` against an already-up node) and, at the shared `CoreRpcClient` level, a successful call and the HTTP 401-\>`RpcError` misclassification fix (see `work-done.md`). The retry-after-initial-unreachable, empty-result, and timeout-never-reachable paths are **not yet covered** by any automated test, real or fake -- this was previously (inaccurately) documented as "tested against fake RPC servers"; no such tests ever existed in this repo (see the original PR review's finding).
-- [x] Transaction-generation step wired in (`generate_traffic.py`, see Milestone 3) --
-  currently commented out in the workflow alongside the rest of the
-  signers-never-brought-up block (see "PR review response (round 2)"); re-enable once
-  that block is restored.
+- [x] Transaction-generation step wired in and **active** (`generate_traffic.py`) --
+  uncommented alongside "Assemble signer-set-a configs"/"Bring up signer-set-a" (the
+  rest of the per-node/max-block-size/rotation block stays commented, still genuinely
+  unbuilt). Re-verified end-to-end at smoke scale (`tx_round_count=2`) immediately
+  before the reorg step, back-to-back in the same job, with the `fallbackfee` fix in
+  place: zero send/issuance failures across both rounds (previously 100%), settled
+  with balances matching the ledger for real, not vacuously. See "PR review response
+  (round 6)".
 - [ ] Orchestrator step for per-node query/lifecycle + max-block-size change (depends on the remaining Milestone 3 pieces existing first)
-- [ ] Reorg scripted as a reusable CI step (recipe is verified by hand -- see `work-done.md` -- but every command was typed against a live stack, not captured as a script)
+- [x] Reorg scripted as a reusable CI step and **active** -- `scripts/simulate_reorg.py`
+  (`ReorgSimulator`). Encodes the hand-verified 8-step recipe
+  (`weekly-integration-test-plan.md` section 4d): build baseline, split, group A
+  builds its fork, bring group B back + reset redis fresh, repoint + restart signers
+  (reuses `assemble_signer_configs.py`'s `SignerConfigAssembler` directly), group B
+  builds the longer fork, reconnect (reuses `wait_for_topology.py`'s `TopologyWaiter`
+  directly), confirm via `getchaintips`. First script to drive `docker compose`
+  itself (stop/start/force-recreate specific services), not just RPC. Uncommented
+  right after the traffic-generation step. Re-verified end-to-end running
+  immediately after `generate_traffic.py` in the same job (not standalone): baseline
+  height derives from `TX_ROUND_COUNT + 2` (a floor, not a literal target -- the
+  script captures the height actually reached, well past that floor once traffic
+  generation has run, as the real reference point for fork-length math); every
+  ex-group-A node showed exactly 2 tips (`active` matching group B's winning tip,
+  `valid-fork` with `branchlen` matching group A's fork exactly); `core-3a` showed a
+  single active tip as expected. See "PR review response (round 6)".
 - [ ] Rotation step scripted (signer-set-b ceremony + `--xfield` handoff + config regen/restart at scheduled height)
 - [ ] Rotation-confirmation step
 - [ ] Slack report step (pass/fail, run metadata, both aggpubkeys, failure log tail) -- needs a Slack webhook secret provisioned (see Milestone 5)
@@ -231,6 +267,38 @@ content removed from the plan doc). What was still open, now fixed:
   the 401 empty-body path) but none of that is captured as a committed, automated
   test -- the exact gap finding #3 (round 4) pointed out. Worth doing before the next
   time `lib/rpc.py` changes, not before this PR merges.
+
+## PR review response (round 6 -- enable traffic generation + reorg in CI)
+
+- [x] `scripts/generate_traffic.py` and `scripts/simulate_reorg.py` uncommented in the
+  workflow (along with their shared prerequisite, signer-set-a bring-up) -- the
+  per-node lifecycle/max-block-size and all rotation steps stay commented out, still
+  genuinely unbuilt.
+- [x] `chain_height_before_reorg` removed as an independent `workflow_dispatch` input
+  -- `CHAIN_HEIGHT_BEFORE_REORG` is now always `TX_ROUND_COUNT + 2` (a new "Derive
+  CHAIN_HEIGHT_BEFORE_REORG from TX_ROUND_COUNT" step; `env:` block expressions have
+  no arithmetic operators, so this couldn't be a `${{ }}` one-liner). `tx_round_count`
+  took the freed input slot, now that its consuming step is active for real -- input
+  count stays at 10.
+- [x] Fixed a real correctness bug in `scripts/simulate_reorg.py` this surfaced:
+  `_build_baseline` computed the loser/winner fork targets from the literal
+  `CHAIN_HEIGHT_BEFORE_REORG` value, not the height actually reached. Harmless when
+  reorg ran standalone (nothing else had moved the chain), but with traffic
+  generation now running first in the same job, the chain is typically already well
+  past that floor by the time reorg starts -- computing targets from the stale
+  literal would have let already-elapsed height silently satisfy them too, producing
+  a no-op "reorg" (group A/B "build their fork" without any new blocks). Fixed:
+  `_wait_for_height` now returns the height actually reached, and `_build_baseline`
+  captures that as the new `self._baseline_height`, so downstream fork-target math is
+  always relative to reality, not the input.
+- [x] Re-verified end-to-end with both fixes together, back-to-back in the same live
+  stack (not two separate standalone runs): `generate_traffic.py` (`tx_round_count=2`)
+  produced zero failures and settled for real (chain reached height 11, well past the
+  naive `CHAIN_HEIGHT_BEFORE_REORG` floor of 4); `simulate_reorg.py` then correctly
+  logged "baseline confirmed: all 7 nodes at height 11" (not 4) and computed the
+  losing-fork target as 13 (11+2), not 6 (4+2) -- confirming the fix works exactly as
+  intended. `getchaintips` confirmed the reorg fully and correctly on every
+  ex-group-A node afterward. Total combined runtime at smoke scale: ~18 minutes.
 
 ## Milestone 5 -- Team/repo readiness
 

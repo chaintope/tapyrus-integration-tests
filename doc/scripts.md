@@ -183,6 +183,15 @@ just string formatting and a file write, nothing to overlap.
   from that and silently breaks every P2P edge (see `work-done.md`'s Lessons learnt
   for the full incident -- caught only by testing the real 7-node topology, not a
   single container).
+- **`fallbackfee=0.0002`, `dbcache=64`, `maxorphantx=20`, `mempoolexpiry=2`** (hours):
+  `fallbackfee` is required, not just tuning -- `tapyrusd`'s real default is disabled,
+  and on the brand-new chain every run starts, `estimatesmartfee` never has enough
+  history to let `sendtoaddress`/`issuetoken` succeed without it (confirmed live:
+  `scripts/generate_traffic.py` generated zero real transactions without this, every
+  call failing with `-4 Fee estimation failed`, yet the step still exited 0 -- see
+  `work-done.md`'s Lessons learnt). The other three are memory/lifetime bounds sized
+  down from their production-node defaults for a small, short-lived, closed-topology
+  test chain (7 fixed peers, a handful of blocks, a run measured in hours not weeks).
 - **Known limitation**: not wired into the `seeder` service's `-i`/`-s` flags (still
   hardcoded to `1905960821` in `docker/docker-compose.yml`) -- deliberately, since the
   seeder isn't brought up by any `docker compose up` invocation yet at all (see
@@ -295,10 +304,89 @@ assignment, and the balance-shortfall top-up mechanic). Implemented as `TrafficN
 - Verified end-to-end against a real 7-node stack (`round_count=2`, all three
   colored-coin types) -- see `doc/work-done.md`'s Lessons learnt for the bugs this
   found and fixed (a `gettransaction` fee-shape gap, a funding-phase timing gap).
+- **Requires `fallbackfee` set** (see `render_tapyrus_conf.py` above, which now sets
+  it) -- without it, every funding/send/issuance call on a brand-new chain fails with
+  `-4 Fee estimation failed`, and the script still **exits 0** (its settle-height
+  assertion can't tell "real activity, correctly tracked" apart from "total failure,
+  trivially consistent" -- both a never-funded node's ledger and its actual balance
+  stay `0.0`). A green run is not by itself evidence traffic was generated -- check
+  the log for `round TPC send skipped` / `round colored action failed` warnings. With
+  the fix, re-verified live: zero such warnings across 2 full rounds, real balance
+  changes throughout. See `doc/work-done.md`'s Lessons learnt for the full incident.
+- **Active in the workflow**, right after "Bring up signer-set-a" -- uncommented
+  along with `simulate_reorg.py` (which runs right after it) and their shared
+  prerequisite, signer-set-a bring-up; the per-node lifecycle/max-block-size and
+  rotation steps remain commented out, still genuinely unbuilt.
 - **Known limitation**: `core-1a`/`2a`/`3a`'s TPC balance is intentionally excluded from
   the settle-height assertion (logged, not asserted) -- they receive ongoing coinbase
   income whenever they propose a block, at a rate this script can't predict in advance.
   Their colored balances stay fully asserted.
+- **Known limitation**: the settle-height assertion has no hard floor on how much
+  activity actually succeeded (see the `fallbackfee` point above) -- worth adding one
+  (e.g. assert at least N sends/mints happened this run) so a fully-broken run fails
+  loudly instead of exiting 0.
+
+## `scripts/simulate_reorg.py`
+
+Drives a genuine two-sided reorg: splits the 7-node network into two isolated groups,
+lets each independently threshold-sign its own fork from a common baseline,
+reconnects, and confirms the losing group's fork shows up as a real `valid-fork` tip
+via `getchaintips` -- not simulated. Encodes the exact 8-step recipe in
+`weekly-integration-test-plan.md` section 4d, already run once by hand (see
+`work-done.md`'s "Reorg -- full run transcript"). Implemented as `ReorgSimulator`,
+following `generate_traffic.py`'s class-based/asyncio pattern. The first script to
+also drive `docker compose` itself (stop/start/force-recreate specific services), not
+just RPC -- via a small `_compose()` subprocess helper, matching `checkout_repos.py`'s
+`_run()` style.
+
+- **Usage**: `./scripts/simulate_reorg.py` (no arguments -- reads
+  `CHAIN_HEIGHT_BEFORE_REORG` / `REORG_LOSER_BLOCKS` / `REORG_WINNER_MARGIN` /
+  `CORE_RPC_USER` / `CORE_RPC_PASS` / `ROUND_DURATION` from the environment, same
+  job-level env vars the workflow already sets).
+- Requires the 7-node topology and signer-set-a already up and converged (same
+  precondition as `generate_traffic.py`, which this step runs right after in the
+  workflow).
+- **`CHAIN_HEIGHT_BEFORE_REORG` is a floor, not an assumed starting point**: the
+  workflow always sets it to `TX_ROUND_COUNT + 2` (see the root `README.md`'s
+  variable table), tying it to whatever `generate_traffic.py` produces first in the
+  same job. `_build_baseline` waits until height >= that floor, then captures
+  whatever height was *actually* reached (typically well past the floor) as the real
+  reference point for the loser/winner fork targets -- using the literal floor value
+  instead would let already-elapsed height silently satisfy those targets too,
+  producing a no-op "reorg" (group A/B "build their fork" without any new blocks).
+  Confirmed live: running right after `generate_traffic.py` (chain already at height
+  11, floor at 4), the script logged `baseline confirmed: all 7 nodes at height 11`
+  and computed the losing-fork target as 13 (11+2), not 6 (4+2).
+- **Why not `tapyrus-core`'s `generatetoaddress` RPC** (instant block mining): it needs
+  the aggregate *private* key as a parameter, not available here by design (threshold-
+  shared across the 3 signers, no single party holds it in a real ceremony). Blocks can
+  only come from the live `tapyrus-signerd` trio's normal round-robin process at
+  `ROUND_DURATION` cadence -- this script is inherently as slow as that process (~10-12
+  min at smoke-scale values, under an hour at full-scale, both well inside the 3h/6h
+  timeout budgets).
+- The repoint step (recipe step 5) reuses `assemble_signer_configs.py`'s
+  `SignerConfigAssembler` directly (not a subprocess) -- pubkeys come from
+  `secrets/<set-name>/pubkeys.txt` (persists for the whole job); each node's
+  `to-address` is re-read from its own already-written
+  `runtime/signers/node-<i>/tapyrus-signer.toml` (via stdlib `tomllib`, Python 3.11+)
+  rather than depending on the original "Collect coinbase addresses" step's `/tmp` file
+  still being around -- keeps this script self-contained. The reconnect step (recipe
+  step 7) reuses `wait_for_topology.py`'s `TopologyWaiter` directly, same reasoning.
+- **Output**: none written to disk -- verification results are logged; a mismatch at
+  any step raises `ReorgError` (non-zero exit).
+- Verified end-to-end twice against a real 7-node + signer-set-a stack: standalone
+  (`CHAIN_HEIGHT_BEFORE_REORG=5 REORG_LOSER_BLOCKS=2 REORG_WINNER_MARGIN=1`, ~12.5 min
+  real runtime) and immediately after a real `generate_traffic.py` run in the same
+  job (`REORG_LOSER_BLOCKS=2 REORG_WINNER_MARGIN=1`, `CHAIN_HEIGHT_BEFORE_REORG`
+  derived, ~6 min on top of traffic generation's ~12 min). Both times, every
+  ex-group-A node showed exactly 2 `getchaintips` entries (one `active` matching
+  group B's winning tip, one `valid-fork` with `branchlen` matching group A's fork
+  length exactly); `core-3a` showed a single active tip, as expected (never had a
+  competing fork of its own to abandon).
+- **Active in the workflow**, right after "Generate round-robin TPC + colored-coin
+  traffic" -- both steps were uncommented together (along with their shared
+  prerequisite, signer-set-a bring-up); the per-node lifecycle/max-block-size and
+  rotation steps remain commented out, still genuinely unbuilt.
 
 ## `docker/docker-compose.yml`
 

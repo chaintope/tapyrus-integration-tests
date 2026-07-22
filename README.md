@@ -48,28 +48,25 @@ A single `integration-test` job runs these steps in order:
    `getconnectioncount` against the expected 1/2/1/2/1/2/3 pattern), then collect a
    coinbase address from each first-layer node (`scripts/collect_coinbase_addresses.py`,
    retries until each node's RPC is actually up).
-6. **Bring up signers and per-node activity**: assemble each signer's config with
-   `scripts/assemble_signer_configs.py`, bring up the 3 signer-set-a containers,
-   round-robin TPC + colored-coin traffic across all 7 nodes with balances confirmed
-   after each block (`scripts/generate_traffic.py` -- built and verified against a
-   live stack, see `doc/work-done.md`), RPC health/height/mempool queries, and
-   stop/restart/resync for every node, plus the max-block-size (xfield) change
-   *(the query/lifecycle/max-block-size pieces are still not yet scripted -- and the
-   whole step is currently commented out in the workflow, signers included, pending
-   Milestone 3/4; see `doc/project-plan.md`)*.
-7. **Reorg**: split the network into two groups, let each build its own real
+6. **Bring up signers**: assemble each signer's config with
+   `scripts/assemble_signer_configs.py`, bring up the 3 signer-set-a containers.
+7. **Per-node activity**: round-robin TPC + colored-coin traffic across all 7 nodes
+   with balances confirmed after each block (`scripts/generate_traffic.py`); RPC
+   health/height/mempool queries and stop/restart/resync for every node, plus the
+   max-block-size (xfield) change, remain *(not yet scripted -- see
+   `doc/project-plan.md` Milestone 3/4)*.
+8. **Reorg**: split the network into two groups, let each build its own real
    threshold-signed fork, reconnect, and confirm convergence via `getchaintips`
-   *(recipe verified by hand -- see `doc/work-done.md`; not yet scripted as a reusable
-   step)*.
-8. **Aggpubkey rotation**: run the offline ceremony again for signer-set-b, then the
+   (`scripts/simulate_reorg.py`).
+9. **Aggpubkey rotation**: run the offline ceremony again for signer-set-b, then the
    `--xfield` sign/computesig handoff and a `federations.toml` with both entries
    *(not yet scripted)*.
-9. **Confirm the rotation** took effect at the scheduled height *(not yet scripted)*.
-10. **Bring up tapyrus-seeder** and confirm it resolves a real peer via `dig`
+10. **Confirm the rotation** took effect at the scheduled height *(not yet scripted)*.
+11. **Bring up tapyrus-seeder** and confirm it resolves a real peer via `dig`
     *(image is built, but the service itself is never started -- not yet scripted)*.
-11. **Teardown**: collect every container's logs, upload them as a CI artifact, then
+12. **Teardown**: collect every container's logs, upload them as a CI artifact, then
     `docker compose down` -- runs unconditionally (`if: always()`).
-12. **Slack report**: pass/fail summary, run metadata, both aggpubkeys, and (on failure)
+13. **Slack report**: pass/fail summary, run metadata, both aggpubkeys, and (on failure)
     the implicated container's tail log, sent unconditionally *(not yet scripted)*.
 
 Steps marked "not yet scripted" currently just `echo` a TODO pointing at the relevant
@@ -104,7 +101,7 @@ override per-run yet.
 | `core_repo_ref` | see `config/repos.py` | `tapyrus-core` branch/tag/sha to check out |
 | `signer_repo_ref` | see `config/repos.py` | `tapyrus-signer` branch/tag/sha to check out (override to `163_federationChangeToml` on the `Naviabheeman` fork to test rotation) |
 | `seeder_repo_ref` | see `config/repos.py` | `tapyrus-seeder` branch/tag/sha to check out |
-| `chain_height_before_reorg` | `30` | Baseline height to reach (all 7 nodes connected) before splitting for the reorg |
+| `tx_round_count` | `5` | Round-robin send/check/settle cycles `scripts/generate_traffic.py` runs -- each is 3 block-heights and 14 transactions (7 nodes x {TPC send, colored send-or-mint}), so this alone determines the tx/block/height totals for that step. Also determines the reorg's baseline height -- see below |
 | `reorg_loser_blocks` | `10` | Blocks the losing group builds past the baseline |
 | `reorg_winner_margin` | `2` | Extra blocks the winning group builds beyond `reorg_loser_blocks` (winner total = loser + margin, so a tie/shorter-winner is structurally impossible) |
 | `round_duration_seconds` | `60` | `tapyrus-signerd` round-duration (block interval) -- 60s avoids the `InvalidBlock` timing race a shorter duration hits, see `doc/work-done.md` |
@@ -112,17 +109,24 @@ override per-run yet.
 | `slack_log_tail_lines` | `100` | Lines of the implicated container's log inlined in the Slack failure report |
 | `docker_build_platform` | *(empty, runner-native)* | Docker `--platform` for image builds -- local verification only ever used `linux/arm64` |
 
-Not yet real inputs (env-literal only, no per-run override -- see above): `tx_total_count`
-(`20`), `tx_tpc_percent` (`30`), `tx_interval_seconds` (`30`), `tx_round_count` (`5`,
-`scripts/generate_traffic.py`'s round-robin send/check/settle cycle count -- each is 3
-block-heights and 14 transactions, 7 nodes x {TPC send, colored send-or-mint}, so this
-alone determines the tx/block/height totals for that step), `rotation_height_offset`
-(`10`), `max_block_size_new` (`2000000`), `prng_seed_base` (`github.run_id`). All feed
-steps that are still commented-out/TODO (Milestone 3/4) -- `generate_traffic.py`
-itself is fully built and verified (see `doc/work-done.md`), but its step is disabled
-along with the rest of the signers-never-brought-up block for now. Reintroduce as real
-inputs once a step lands for real, if the 10-input budget allows, or via a JSON
-"overrides" input / repo vars otherwise.
+Not yet real inputs (env-literal only, no per-run override -- see above):
+`tx_total_count` (`20`), `tx_tpc_percent` (`30`), `tx_interval_seconds` (`30`),
+`rotation_height_offset` (`10`), `max_block_size_new` (`2000000`), `prng_seed_base`
+(`github.run_id`). All feed steps that are still commented-out/TODO (Milestone 3/4).
+Reintroduce as real inputs once a step lands for real, if the 10-input budget allows,
+or via a JSON "overrides" input / repo vars otherwise.
+
+**No input at all** (not even an env-literal fallback): `chain_height_before_reorg`.
+`CHAIN_HEIGHT_BEFORE_REORG` is always `TX_ROUND_COUNT + 2` (computed by the "Derive
+CHAIN_HEIGHT_BEFORE_REORG from TX_ROUND_COUNT" workflow step, since `env:` block
+expressions have no arithmetic operators) -- ties the reorg's baseline directly to
+whatever `scripts/generate_traffic.py` actually produces first in the same job,
+rather than an independently-configured value that could silently drift out of sync
+with it. `scripts/simulate_reorg.py` treats this as a floor, not a literal target: it
+waits until the chain reaches at least that height, then uses whatever height was
+*actually* reached (which is typically well past the floor, since traffic generation
+runs first) as the real reference point for the loser/winner fork targets -- see
+`doc/work-done.md` for why that distinction matters.
 
 Not configurable per-run at all (hardcoded): the RPC port/user/pass (`12381` /
 `rpcuser` / `rpcpassword`), and the signer count (3) / threshold (2) -- the 7-node

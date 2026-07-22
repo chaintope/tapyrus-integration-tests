@@ -65,6 +65,31 @@ class TapyrusConfRenderer:
             "\n"
             "rpcport=12381\n"
             f"networkid={self._network_id}\n"
+            "\n"
+            # tapyrusd's own default is disabled (0), not the 0.0002 shown as an
+            # example in --help -- on a brand-new chain (every run here starts one),
+            # estimatesmartfee has no block history yet and sendtoaddress/issuetoken
+            # fail outright with "Fee estimation failed" until fallbackfee is set.
+            # Confirmed live: scripts/generate_traffic.py's funding/send/issuance
+            # calls failed 100% of the time without this, for the whole run, on a
+            # throwaway dev chain there's no real fee market to estimate anyway. See
+            # doc/work-done.md.
+            "fallbackfee=0.0002\n"
+            # Small test chain (a handful of blocks, a handful of UTXOs) -- the
+            # 450MB default is pure overhead across 7 concurrent core-* containers.
+            "dbcache=64\n"
+            # Default (100) sized for a real, internet-facing node fending off
+            # unconnectable garbage from arbitrary peers; this network's only peers
+            # are the other 6 core-* nodes (docker/docker-compose.yml's fixed
+            # -connect topology). Kept above 0, not tightened to it, since the
+            # planned reorg step (doc/project-plan.md Milestone 3/4) can transiently
+            # orphan real transactions from the losing side.
+            "maxorphantx=20\n"
+            # Default (336h / 2 weeks) targets a long-running production node; every
+            # run here is a single CI job under a few hours (see the workflow's
+            # timeout-minutes). 2h bounds mempool memory without risking evicting
+            # anything an hours-long full-scale run still needs mid-test.
+            "mempoolexpiry=2\n"
         )
 
 
