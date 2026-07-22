@@ -34,8 +34,17 @@ DEFAULT_OUTPUT = REPO_ROOT / "docker" / "generated" / "tapyrus.conf"
 
 class TapyrusConfRenderer:
     """Renders the one tapyrus.conf every core-* node mounts (see
-    docker/docker-compose.yml) -- prod mode, port/rpcport fixed to match the compose
-    file's port mappings, networkid the only thing that varies per run.
+    docker/docker-compose.yml) -- prod mode, rpcport fixed to match the compose file's
+    RPC port mappings, networkid the only thing that varies per run.
+
+    No `port=` (P2P listen port) override -- deliberately left at prod mode's own
+    default (2357, confirmed against a real container's "Bound to 0.0.0.0:2357" log
+    line). docker/docker-compose.yml's -connect=<service-name> targets have no
+    explicit port, so tapyrus-core resolves them against the chain's *default* P2P
+    port (CConnman::ConnectNode), not whatever this conf's own port= says -- pinning
+    port= to a value here would silently desync from what -connect actually dials,
+    breaking every P2P edge with nothing listening on the other end. See
+    doc/work-done.md.
     """
 
     def __init__(self, network_id, rpc_user, rpc_pass):
@@ -54,7 +63,6 @@ class TapyrusConfRenderer:
             "keypool=1\n"
             "discover=0\n"
             "\n"
-            "port=12383\n"
             "rpcport=12381\n"
             f"networkid={self._network_id}\n"
         )

@@ -16,6 +16,14 @@ on:
   # all, so a workflow_dispatch-only default couldn't be shared with those triggers
   # anyway. Every actual default lives in the env: block below instead, in one place --
   # leave a field blank on a manual dispatch and you get the same value schedule uses.
+  # GitHub Actions caps workflow_dispatch at 10 inputs -- exceeding it makes the whole
+  # workflow file invalid (startup_failure on every trigger, not just workflow_dispatch).
+  # tx_total_count/tx_tpc_percent/tx_interval_seconds/rotation_height_offset/
+  # max_block_size_new/prng_seed_base are dropped to stay at 10: their consuming steps
+  # are all still commented-out/TODO (Milestone 3/4), so nothing else changes. Their
+  # env: fallback literals stay below, ready for when a Milestone 3/4 step needs one --
+  # add it back then, or as a single JSON "overrides" input / repo vars if the list
+  # would otherwise exceed 10 again.
   workflow_dispatch:
     inputs:
       core_repo_ref:
@@ -33,29 +41,9 @@ on:
       reorg_winner_margin:
         description: 'Extra blocks the winning group builds beyond reorg_loser_blocks -- default: 2 (1 on pull_request/push)'
 
-      # --- transaction mix ---
-      tx_total_count:
-        description: 'Total number of transactions generated across the run -- default: 20 (4 on pull_request/push)'
-      tx_tpc_percent:
-        description: 'Percent of tx_total_count that are plain TPC transfers (remainder is colored-coin) -- default: 30'
-      tx_interval_seconds:
-        description: 'Seconds between each generated transaction -- default: 30 (2 on pull_request/push)'
-
       # --- block interval ---
       round_duration_seconds:
         description: 'tapyrus-signerd round-duration -- default: 60'
-
-      # --- rotation (scenario step 6) ---
-      rotation_height_offset:
-        description: 'Blocks ahead of the current tip to schedule signer-set-b''s takeover height -- default: 10 (3 on pull_request/push)'
-
-      # --- max block size change (scenario step 7) ---
-      max_block_size_new:
-        description: 'New max-block-size value pushed via the xfield change -- default: 2000000'
-
-      # --- determinism ---
-      prng_seed_base:
-        description: 'Base seed for per-node PRNGs (combined with node index) -- default: github.run_id'
 
       # --- misc ---
       network_id:
@@ -71,6 +59,12 @@ on:
   pull_request:
     paths-ignore:
       - 'doc/**'
+  # TEMPORARY: push.branches is '**' (any branch), not just 'main', as a workaround for
+  # this fork's first-time-contributor approval gate blocking pull_request runs while
+  # this PR is still unreviewed -- verifiable by pushing to the PR branch directly, no
+  # merge or approval needed. Once merged, this double-runs: any push to a PR branch in
+  # the base repo fires both pull_request AND push (two identical smoke runs per
+  # commit). Narrow back to `branches: [main]` once merged -- see doc/project-plan.md.
   push:
     branches:
       - '**'
@@ -164,6 +158,8 @@ jobs:
           cd docker
           GENESIS_BLOCK_WITH_SIG=$(cat ../secrets/signer-set-a/genesis.hex) \
             docker compose up -d redis core-1a core-1b core-2a core-2b core-3a core-3b core-7
+      - name: Wait for topology to converge
+        run: ./scripts/wait_for_topology.py
       - name: Collect coinbase addresses from each first-layer node
         run: |
           ./scripts/collect_coinbase_addresses.py 12381 12383 12385 --output /tmp/addrs.txt
@@ -182,9 +178,6 @@ jobs:
       #     cd docker
       #     GENESIS_BLOCK_WITH_SIG=$(cat ../secrets/signer-set-a/genesis.hex) \
       #       docker compose up -d signer-0 signer-1 signer-2
-
-      # - name: Wait for topology to converge
-      #   run: ./scripts/wait_for_topology.py
 
       # - name: Per-node tx/query/stop-restart + max-block-size change
       #   run: echo "TODO -- not yet scripted -- see doc/project-plan.md Milestone 3/4"

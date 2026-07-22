@@ -20,17 +20,6 @@ done-vs-outstanding progress, and [`scripts.md`](scripts.md) for what each scrip
   branch** (`Naviabheeman/tapyrus-seeder` @ `docker-build-fix`) so at least one CI
   trigger can go green before #5 merges -- switch back to `chaintope/tapyrus-seeder` @
   `master` once it does.
-- **`tapyrus-signer`'s `master` fails to build on Apple Silicon** -- the vendored
-  `gmp-mpfr-sys` build runs GMP's own test suite, which segfaults/aborts there. Fix
-  (skip the self-test via the `c-no-tests` feature) is up as
-  [`chaintope/tapyrus-signer#172`](https://github.com/chaintope/tapyrus-signer/pull/172),
-  not yet merged. Turned out the toolchain pin originally suspected as also-needed
-  (rustc 1.76+ breaking a `rustc-serialize` lifetime-checking case) isn't required --
-  `master` already carries a `rustc-serialize` 0.3.25 bump that avoids it; only the
-  GMP self-test skip was actually needed. **`SIGNER_REPO_REF`/`SIGNER_REPO_URL`
-  default to the PR's own branch** (`Naviabheeman/tapyrus-signer` @
-  `master-build-fix`) so at least one CI trigger can go green before #172 merges --
-  switch back to `chaintope/tapyrus-signer` @ `master` once it does.
 - **GitHub-hosted `ubuntu-latest` runner's CPU/disk sufficiency is unconfirmed** for 7
   core nodes + 3 signers + redis + seeder running concurrently -- may need
   self-hosted.
@@ -43,10 +32,14 @@ done-vs-outstanding progress, and [`scripts.md`](scripts.md) for what each scrip
   federation change/rotation** (the `--xfield` sign/computesig flow, multi-entry
   `federations.toml`) -- `chaintope/tapyrus-signer`'s own `master` already has the base
   ceremony (createkey/createnodevss/aggregate/genesis-signing, confirmed nearly
-  identical). Override `SIGNER_REPO_URL`/`SIGNER_REPO_REF` to that fork+branch when
-  testing rotation (Milestone 3/4's rotation items) -- see the current
-  `SIGNER_REPO_REF`/`SIGNER_REPO_URL` default above for what the default is *today*
-  (temporarily the `#172` PR branch, not `master`, until it merges).
+  identical), and now builds out of the box too
+  ([`chaintope/tapyrus-signer#172`](https://github.com/chaintope/tapyrus-signer/pull/172)
+  merged -- confirmed directly against a fresh `chaintope/master` fetch, not just PR
+  metadata: its new tip is that fix commit, with `gmp-mpfr-sys`'s `c-no-tests` feature
+  present in `Cargo.toml`, and `cargo build --release` verified clean against it).
+  Override `SIGNER_REPO_URL`/`SIGNER_REPO_REF` to the `Naviabheeman` fork's
+  `163_federationChangeToml` branch when testing rotation (Milestone 3/4's rotation
+  items).
 - **Signer count (3) / threshold (2) is hardcoded**, not a per-run variable -- the
   7-node topology in `docker-compose.yml` is wired 1:1 to exactly 3 signers; changing
   the count means redesigning the topology, not just passing a different number.
@@ -173,6 +166,25 @@ done-vs-outstanding progress, and [`scripts.md`](scripts.md) for what each scrip
   `scripts/collect_coinbase_addresses.py`, which retries each node via
   `lib/rpc.py`'s `RpcUnreachable` until it answers (or times out loudly) and raises on
   an empty address instead of writing one.
+- **`RPC_IN_WARMUP` (-28) is a real, common state to retry through, not just
+  connection-refused/timeout** -- fixing `lib/rpc.py`'s `HTTPError`->`RpcError`
+  misclassification (see the Design decisions entry above) accidentally regressed
+  this: `tapyrusd` serves `-28` as HTTP 500 with a JSON-RPC error body
+  (`JSONRPCError` -> `JSONErrorReply`, confirmed by reading `src/rpc/protocol.cpp` /
+  `src/httprpc.cpp` in a real `tapyrus-core` checkout), which is exactly the readiness
+  window right after `docker compose up` -- so classifying every `HTTPError` as a hard
+  `RpcError` killed the retry loop instantly on that window instead of polling through
+  it, a regression the previous fix's own review request explicitly asked to avoid.
+  Confirmed live against a real container racing the actual warmup window (not
+  simulated): 30 consecutive real `-28` responses (`"Verifying wallet(s)...",
+  "Loading block index..."`), all correctly retried, then a clean success. Fixed by
+  parsing the `HTTPError`'s JSON body and treating `error.code == -28` as retryable
+  (`RpcUnreachable`) same as connection-refused, while still raising `RpcError` (now
+  with the JSON-RPC error code/message included, not just the bare HTTP status) for
+  every other HTTP error. A bad-credentials 401 has **no response body at all**
+  (`HTTPReq_JSONRPC`'s auth-failure path calls `WriteReply` with no body argument) --
+  confirmed this doesn't crash the JSON parse, verified live against a real container
+  too.
 
 ## Reorg -- full run transcript
 
@@ -231,6 +243,31 @@ threshold-signing their own blocks from a common tip, reconnected, and confirmed
   (see Known issues/Milestone 4), so wiring `NETWORK_ID` into it now would just be
   another way for it to silently drift from the daemons' actual network id the moment
   an override is used.
+- **The prod-mode switch above initially broke P2P entirely, caught only by testing
+  the real 7-node topology, not a single container**: the first version of
+  `render_tapyrus_conf.py` also pinned `port=12383` (dev mode's default P2P port,
+  matching the old auto-generated conf) to keep the RPC-port-table story simple. But
+  `docker/docker-compose.yml`'s `-connect=<service-name>` targets have no explicit
+  port, and `tapyrus-core` resolves a portless `-connect` against the *chain's own
+  default* P2P port (`CConnman::ConnectNode`), not whatever `port=` says in that
+  node's own conf. Prod mode's default P2P port is `2357` (confirmed against a real
+  container's `Bound to 0.0.0.0:2357` log line with no `port=` override present) --
+  not `12383`. With `port=12383` pinned, every node listened on `12383` but every
+  `-connect` dialed port `2357` where nothing was listening: zero P2P connections,
+  4/7 nodes stuck permanently at 0 peers. A single-container `getblockchaininfo` check
+  (`"mode": "prod"`) can't catch this at all -- it says nothing about what port the
+  node bound to or who successfully connected to whom. Only running the real 7-node
+  `docker-compose.yml` and polling `getconnectioncount` (`wait_for_topology.py`)
+  surfaced it. Fixed by dropping `port=` from the rendered conf entirely, letting
+  every node fall back to the same chain-default port `-connect` already resolves
+  against -- verified for real: `wait_for_topology.py` against the live 7-node stack
+  converged on attempt 1, matching the expected 1/2/1/2/1/2/3 pattern exactly, and
+  `getpeerinfo` on a second-layer node directly confirmed 2 real peer connections.
+  Lesson: whenever a P2P-relevant conf value changes, verify against the full
+  multi-node topology, not a single node in isolation -- the smoke run's "Wait for
+  topology to converge" step exists specifically to catch this class of bug and now
+  runs unconditionally (it only depends on the 7 core nodes, not signers, so it isn't
+  gated behind the signers-never-brought-up block -- see "PR review response").
 - **All scripts are Python** (stdlib only, no third-party dependencies), converted
   from an earlier bash version -- class-based (`RepoCheckout`, `AggpubkeyCeremony`,
   `GenesisSigningCeremony`, `SignerConfigAssembler`, `TopologyWaiter`), sharing a

@@ -28,17 +28,18 @@ class ReposConfig:
     """Default checkout targets for all three repos this test spans."""
 
     def __init__(self):
-        # TEMPORARY: pointed at the Naviabheeman fork's master-build-fix branch, not
-        # chaintope/tapyrus-signer's master, because master doesn't build out of the
-        # box yet (see doc/work-done.md) -- master-build-fix is chaintope/tapyrus-signer#172,
-        # not yet merged. Switch back to chaintope/tapyrus-signer @ master once #172 merges.
-        # For federation-change/rotation testing (--xfield sign/computesig, multi-entry
-        # federations.toml), override SIGNER_REPO_URL/SIGNER_REPO_REF to the same fork's
-        # 163_federationChangeToml branch instead.
+        # chaintope/tapyrus-signer#172 (the gmp-mpfr-sys c-no-tests build fix) merged
+        # -- confirmed directly against a fresh chaintope/master fetch, not just PR
+        # metadata: its new tip is literally that fix commit, with the feature present
+        # in Cargo.toml. master has the base ceremony (createkey/createnodevss/
+        # aggregate/genesis-sign) but not the federation-change/rotation ceremony
+        # (--xfield sign/computesig, multi-entry federations.toml) -- that only exists
+        # on the Naviabheeman fork's 163_federationChangeToml branch. Override
+        # SIGNER_REPO_URL/SIGNER_REPO_REF to that fork+branch when testing rotation.
         self.signer = RepoTarget(
             "tapyrus-signer", "SIGNER",
-            "https://github.com/Naviabheeman/tapyrus-signer.git",
-            "master-build-fix",
+            "https://github.com/chaintope/tapyrus-signer.git",
+            "master",
         )
         self.core = RepoTarget(
             "tapyrus-core", "CORE",

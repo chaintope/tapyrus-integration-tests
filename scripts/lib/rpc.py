@@ -54,11 +54,30 @@ class CoreRpcClient:
             with urllib.request.urlopen(request, timeout=self._timeout_seconds) as response:
                 payload = json.loads(response.read())
         except urllib.error.HTTPError as exc:
-            # The node answered (wrong RPC credentials, malformed request, ...) --
-            # HTTPError is a URLError subclass, so it must be caught here, ahead of
-            # the URLError branch below, or it would be misclassified as "not
-            # reachable yet" and retried forever instead of surfacing the real error.
-            raise RpcError(f"{method} against {self._url}: HTTP {exc.code} {exc.reason}") from exc
+            # The node answered (wrong RPC credentials, malformed request, still
+            # warming up, ...) -- HTTPError is a URLError subclass, so it must be
+            # caught here, ahead of the URLError branch below, or it would be
+            # misclassified as "not reachable yet" and retried forever instead of
+            # surfacing the real error.
+            #
+            # tapyrusd serves RPC_IN_WARMUP (-28) as HTTP 500 with a JSON-RPC error
+            # body (JSONRPCError -> JSONErrorReply, src/rpc/protocol.cpp /
+            # src/httprpc.cpp) -- that's the readiness window right after `docker
+            # compose up`, so it must stay retryable like RpcUnreachable, not become a
+            # hard failure. A bad-credentials 401 has no body at all
+            # (HTTPReq_JSONRPC's auth-failure path calls WriteReply with no body), so
+            # the JSON parse below is expected to fail for that case -- caught and
+            # treated as "no error object", not re-raised.
+            try:
+                error = json.loads(exc.read()).get("error") or {}
+            except (json.JSONDecodeError, ValueError):
+                error = {}
+            if error.get("code") == -28:
+                raise RpcUnreachable(
+                    f"{method} against {self._url}: still warming up ({error.get('message', 'RPC_IN_WARMUP')})"
+                ) from exc
+            detail = f"{error['code']} {error['message']}" if error else f"HTTP {exc.code} {exc.reason}"
+            raise RpcError(f"{method} against {self._url}: {detail}") from exc
         except (urllib.error.URLError, ConnectionError, TimeoutError) as exc:
             raise RpcUnreachable(f"{method} against {self._url}: {exc}") from exc
 

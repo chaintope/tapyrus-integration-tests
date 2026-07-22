@@ -54,16 +54,13 @@ that value wins; otherwise the default here applies -- so this file's defaults a
 also what a schedule-triggered run (no `inputs` context) and any local/manual
 invocation fall back to.
 
-- `SIGNER_REPO_URL` / `SIGNER_REPO_REF` -- **TEMPORARY default**
-  `https://github.com/Naviabheeman/tapyrus-signer.git` @ `master-build-fix`, tracking
-  unmerged [`chaintope/tapyrus-signer#172`](https://github.com/chaintope/tapyrus-signer/pull/172)
-  (the `gmp-mpfr-sys` self-test skip that lets `cargo build --release` succeed --
-  `chaintope/tapyrus-signer`'s own `master` doesn't build out of the box, see
-  `work-done.md`). Switch back to `https://github.com/chaintope/tapyrus-signer.git` @
-  `master` once #172 merges. For federation-change/rotation testing (`--xfield`
-  sign/computesig, multi-entry `federations.toml`), override both to
+- `SIGNER_REPO_URL` / `SIGNER_REPO_REF` -- default
+  `https://github.com/chaintope/tapyrus-signer.git` @ `master`, which has the base
+  `tapyrus-setup` ceremony (createkey/createnodevss/aggregate/genesis-sign) but not
+  the federation-change/rotation ceremony (`--xfield` sign/computesig, multi-entry
+  `federations.toml`). Override both to
   `https://github.com/Naviabheeman/tapyrus-signer.git` @ `163_federationChangeToml`
-  instead, e.g.:
+  to test rotation, e.g.:
   `SIGNER_REPO_URL=https://github.com/Naviabheeman/tapyrus-signer.git SIGNER_REPO_REF=163_federationChangeToml`.
 - `CORE_REPO_URL` / `CORE_REPO_REF` -- default
   `https://github.com/chaintope/tapyrus-core.git` @ `master`.
@@ -179,6 +176,13 @@ just string formatting and a file write, nothing to overlap.
   `sign_genesis.py` above), with `networkid=$NETWORK_ID` -- verified against a real
   container: `getblockchaininfo` reports `"mode": "prod"` and `"chain":
   "<NETWORK_ID>"`.
+- **No `port=` (P2P listen port) override**: deliberately left at prod mode's own
+  default (`2357`) rather than pinned to dev mode's old `12383` -- `-connect=` in
+  `docker/docker-compose.yml` has no explicit port, so it resolves against the
+  chain's *default* P2P port, not this conf's `port=`. Pinning `port=` here desyncs
+  from that and silently breaks every P2P edge (see `work-done.md`'s Lessons learnt
+  for the full incident -- caught only by testing the real 7-node topology, not a
+  single container).
 - **Known limitation**: not wired into the `seeder` service's `-i`/`-s` flags (still
   hardcoded to `1905960821` in `docker/docker-compose.yml`) -- deliberately, since the
   seeder isn't brought up by any `docker compose up` invocation yet at all (see

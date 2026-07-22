@@ -135,9 +135,15 @@ services:
       - core-3a
 
   # --- tapyrus-seeder: Crawls the network starting from core-1a and serves the resulting
-  # address list over DNS. -i/-s NETWORK_ID (core-*'s  networkid -- the
-  # seeder service is never actually brought up yet (see the workflow's "Bring up
-  # tapyrus-seeder" TODO step)
+  # address list over DNS. -i/-s hardcode 1905960821 (not wired to NETWORK_ID -- the
+  # seeder service is never actually brought up yet, see the workflow's "Bring up
+  # tapyrus-seeder" TODO step; wire it in once that lands). -s's port is 2357, prod
+  # mode's default P2P port (confirmed against a real container's "Bound to
+  # 0.0.0.0:2357" log line) -- NOT core-*'s rpcport (12381/83/85). See
+  # render_tapyrus_conf.py and doc/work-done.md for why core-* has no explicit `port=`
+  # override: -connect=<service-name> (no port suffix) resolves against the chain's
+  # default P2P port too, so both sides have to agree on that same default, not a
+  # value pinned here or in the conf.
   # entrypoint is fully overridden below rather than appended to,
   # since this image's ENTRYPOINT is a plain JSON-array exec form (no bash -c wrapper
   # like tapyrusd's, so no COMMAND OVERRIDE gotcha here). -h/-n/-m are placeholder
@@ -177,7 +183,7 @@ services:
       - -i
       - '1905960821'
       - -s
-      - '1905960821:core-1a:12383'
+      - '1905960821:core-1a:2357'
       - -h
       - seed.tapyrus-integration-tests.local
       - -n

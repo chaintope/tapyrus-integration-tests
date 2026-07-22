@@ -150,6 +150,84 @@ content removed from the plan doc). What was still open, now fixed:
   non-numeric value would land in the generated `federations.toml` unvalidated
   instead of failing loudly at parse time. Fixed.
 
+## PR review response (round 4 -- workflow validity, P2P port break, HTTP -28, stale signer default)
+
+- [x] "Every trigger ends in startup_failure" (blocking) -- `workflow_dispatch`
+  defined 16 inputs; GitHub Actions caps it at 10, and exceeding that makes the whole
+  workflow file invalid for every trigger, not just `workflow_dispatch` (confirmed via
+  two real fork runs, both `startup_failure`, once the `push: branches: '**'` change
+  from round 3 started actually exercising the trigger). Cut to 10: dropped
+  `tx_total_count`/`tx_tpc_percent`/`tx_interval_seconds`/`rotation_height_offset`/
+  `max_block_size_new`/`prng_seed_base` -- all consumed only by still-commented-out/TODO
+  steps, so nothing else changes. Their `env:` fallback literals stay in place
+  (referencing a now-undeclared `inputs.x` is not a schema error -- it just evaluates
+  to `null`/falls through to the literal at runtime, for every trigger, not only the
+  ones that already had no `inputs` context); reintroduce as real inputs, a JSON
+  "overrides" input, or repo vars once a Milestone 3/4 step actually needs one.
+- [x] "The prod-mode switch breaks the P2P topology" (blocking) --
+  `render_tapyrus_conf.py` also pinned `port=12383` (dev mode's old P2P port) in the
+  rendered conf, but `docker-compose.yml`'s portless `-connect=<service-name>`
+  resolves against the *chain's default* P2P port, which for prod mode is `2357`, not
+  `12383`. Every `-connect` edge (core-1b/2b/3b/7) was dialing a port nothing
+  listened on -- zero P2P connections, topology never converges. Fixed by dropping
+  `port=` from the rendered conf entirely (not pinning `:12383` on every `-connect`
+  instead, to avoid a second place the port number has to stay in sync). Also fixed
+  the seeder's `-s` crawl-start target (`docker-compose.yml`), which encoded the same
+  stale `12383` P2P port. Verified for real against the full 7-node topology (not just
+  one container): `wait_for_topology.py` converged on attempt 1 matching the expected
+  1/2/1/2/1/2/3 pattern, `getpeerinfo` on `core-1b` directly confirmed 2 real peers.
+  See `work-done.md`'s Lessons learnt for the full incident writeup.
+- [x] Related/compounding -- "Wait for topology to converge" moved out of the
+  commented-out signers-never-brought-up block and now runs unconditionally right
+  after the 7 core nodes come up: it only depends on `getconnectioncount` against the
+  core nodes, not signers, and it's exactly the check that would have caught the P2P
+  break above. `collect_coinbase_addresses.py`'s RPC-only check could pass on a fully
+  partitioned network, so this closes that gap for future P2P-relevant changes too.
+- [x] "HTTPError fix regressed warmup handling" -- the round-3 `HTTPError`->`RpcError`
+  fix (correctly) stopped misclassifying real RPC errors as retryable, but along with
+  it also stopped retrying `RPC_IN_WARMUP` (-28), which `tapyrusd` serves as HTTP 500
+  with a JSON-RPC error body -- exactly the readiness window right after `docker
+  compose up`, and exactly what the *original* review request asked to keep working.
+  Fixed in `lib/rpc.py`: `-28` is now parsed out of the `HTTPError` body and raises
+  `RpcUnreachable` (retryable), same as connection-refused; every other HTTP error
+  still raises `RpcError`, now with the JSON-RPC code/message included instead of
+  just the bare HTTP status. Verified live racing a real container's actual warmup
+  window (not simulated): 30 consecutive real `-28` responses, all retried, then a
+  clean success; a bad-credentials 401 (which has no response body at all) still
+  raises `RpcError` without crashing the JSON parse. See `work-done.md`'s Lessons
+  learnt for the full writeup, including the exact `tapyrus-core` source read to
+  confirm the response shape.
+- [x] "chaintope/tapyrus-signer#172 has merged -- temporary signer default is
+  obsolete" -- confirmed independently (not just PR metadata): fetched
+  `chaintope/tapyrus-signer`'s `master` fresh, its new tip is literally the
+  `c-no-tests` fix commit, `Cargo.toml` has the feature, and `cargo build --release`
+  against it is clean. `config/repos.py`'s `SIGNER_REPO_URL`/`SIGNER_REPO_REF` default
+  switched from the `Naviabheeman` fork's `master-build-fix` straight back to
+  `chaintope/tapyrus-signer` @ `master`; the `TEMPORARY` comment block trimmed to just
+  the seeder case (`chaintope/tapyrus-seeder#5` -- checked too, still unmerged:
+  `chaintope/tapyrus-seeder`'s `master` tip is still the old pre-fix commit, `main.cpp`
+  still has the `sprintf`/`%d` bugs).
+
+## PR review response (round 5 -- push/pull_request double-run, comment fix, test suggestion)
+
+- [x] "push: branches: '**' double-runs with pull_request after merge" -- correct: any
+  push to a PR branch that lives in the base repo (not a fork) fires both `push` and
+  `pull_request`, two identical smoke runs per commit. `'**'` stays for now -- it's the
+  only way to verify a fix by pushing directly while this PR is still blocked on the
+  fork's first-time-contributor approval gate -- but flagged with a `TEMPORARY`
+  comment in the workflow explaining the double-run and pointing back here: narrow
+  `push.branches` to `[main]` once this PR merges.
+- [x] "docker-compose.yml's seeder comment got mangled mid-edit" -- already fixed by
+  the time this was raised (a full rewrite of that comment block landed in round 4);
+  re-verified no fragment/double-space artifacts remain.
+- [ ] "A minimal tests/ for CoreRpcClient (warmup-retry, 401, unreachable-timeout) as
+  a cheap early CI step would pay for itself" -- flagged non-blocking; not built yet.
+  All three paths have been verified by hand against real containers this cycle (see
+  `work-done.md`'s Lessons learnt: the `-28` warmup-retry regression and its fix, plus
+  the 401 empty-body path) but none of that is captured as a committed, automated
+  test -- the exact gap finding #3 (round 4) pointed out. Worth doing before the next
+  time `lib/rpc.py` changes, not before this PR merges.
+
 ## Milestone 5 -- Team/repo readiness
 
 - [x] Dedicated repo exists (`chaintope/tapyrus-integration-tests`)
