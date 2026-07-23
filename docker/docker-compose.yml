@@ -148,34 +148,6 @@ services:
   # since this image's ENTRYPOINT is a plain JSON-array exec form (no bash -c wrapper
   # like tapyrusd's, so no COMMAND OVERRIDE gotcha here). -h/-n/-m are placeholder
   # values -- harmless, since nothing outside this compose network ever queries them.
-  #
-  # Image built locally from a patched branch (`docker-build-fix`, on top of this repo's
-  # own local `tapyrus-seeder` checkout) -- the upstream Dockerfile/source as-is has FOUR
-  # real bugs, all found and fixed here, all confirmed live:
-  #   1. Build failure: Alpine 3.7's g++ rejects a designated-initializer used for
-  #      `struct msghdr` in dns.cpp as "non-trivial" (not architecture-specific -- fails
-  #      identically on linux/arm64 and linux/amd64). Fixed with plain field assignment
-  #      instead of the designated initializer (same semantics).
-  #   2. Runtime segfault on first real connection: `char filename[25]` in main.cpp is
-  #      too small for its own sprintf format strings (`tapyrusdnsstats_%d.log` alone
-  #      needs up to 31 bytes for a 10-digit network id) -- overflows even for the
-  #      image's own default hardcoded production network id, not just ours. Caught by
-  #      Alpine/musl's fortified sprintf (SIGTRAP), confirmed via gdb + a core dump.
-  #      Fixed by bumping both `filename` buffers to 64 bytes.
-  #   3/4. Two data races (intermittent crash, ~1/3 of runs, even after fixes 1-2) found
-  #      with a ThreadSanitizer build on ubuntu:22.04 (musl/Alpine has weak TSan support,
-  #      so this diagnostic step used a separate glibc-based build, same source): (a)
-  #      dns.cpp's global `listenSocket` was checked-and-created with no synchronization
-  #      across the 4 concurrent DNS threads -- fixed with a mutex. (b) main.cpp's
-  #      per-crawler-thread `ThreadCrawler_options` was stack-allocated inside the
-  #      spawning loop, reused by the next iteration before the new thread reliably read
-  #      it -- fixed by heap-allocating it (never freed, matching this process's existing
-  #      long-running-daemon style for its DNS-thread options).
-  # VERIFIED END-TO-END after all four fixes: 8/8 consecutive docker-compose restarts
-  # stayed up (vs. failing on the first run pre-fix-1/2, then ~1/3 of restarts pre-fix-3/4);
-  # 0 ThreadSanitizer races across 8 runs (vs. 3 races on every run before); `dig` against
-  # the running container returned a real discovered peer address once the crawl had run
-  # long enough to vet one.
   seeder:
     image: tapyrus-seeder:integration-test
     entrypoint:

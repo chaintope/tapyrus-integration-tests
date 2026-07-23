@@ -12,14 +12,6 @@ done-vs-outstanding progress, and [`scripts.md`](scripts.md) for what each scrip
 
 ## Known issues (open)
 
-- **`tapyrus-seeder`'s `master` fails to build** -- reproduced for real (local full
-  E2E test): fails on bug #1 below (Alpine g++ rejecting a designated-initializer in
-  `dns.cpp`). All four fixes are up as
-  [`chaintope/tapyrus-seeder#5`](https://github.com/chaintope/tapyrus-seeder/pull/5),
-  not yet merged. **`SEEDER_REPO_REF`/`SEEDER_REPO_URL` default to the PR's own
-  branch** (`Naviabheeman/tapyrus-seeder` @ `docker-build-fix`) so at least one CI
-  trigger can go green before #5 merges -- switch back to `chaintope/tapyrus-seeder` @
-  `master` once it does.
 - **GitHub-hosted `ubuntu-latest` runner's CPU/disk sufficiency is unconfirmed** for 7
   core nodes + 3 signers + redis + seeder running concurrently -- may need
   self-hosted.
@@ -32,14 +24,9 @@ done-vs-outstanding progress, and [`scripts.md`](scripts.md) for what each scrip
   federation change/rotation** (the `--xfield` sign/computesig flow, multi-entry
   `federations.toml`) -- `chaintope/tapyrus-signer`'s own `master` already has the base
   ceremony (createkey/createnodevss/aggregate/genesis-signing, confirmed nearly
-  identical), and now builds out of the box too
-  ([`chaintope/tapyrus-signer#172`](https://github.com/chaintope/tapyrus-signer/pull/172)
-  merged -- confirmed directly against a fresh `chaintope/master` fetch, not just PR
-  metadata: its new tip is that fix commit, with `gmp-mpfr-sys`'s `c-no-tests` feature
-  present in `Cargo.toml`, and `cargo build --release` verified clean against it).
-  Override `SIGNER_REPO_URL`/`SIGNER_REPO_REF` to the `Naviabheeman` fork's
-  `163_federationChangeToml` branch when testing rotation (Milestone 3/4's rotation
-  items).
+  identical) and builds out of the box. Override `SIGNER_REPO_URL`/`SIGNER_REPO_REF` to
+  the `Naviabheeman` fork's `163_federationChangeToml` branch when testing rotation
+  (Milestone 3/4's rotation items).
 - **Signer count (3) / threshold (2) is hardcoded**, not a per-run variable -- the
   7-node topology in `docker-compose.yml` is wired 1:1 to exactly 3 signers; changing
   the count means redesigning the topology, not just passing a different number.
@@ -90,31 +77,6 @@ done-vs-outstanding progress, and [`scripts.md`](scripts.md) for what each scrip
   appending to it -- a bare `command: [-connect=core-1b]` crashes every such container
   (`bash -c "-connect=core-1b"` -> invalid option). Fixed by having every `command:`
   override repeat the full default invocation and append its own flags.
-- **`tapyrus-seeder`'s four real upstream bugs**, found and fixed in
-  [`chaintope/tapyrus-seeder#5`](https://github.com/chaintope/tapyrus-seeder/pull/5),
-  all confirmed live:
-  1. Build failure -- Alpine 3.7's g++ rejects a designated-initializer used for
-     `struct msghdr` in `dns.cpp` as "non-trivial" (not architecture-specific). Fixed
-     with plain field assignment instead.
-  2. Runtime segfault on the first real connection -- `char filename[25]` in
-     `main.cpp` is too small for its own `sprintf` format strings (up to 31 bytes
-     needed for a 10-digit network id), overflowing even the image's own default
-     production network id. Caught by Alpine/musl's fortified `sprintf` (SIGTRAP),
-     confirmed via `gdb` + a core dump. Fixed by bumping both `filename` buffers to 64
-     bytes.
-  3. Data race in the DNS threads -- `dns.cpp`'s global `listenSocket` was
-     checked-and-created with no synchronization across the 4 concurrent DNS threads.
-     Found via a ThreadSanitizer build on `ubuntu:22.04` (Alpine/musl has weak TSan
-     support). Fixed with a mutex.
-  4. Data race in the crawler-thread spawn loop -- `main.cpp`'s per-crawler-thread
-     `ThreadCrawler_options` was stack-allocated inside the spawning loop and reused
-     by the next iteration before the new thread reliably read it. Fixed by
-     heap-allocating it instead.
-
-     Verified end-to-end after all four fixes: 8/8 consecutive `docker compose`
-     restarts stayed up (vs. crashing on the very first run pre-fix, then ~1/3 of
-     restarts pre-fix-3/4); 0 TSan races across 8 runs (vs. every run before); `dig`
-     against the running container returned a real, live-discovered peer address.
 - **Building `tapyrus-core`'s Dockerfile** needs the real `tapyrus/builder:v0.7.0`
   image, not a stale, locally-mistagged image of the same name -- confirmed once by
   diffing digests. Environment-specific, unlikely to recur, noted here in case it
@@ -136,8 +98,7 @@ done-vs-outstanding progress, and [`scripts.md`](scripts.md) for what each scrip
   the federation-rotation design decision below.
 - **On macOS, building tapyrus-signer outside Docker also needs `brew install gmp` +
   `LIBRARY_PATH=/opt/homebrew/lib`** for the linker to find the system `libgmp` a
-  transitive dependency wants (separate from the vendored `gmp-mpfr-sys` build above).
-  Confirmed working during the full local E2E test.
+  transitive dependency wants. Confirmed working during the full local E2E test.
 - **A benign warning, any `round-duration`**: a non-master signer's own `submitblock`
   call occasionally races a block another signer already submitted, and tapyrus-core's
   `"duplicate"` string response doesn't match what the Rust client's JSON deserializer

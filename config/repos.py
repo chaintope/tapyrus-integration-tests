@@ -28,14 +28,11 @@ class ReposConfig:
     """Default checkout targets for all three repos this test spans."""
 
     def __init__(self):
-        # chaintope/tapyrus-signer#172 (the gmp-mpfr-sys c-no-tests build fix) merged
-        # -- confirmed directly against a fresh chaintope/master fetch, not just PR
-        # metadata: its new tip is literally that fix commit, with the feature present
-        # in Cargo.toml. master has the base ceremony (createkey/createnodevss/
-        # aggregate/genesis-sign) but not the federation-change/rotation ceremony
-        # (--xfield sign/computesig, multi-entry federations.toml) -- that only exists
-        # on the Naviabheeman fork's 163_federationChangeToml branch. Override
-        # SIGNER_REPO_URL/SIGNER_REPO_REF to that fork+branch when testing rotation.
+        # master has the base ceremony (createkey/createnodevss/aggregate/genesis-sign)
+        # but not the federation-change/rotation ceremony (--xfield sign/computesig,
+        # multi-entry federations.toml) -- that only exists on the Naviabheeman fork's
+        # 163_federationChangeToml branch. Override SIGNER_REPO_URL/SIGNER_REPO_REF to
+        # that fork+branch when testing rotation.
         self.signer = RepoTarget(
             "tapyrus-signer", "SIGNER",
             "https://github.com/chaintope/tapyrus-signer.git",
@@ -46,14 +43,10 @@ class ReposConfig:
             "https://github.com/chaintope/tapyrus-core.git",
             "master",
         )
-        # TEMPORARY: pointed at the Naviabheeman fork's docker-build-fix branch, not
-        # chaintope/tapyrus-seeder's master, because master doesn't build (see
-        # doc/work-done.md) -- docker-build-fix is chaintope/tapyrus-seeder#5, not yet
-        # merged. Switch back to chaintope/tapyrus-seeder @ master once #5 merges.
         self.seeder = RepoTarget(
             "tapyrus-seeder", "SEEDER",
-            "https://github.com/Naviabheeman/tapyrus-seeder.git",
-            "docker-build-fix",
+            "https://github.com/chaintope/tapyrus-seeder.git",
+            "master",
         )
 
     def __iter__(self):

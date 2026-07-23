@@ -64,12 +64,8 @@ invocation fall back to.
   `SIGNER_REPO_URL=https://github.com/Naviabheeman/tapyrus-signer.git SIGNER_REPO_REF=163_federationChangeToml`.
 - `CORE_REPO_URL` / `CORE_REPO_REF` -- default
   `https://github.com/chaintope/tapyrus-core.git` @ `master`.
-- `SEEDER_REPO_URL` / `SEEDER_REPO_REF` -- **TEMPORARY default**
-  `https://github.com/Naviabheeman/tapyrus-seeder.git` @ `docker-build-fix`, tracking
-  unmerged [`chaintope/tapyrus-seeder#5`](https://github.com/chaintope/tapyrus-seeder/pull/5)
-  (the four build/runtime bug fixes documented in `doc/work-done.md` --
-  `chaintope/tapyrus-seeder`'s own `master` lacks them). Switch back to
-  `https://github.com/chaintope/tapyrus-seeder.git` @ `master` once #5 merges.
+- `SEEDER_REPO_URL` / `SEEDER_REPO_REF` -- default
+  `https://github.com/chaintope/tapyrus-seeder.git` @ `master`.
 
 Any variable can be overridden by exporting it before running `checkout_repos.py`.
 
