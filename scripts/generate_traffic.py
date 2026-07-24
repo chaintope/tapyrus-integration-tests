@@ -377,8 +377,8 @@ class TrafficGenerator:
             log.info(f"height {height}: {node_name} {asset}: {actual} (matches ledger)")
 
     async def _apply_fee(self, node, txid):
-        # Unlike plain Bitcoin Core, gettransaction has no top-level "fee" field here --
-        # and the fee's shape within "details" itself varies by tx type (confirmed
+        # tapyrus-core's gettransaction has no top-level "fee" field here -- and the
+        # fee's shape within "details" itself varies by tx type (confirmed
         # against a live node; see doc/work-done.md): a plain TPC send nests "fee"
         # inside its own category="send" entry, while a transaction that also moves a
         # colored output puts it in a separate category="fee" entry instead (and the

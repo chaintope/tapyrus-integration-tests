@@ -18,17 +18,6 @@ on:
   # leave a field blank on a manual dispatch and you get the same value schedule uses.
   # GitHub Actions caps workflow_dispatch at 10 inputs -- exceeding it makes the whole
   # workflow file invalid (startup_failure on every trigger, not just workflow_dispatch).
-  # tx_total_count/tx_tpc_percent/tx_interval_seconds/rotation_height_offset/
-  # max_block_size_new/prng_seed_base are dropped to stay at 10: their consuming steps
-  # are all still commented-out/TODO (Milestone 3/4). Their env: fallback literals
-  # stay below, ready for when a Milestone 3/4 step needs one -- add it back then, or
-  # as a single JSON "overrides" input / repo vars if the list would otherwise exceed
-  # 10 again. chain_height_before_reorg is NOT in that dropped list -- it's gone
-  # entirely, not just demoted to an env fallback: CHAIN_HEIGHT_BEFORE_REORG is now
-  # always derived from tx_round_count (see the "Derive CHAIN_HEIGHT_BEFORE_REORG"
-  # step), so an independent input for it would be misleading (it'd be silently
-  # ignored). tx_round_count took its slot instead, now that generate_traffic.py's
-  # step is wired in for real.
   workflow_dispatch:
     inputs:
       core_repo_ref:
@@ -40,23 +29,21 @@ on:
 
       # --- transaction generation (scripts/generate_traffic.py) ---
       tx_round_count:
-        description: 'Round-robin send/check/settle cycles to run (3 block-heights and 14 transactions each) -- default: 5 (2 on pull_request/push). Also sets the reorg baseline height (tx_round_count + 2) -- see reorg_loser_blocks/reorg_winner_margin.'
+        description: 'Round-robin send/check/settle cycles to run (3 block-heights and 14 transactions each); also sets the reorg baseline height (tx_round_count + 2) -- see reorg_length. Leave blank for the default -- see README.md''s variable table (defaults live in the env: block below, not restated here to avoid drift).'
 
       # --- reorg shape ---
-      reorg_loser_blocks:
-        description: 'Blocks the losing group builds past the baseline -- default: 10 (2 on pull_request/push)'
-      reorg_winner_margin:
-        description: 'Extra blocks the winning group builds beyond reorg_loser_blocks -- default: 2 (1 on pull_request/push)'
+      reorg_length:
+        description: 'Blocks each isolated group builds past the baseline before reconnecting at the tie. How many blocks past this the winning side needs before the reorg actually triggers is no longer an input -- simulate_reorg.py probes for it live, see doc/scripts.md. Leave blank for the default -- see README.md''s variable table.'
 
       # --- block interval ---
       round_duration_seconds:
-        description: 'tapyrus-signerd round-duration -- default: 60'
+        description: 'tapyrus-signerd round-duration. Leave blank for the default -- see README.md''s variable table.'
 
       # --- misc ---
       network_id:
-        description: 'Tapyrus network id (prod mode -- see doc/work-done.md), used by every core-* node''s rendered tapyrus.conf and the genesis.<id> file tapyrusd looks for -- default: 1905960821. Not yet wired into the seeder (deferred, see the "Bring up tapyrus-seeder" step)'
+        description: 'Tapyrus network id (prod mode -- see doc/work-done.md), used by every core-* node''s rendered tapyrus.conf and the genesis.<id> file tapyrusd looks for. Not yet wired into the seeder (deferred, see the "Bring up tapyrus-seeder" step). Leave blank for the default -- see README.md''s variable table.'
       slack_log_tail_lines:
-        description: 'Lines of the implicated container''s log to inline in the Slack failure report -- default: 100'
+        description: 'Lines of the implicated container''s log to inline in the Slack failure report. Leave blank for the default -- see README.md''s variable table.'
       docker_build_platform:
         description: 'Docker --platform for image builds; leave empty for the runner''s native platform'
 
@@ -92,27 +79,21 @@ env:
   # No literal fallback here (unlike the smoke-scale variables below) -- an
   # unset/blank ref resolves to config/repos.py's own default, the single source of
   # truth for these three, rather than a second copy of the same value living here.
+  DOCKER_BUILD_PLATFORM: ${{ inputs.docker_build_platform || '' }}
   CORE_REPO_REF: ${{ inputs.core_repo_ref }}
   SIGNER_REPO_REF: ${{ inputs.signer_repo_ref }}
   SEEDER_REPO_REF: ${{ inputs.seeder_repo_ref }}
-  # CHAIN_HEIGHT_BEFORE_REORG is not set here -- env: can only hold GitHub Actions
-  # expressions, which have no arithmetic operators, and its value is always derived
-  # from TX_ROUND_COUNT (+2) below, not an independent input. See the "Derive
-  # CHAIN_HEIGHT_BEFORE_REORG" step, which computes it into $GITHUB_ENV once
-  # TX_ROUND_COUNT itself is resolved.
-  REORG_LOSER_BLOCKS: ${{ inputs.reorg_loser_blocks || ((github.event_name == 'pull_request' || github.event_name == 'push') && '2' || '10') }}
-  REORG_WINNER_MARGIN: ${{ inputs.reorg_winner_margin || ((github.event_name == 'pull_request' || github.event_name == 'push') && '1' || '2') }}
-  TX_ROUND_COUNT: ${{ inputs.tx_round_count || ((github.event_name == 'pull_request' || github.event_name == 'push') && '2' || '5') }}
-  ROUND_DURATION: ${{ inputs.round_duration_seconds || '60' }}
-  ROTATION_HEIGHT_OFFSET: ${{ inputs.rotation_height_offset || ((github.event_name == 'pull_request' || github.event_name == 'push') && '3' || '10') }}
-  MAX_BLOCK_SIZE_NEW: ${{ inputs.max_block_size_new || '2000000' }}
-  PRNG_SEED_BASE: ${{ inputs.prng_seed_base || github.run_id }}
+  PRNG_SEED_BASE: ${{ github.run_id }}
   NETWORK_ID: ${{ inputs.network_id || '1905960821' }}
-  SLACK_LOG_TAIL_LINES: ${{ inputs.slack_log_tail_lines || '100' }}
-  DOCKER_BUILD_PLATFORM: ${{ inputs.docker_build_platform || '' }}
   CORE_RPC_PORT: '12381'
   CORE_RPC_USER: 'rpcuser'
   CORE_RPC_PASS: 'rpcpassword'
+  TX_ROUND_COUNT: ${{ inputs.tx_round_count || ((github.event_name == 'pull_request' || github.event_name == 'push') && '20' || '500') }}
+  ROUND_DURATION: ${{ inputs.round_duration_seconds || '60' }}
+  REORG_LENGTH: ${{ inputs.reorg_length || ((github.event_name == 'pull_request' || github.event_name == 'push') && '10' || '100') }}
+  FEDERATION_CHANGE_HEIGHT: ${{ inputs.federation_change_height || ((github.event_name == 'pull_request' || github.event_name == 'push') && '60' || '800') }}
+  MAX_BLOCK_SIZE_NEW: ${{ inputs.max_block_size_new || '2000000' }}
+  SLACK_LOG_TAIL_LINES: ${{ inputs.slack_log_tail_lines || '100' }}
 
 jobs:
   integration-test:
@@ -166,10 +147,10 @@ jobs:
           docker run --rm --entrypoint tapyrus-genesis tapyrus/tapyrusd:master-local \
             -signblockpubkey=$(cat secrets/signer-set-a/aggregated-public-key.txt) \
             > /tmp/unsigned-genesis.hex
-      - name: Sign genesis (section 4a steps 4-7)
+      - name: Sign genesis
         run: TAPYRUS_SETUP_THRESHOLD=2 ./scripts/sign_genesis.py signer-set-a /tmp/unsigned-genesis.hex secrets/signer-set-a/genesis.hex
 
-      - name: Render tapyrus.conf (prod mode, NETWORK_ID wired through)
+      - name: Render tapyrus.conf
         run: ./scripts/render_tapyrus_conf.py
       - name: Bring up redis + 7 core nodes
         run: |
@@ -184,17 +165,17 @@ jobs:
           printf 'core-1a\ncore-2a\ncore-3a\n' > /tmp/core-rpc-hosts.txt
       - name: Bring up tapyrus-seeder
         run: echo "TODO -- image is built above but the seeder service is never started (no docker compose up includes it) and there's no dig-based pass/fail check -- see doc/project-plan.md Milestone 4"
-      - name: Assemble signer-set-a configs
+      - name: Assemble signer configs
         run: |
           ROUND_DURATION="$ROUND_DURATION" ./scripts/assemble_signer_configs.py signer-set-a 2 \
             /tmp/core-rpc-hosts.txt "$CORE_RPC_PORT" "$CORE_RPC_USER" "$CORE_RPC_PASS" redis 6379 /tmp/addrs.txt
-      - name: Bring up signer-set-a
+      - name: Bring up signers
         run: |
           cd docker
           GENESIS_BLOCK_WITH_SIG=$(cat ../secrets/signer-set-a/genesis.hex) \
             docker compose up -d signer-0 signer-1 signer-2
 
-      - name: Generate round-robin TPC + colored-coin traffic
+      - name: Generate TPC + colored-coin traffic
         run: ./scripts/generate_traffic.py "$TX_ROUND_COUNT"
 
       # - name: Per-node query/stop-restart + max-block-size change

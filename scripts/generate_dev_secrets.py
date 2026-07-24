@@ -169,11 +169,7 @@ def parse_args():
 TAPYRUS_SETUP_BUILD_HINT = (
     "Build it first, e.g.:\n"
     "  ./scripts/checkout_repos.py   # if not already checked out\n"
-    "  cd workdir/tapyrus-signer && cargo build --release\n\n"
-    "Note: this codebase needs rustc 1.70.0 pinned (add a rust-toolchain.toml with\n"
-    "channel = \"1.70.0\") and gmp-mpfr-sys's \"c-no-tests\" feature enabled (in\n"
-    "Cargo.toml) -- neither fix is committed upstream, so apply both by hand to the\n"
-    "workdir/ checkout first. See doc/work-done.md for why and the exact fix."
+    "  cd workdir/tapyrus-signer && cargo build --release"
 )
 
 

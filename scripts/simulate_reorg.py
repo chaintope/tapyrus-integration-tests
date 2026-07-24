@@ -1,21 +1,31 @@
 #!/usr/bin/env python3
 """Drive a genuine two-sided reorg: split the 7-node network into two isolated
 groups, let each independently threshold-sign its own fork from a common baseline,
-reconnect, and confirm the losing group's fork shows up as a real `valid-fork` tip via
-getchaintips -- not simulated.
+reconnect, then probe how many blocks past the tie it actually takes for the reorg to
+trigger -- not simulated, and not assumed.
 
-This is the exact 8-step recipe in doc/weekly-integration-test-plan.md section 4d,
-already run once by hand end-to-end (see doc/work-done.md's "Reorg -- full run
-transcript" for the verified transcript this script encodes).
+This follows the 8-step recipe in doc/weekly-integration-test-plan.md section 4d
+(already run once by hand -- see doc/work-done.md's "Reorg -- full run transcript" for
+the verified transcript), with one deliberate departure: that transcript had the
+winning group build straight past the losing group's height by a fixed margin before
+ever reconnecting. There's no protocol rule that says a competing chain needs to be any
+particular number of blocks longer before tapyrus-core's chain selection switches to
+it -- one block of extra cumulative work is sufficient in principle. So instead of
+assuming a margin, this script builds both forks to the exact
+same height, reconnects at that tie, confirms the tie alone does NOT cause a reorg,
+then grows the winning side one block at a time -- checking after every new block
+whether the reorg has actually triggered yet -- and reports however many blocks it
+actually took. In practice this has never taken more than 2 (see
+doc/work-done.md), but the script measures it rather than hardcoding it.
 
 Usage:
     ./scripts/simulate_reorg.py
 
 Requires the 7-node topology and signer-set-a already up and converged (same
 precondition as scripts/generate_traffic.py). Reads
-CHAIN_HEIGHT_BEFORE_REORG / REORG_LOSER_BLOCKS / REORG_WINNER_MARGIN /
-CORE_RPC_USER / CORE_RPC_PASS / ROUND_DURATION from the environment -- the same
-job-level env vars the workflow already sets for the other steps.
+CHAIN_HEIGHT_BEFORE_REORG / REORG_LENGTH / CORE_RPC_USER / CORE_RPC_PASS /
+ROUND_DURATION from the environment -- the same job-level env vars the workflow
+already sets for the other steps.
 
 CHAIN_HEIGHT_BEFORE_REORG is a floor to wait for, not an assumed starting point (and
 in the workflow, it's always TX_ROUND_COUNT + 2, not an independent value -- see the
@@ -23,10 +33,10 @@ in the workflow, it's always TX_ROUND_COUNT + 2, not an independent value -- see
 scripts/generate_traffic.py produces when that runs first in the same job). The
 baseline step waits until height >= CHAIN_HEIGHT_BEFORE_REORG, then uses whatever
 height was *actually* reached -- which can be higher -- as the real reference point
-for the loser/winner fork targets. Using the literal input value instead would let
-already-elapsed height silently satisfy those targets too: group A/B would "build
-their fork" without producing any new blocks at all, a silent no-op reorg instead of
-a real one.
+for both forks' target height. Using the literal input value instead would let
+already-elapsed height silently satisfy that target too: group A/B would "build their
+fork" without producing any new blocks at all, a silent no-op reorg instead of a real
+one.
 
 Why not tapyrus-core's generatetoaddress RPC (instant block mining): it requires the
 aggregate *private* key as a parameter, which no single party holds by design in a
@@ -48,19 +58,19 @@ Also verifies transactions aren't silently lost during the reorg: right after th
 split, sends one canary TPC transaction from CANARY_SENDER to CANARY_RECEIVER (both
 group A, using a UTXO that predates the split so it can't legitimately conflict with
 anything group B does) -- this gets mined into one of group A's now-doomed blocks. In
-Bitcoin-Core-derived reorg handling (which tapyrus-core inherits), a disconnected
-block's transactions are pushed back into the mempool unless their inputs are already
-spent on the new chain (a real conflict, correctly dropped) or they depend on an
-output that only existed on the losing side (an "orphan" case mempool logic doesn't
-always handle cleanly -- historically one of Bitcoin Core's more bug-prone corners).
+tapyrus-core's reorg handling, a disconnected block's transactions are pushed back
+into the mempool unless their inputs are already spent on the new chain (a real
+conflict, correctly dropped) or they depend on an output that only existed on the
+losing side (an "orphan" case mempool logic doesn't always handle cleanly --
+historically one of this logic's more bug-prone corners).
 After reconnection, this script confirms the canary is either re-confirmed or back in
 the mempool -- not vanished. Deliberately the simple case only (one transaction, input
 predates the fork point, no legitimate conflict is possible) -- dependent-transaction
 chains and deliberate double-spend/conflict scenarios are real follow-ups, not
 attempted here. Confirms "not lost" (mempool or re-confirmed), not "re-mined into a
 new block": that would need signer-set-a restarted after reconnection to produce one
-more real block, which this script doesn't do (signers stay stopped after the winning
-fork is built, matching the base recipe).
+more real block, which this script doesn't do (signers stay stopped once the reorg
+has triggered, matching the base recipe).
 """
 import asyncio
 import os
@@ -89,6 +99,11 @@ HEIGHT_POLL_INTERVAL_SECONDS = 5
 HEIGHT_POLL_TIMEOUT_SECONDS = 600
 CONVERGENCE_TIMEOUT_SECONDS = 120
 CANARY_SEND_AMOUNT_TPC = 0.001
+# Reorg has consistently triggered within +2 blocks past the tie in practice (see
+# doc/work-done.md) -- this is a generous safety ceiling past that, not an expected
+# value. Exhausting it means something is actually broken (e.g. the repoint didn't
+# take, or P2P relay stalled), not just a slow round.
+MAX_TRIGGER_PROBE_BLOCKS = 5
 
 SIGNERS = ("signer-0", "signer-1", "signer-2")
 CANARY_SENDER = "core-1a"
@@ -115,16 +130,16 @@ class ReorgError(Exception):
 
 
 class ReorgSimulator:
-    def __init__(self, rpc_user, rpc_pass, baseline_height, loser_blocks, winner_margin, round_duration):
+    def __init__(self, rpc_user, rpc_pass, baseline_height, reorg_length, round_duration):
         self._rpc_user = rpc_user
         self._rpc_pass = rpc_pass
         self._baseline_height = baseline_height
-        self._loser_blocks = loser_blocks
-        self._winner_margin = winner_margin
+        self._reorg_length = reorg_length
         self._round_duration = round_duration
         self._clients = {name: CoreRpcClient(RPC_HOST, port, rpc_user, rpc_pass) for name, port in NODES}
         self._losing_tip = None
         self._winning_tip = None
+        self._winner_margin = None
         self._canary_txid = None
 
     async def run(self):
@@ -134,14 +149,17 @@ class ReorgSimulator:
         await self._build_losing_fork()
         await self._bring_back_group_b()
         await self._repoint_and_restart_signers()
-        await self._build_winning_fork()
+        await self._build_equal_fork()
         await self._reconnect()
+        await self._confirm_tie_holds()
+        await self._probe_reorg_trigger()
         await self._confirm_convergence()
         await self._verify_canary_transaction_survived()
         log.info(
-            f"done. group A's {self._loser_blocks}-block fork (tip {self._losing_tip[:12]}...) confirmed as a "
-            f"valid-fork on every ex-group-A node; the network converged on group B's longer chain; the canary "
-            f"transaction ({self._canary_txid[:12]}...) confirmed only on the losing fork was not lost."
+            f"done. group A's {self._reorg_length}-block fork (tip {self._losing_tip[:12]}...) confirmed as a "
+            f"valid-fork on every ex-group-A node; the network converged on group B's chain once it was "
+            f"{self._winner_margin} block(s) longer (tip {self._winning_tip[:12]}...); the canary transaction "
+            f"({self._canary_txid[:12]}...) confirmed only on the losing fork was not lost."
         )
 
     # -- recipe steps (doc/weekly-integration-test-plan.md section 4d) --------------
@@ -150,8 +168,8 @@ class ReorgSimulator:
         log.step(f"building baseline (target height {self._baseline_height}, all 7 nodes)")
         # self._baseline_height is a floor, not an assumed starting point -- the
         # ACTUAL height reached (which can be higher, e.g. if generate_traffic.py
-        # already ran first in the same job) is what the loser/winner fork targets
-        # get computed from, not the original literal value. See _wait_for_height.
+        # already ran first in the same job) is what both forks' targets get computed
+        # from, not the original literal value. See _wait_for_height.
         self._baseline_height = await self._wait_for_height(ALL_NODE_NAMES, self._baseline_height)
         tips = await asyncio.gather(*(self._clients[name].call("getbestblockhash") for name in ALL_NODE_NAMES))
         if len(set(tips)) != 1:
@@ -176,7 +194,7 @@ class ReorgSimulator:
         log.info(f"canary transaction {self._canary_txid[:12]}... broadcast -- will confirm only on group A's fork")
 
     async def _build_losing_fork(self):
-        target = self._baseline_height + self._loser_blocks
+        target = self._baseline_height + self._reorg_length
         log.step(f"group A building its fork (target height {target})")
         await self._wait_for_height(GROUP_A, target)
         self._losing_tip = await self._clients["core-1a"].call("getbestblockhash")
@@ -220,12 +238,15 @@ class ReorgSimulator:
         with (node_dir / "tapyrus-signer.toml").open("rb") as f:
             return tomllib.load(f)["signer"]["to-address"]
 
-    async def _build_winning_fork(self):
-        target = self._baseline_height + self._loser_blocks + self._winner_margin
-        log.step(f"group B building the longer fork (target height {target})")
+    async def _build_equal_fork(self):
+        # Deliberately the SAME target group A built to, not a longer one -- the tie
+        # is the interesting state to reconnect at: see _confirm_tie_holds and
+        # _probe_reorg_trigger below.
+        target = self._baseline_height + self._reorg_length
+        log.step(f"group B building an equal-length fork (target height {target})")
         await self._wait_for_height(GROUP_B, target)
-        self._winning_tip = await self._clients["core-3a"].call("getbestblockhash")
-        log.info(f"group B's fork tip: {self._winning_tip[:12]}... (height {target})")
+        tip = await self._clients["core-3a"].call("getbestblockhash")
+        log.info(f"group B's equal-height fork tip: {tip[:12]}... (height {target})")
         await self._compose("stop", *SIGNERS)
 
     async def _reconnect(self):
@@ -233,6 +254,37 @@ class ReorgSimulator:
         await self._compose("start", *GROUP_A)
         waiter = TopologyWaiter(self._rpc_user, self._rpc_pass, CONVERGENCE_TIMEOUT_SECONDS, HEIGHT_POLL_INTERVAL_SECONDS)
         await waiter.run()
+
+    async def _confirm_tie_holds(self):
+        log.step("confirming the equal-height tie alone does not trigger a reorg")
+        tips = await asyncio.gather(*(self._clients[name].call("getbestblockhash") for name in GROUP_A))
+        for name, tip in zip(GROUP_A, tips):
+            if tip != self._losing_tip:
+                raise ReorgError(
+                    f"{name}: switched off its own tip ({self._losing_tip[:12]}..., now {tip[:12]}...) at the "
+                    f"tie alone, before group B ever built a longer chain -- a tie shouldn't cause a reorg"
+                )
+        log.info("confirmed: every ex-group-A node is still on its own tip at the tie -- no premature reorg")
+
+    async def _probe_reorg_trigger(self):
+        log.step("restarting group B's signers to probe how many blocks past the tie trigger the reorg")
+        await self._compose("start", *SIGNERS)
+        for margin in range(1, MAX_TRIGGER_PROBE_BLOCKS + 1):
+            target = self._baseline_height + self._reorg_length + margin
+            await self._wait_for_height(GROUP_B, target)
+            candidate_tip = await self._clients["core-3a"].call("getbestblockhash")
+            ex_group_a_tips = await asyncio.gather(*(self._clients[name].call("getbestblockhash") for name in GROUP_A))
+            if all(tip == candidate_tip for tip in ex_group_a_tips):
+                self._winning_tip = candidate_tip
+                self._winner_margin = margin
+                await self._compose("stop", *SIGNERS)
+                log.info(f"reorg triggered at +{margin} block(s) past the tie (winning tip {candidate_tip[:12]}...)")
+                return
+            log.info(f"+{margin} block(s) past the tie: not triggered yet ({dict(zip(GROUP_A, ex_group_a_tips))})")
+        raise ReorgError(
+            f"reorg still not triggered after +{MAX_TRIGGER_PROBE_BLOCKS} block(s) past the tie -- "
+            f"has consistently taken 1-2 in practice, this many past that is a real bug, not a slow round"
+        )
 
     async def _confirm_convergence(self):
         log.step("confirming convergence via getchaintips")
@@ -244,10 +296,10 @@ class ReorgSimulator:
                 raise ReorgError(f"{name}: expected exactly 2 tips (1 active, 1 valid-fork), got {tips}")
             if active[0]["hash"] != self._winning_tip:
                 raise ReorgError(f"{name}: active tip {active[0]['hash']} doesn't match group B's {self._winning_tip}")
-            if forks[0]["hash"] != self._losing_tip or forks[0]["branchlen"] != self._loser_blocks:
+            if forks[0]["hash"] != self._losing_tip or forks[0]["branchlen"] != self._reorg_length:
                 raise ReorgError(
                     f"{name}: valid-fork tip mismatch -- expected hash {self._losing_tip} "
-                    f"branchlen {self._loser_blocks}, got {forks[0]}"
+                    f"branchlen {self._reorg_length}, got {forks[0]}"
                 )
             log.info(f"{name}: confirmed -- active={active[0]['hash'][:12]}... valid-fork={forks[0]['hash'][:12]}... "
                       f"branchlen={forks[0]['branchlen']}")
@@ -329,15 +381,14 @@ async def main():
     rpc_user = os.environ.get("CORE_RPC_USER", "rpcuser")
     rpc_pass = os.environ.get("CORE_RPC_PASS", "rpcpassword")
     baseline_height = int(os.environ.get("CHAIN_HEIGHT_BEFORE_REORG", "30"))
-    loser_blocks = int(os.environ.get("REORG_LOSER_BLOCKS", "10"))
-    winner_margin = int(os.environ.get("REORG_WINNER_MARGIN", "2"))
+    reorg_length = int(os.environ.get("REORG_LENGTH", "10"))
     round_duration = os.environ.get("ROUND_DURATION", "60")
 
     log.step(
-        f"simulating a reorg: baseline height {baseline_height}, loser fork "
-        f"{loser_blocks} block(s), winner margin {winner_margin} block(s)"
+        f"simulating a reorg: baseline height {baseline_height}, both forks {reorg_length} block(s) "
+        f"before probing the trigger margin"
     )
-    simulator = ReorgSimulator(rpc_user, rpc_pass, baseline_height, loser_blocks, winner_margin, round_duration)
+    simulator = ReorgSimulator(rpc_user, rpc_pass, baseline_height, reorg_length, round_duration)
     await simulator.run()
 
 

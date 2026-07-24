@@ -64,12 +64,8 @@ invocation fall back to.
   `SIGNER_REPO_URL=https://github.com/Naviabheeman/tapyrus-signer.git SIGNER_REPO_REF=163_federationChangeToml`.
 - `CORE_REPO_URL` / `CORE_REPO_REF` -- default
   `https://github.com/chaintope/tapyrus-core.git` @ `master`.
-- `SEEDER_REPO_URL` / `SEEDER_REPO_REF` -- **TEMPORARY default**
-  `https://github.com/Naviabheeman/tapyrus-seeder.git` @ `docker-build-fix`, tracking
-  unmerged [`chaintope/tapyrus-seeder#5`](https://github.com/chaintope/tapyrus-seeder/pull/5)
-  (the four build/runtime bug fixes documented in `doc/work-done.md` --
-  `chaintope/tapyrus-seeder`'s own `master` lacks them). Switch back to
-  `https://github.com/chaintope/tapyrus-seeder.git` @ `master` once #5 merges.
+- `SEEDER_REPO_URL` / `SEEDER_REPO_REF` -- default
+  `https://github.com/chaintope/tapyrus-seeder.git` @ `master`.
 
 Any variable can be overridden by exporting it before running `checkout_repos.py`.
 
@@ -329,34 +325,50 @@ assignment, and the balance-shortfall top-up mechanic). Implemented as `TrafficN
 ## `scripts/simulate_reorg.py`
 
 Drives a genuine two-sided reorg: splits the 7-node network into two isolated groups,
-lets each independently threshold-sign its own fork from a common baseline,
-reconnects, and confirms the losing group's fork shows up as a real `valid-fork` tip
-via `getchaintips` -- not simulated. Encodes the exact 8-step recipe in
-`weekly-integration-test-plan.md` section 4d, already run once by hand (see
-`work-done.md`'s "Reorg -- full run transcript"). Implemented as `ReorgSimulator`,
+lets each independently threshold-sign its own fork from a common baseline, builds
+both forks to the *same* height, reconnects at that tie, then grows the winning side
+one block at a time until the reorg actually triggers -- confirming the losing
+group's fork shows up as a real `valid-fork` tip via `getchaintips` once it does. Not
+simulated, and the trigger margin isn't assumed either: there's no tapyrus-core
+consensus rule requiring a competing chain to be any particular number of blocks
+longer before nodes switch to it (one block of extra height is sufficient in
+principle), so instead of building the winner straight past the loser by a fixed
+margin, the script measures how many blocks it actually takes live. Follows the 8-step
+recipe in `weekly-integration-test-plan.md` section 4d (already run once by hand, see
+`work-done.md`'s "Reorg -- full run transcript") with that one departure -- see the
+script's own module docstring for the full reasoning. Implemented as `ReorgSimulator`,
 following `generate_traffic.py`'s class-based/asyncio pattern. The first script to
 also drive `docker compose` itself (stop/start/force-recreate specific services), not
 just RPC -- via a small `_compose()` subprocess helper, matching `checkout_repos.py`'s
 `_run()` style.
 
 - **Usage**: `./scripts/simulate_reorg.py` (no arguments -- reads
-  `CHAIN_HEIGHT_BEFORE_REORG` / `REORG_LOSER_BLOCKS` / `REORG_WINNER_MARGIN` /
-  `CORE_RPC_USER` / `CORE_RPC_PASS` / `ROUND_DURATION` from the environment, same
-  job-level env vars the workflow already sets).
+  `CHAIN_HEIGHT_BEFORE_REORG` / `REORG_LENGTH` / `CORE_RPC_USER` / `CORE_RPC_PASS` /
+  `ROUND_DURATION` from the environment, same job-level env vars the workflow already
+  sets).
 - Requires the 7-node topology and signer-set-a already up and converged (same
   precondition as `generate_traffic.py`, which this step runs right after in the
   workflow).
+- **Tie-then-probe, not a fixed margin**: both groups build to `REORG_LENGTH` blocks
+  past the baseline -- the same height, not one longer. After reconnecting at that
+  tie, `_confirm_tie_holds` asserts none of the ex-group-A nodes switched off their own
+  tip (a tie alone must not cause a reorg); `_probe_reorg_trigger` then restarts group
+  B's signers and, one block at a time, checks whether the ex-group-A nodes have
+  switched to group B's new tip yet, up to `MAX_TRIGGER_PROBE_BLOCKS` (5) attempts
+  before treating it as a real failure rather than a slow round. In every run so far
+  this has triggered at +1 or +2 blocks past the tie (see `work-done.md`) -- the script
+  reports however many it actually took rather than hardcoding that expectation.
 - **`CHAIN_HEIGHT_BEFORE_REORG` is a floor, not an assumed starting point**: the
   workflow always sets it to `TX_ROUND_COUNT + 2` (see the root `README.md`'s
   variable table), tying it to whatever `generate_traffic.py` produces first in the
   same job. `_build_baseline` waits until height >= that floor, then captures
   whatever height was *actually* reached (typically well past the floor) as the real
-  reference point for the loser/winner fork targets -- using the literal floor value
-  instead would let already-elapsed height silently satisfy those targets too,
+  reference point for both forks' target height -- using the literal floor value
+  instead would let already-elapsed height silently satisfy that target too,
   producing a no-op "reorg" (group A/B "build their fork" without any new blocks).
   Confirmed live: running right after `generate_traffic.py` (chain already at height
   11, floor at 4), the script logged `baseline confirmed: all 7 nodes at height 11`
-  and computed the losing-fork target as 13 (11+2), not 6 (4+2).
+  and computed the fork target as 13 (11+2), not 6 (4+2).
 - **Why not `tapyrus-core`'s `generatetoaddress` RPC** (instant block mining): it needs
   the aggregate *private* key as a parameter, not available here by design (threshold-
   shared across the 3 signers, no single party holds it in a real ceremony). Blocks can
@@ -374,11 +386,14 @@ just RPC -- via a small `_compose()` subprocess helper, matching `checkout_repos
   step 7) reuses `wait_for_topology.py`'s `TopologyWaiter` directly, same reasoning.
 - **Output**: none written to disk -- verification results are logged; a mismatch at
   any step raises `ReorgError` (non-zero exit).
-- Verified end-to-end twice against a real 7-node + signer-set-a stack: standalone
-  (`CHAIN_HEIGHT_BEFORE_REORG=5 REORG_LOSER_BLOCKS=2 REORG_WINNER_MARGIN=1`, ~12.5 min
-  real runtime) and immediately after a real `generate_traffic.py` run in the same
-  job (`REORG_LOSER_BLOCKS=2 REORG_WINNER_MARGIN=1`, `CHAIN_HEIGHT_BEFORE_REORG`
-  derived, ~6 min on top of traffic generation's ~12 min). Both times, every
+- **Pre-redesign verification** (fixed-margin version, before the tie-then-probe
+  rewrite -- the underlying recipe and assertions are unchanged, but this run predates
+  `REORG_LENGTH`/`_probe_reorg_trigger` and hasn't been re-verified live yet): verified
+  end-to-end twice against a real 7-node + signer-set-a stack, standalone
+  (`CHAIN_HEIGHT_BEFORE_REORG=5`, a 2-block loser fork, a 1-block-longer winner fork,
+  ~12.5 min real runtime) and immediately after a real `generate_traffic.py` run in the
+  same job (same 2-block/1-block-margin shape, `CHAIN_HEIGHT_BEFORE_REORG` derived,
+  ~6 min on top of traffic generation's ~12 min). Both times, every
   ex-group-A node showed exactly 2 `getchaintips` entries (one `active` matching
   group B's winning tip, one `valid-fork` with `branchlen` matching group A's fork
   length exactly); `core-3a` showed a single active tip, as expected (never had a

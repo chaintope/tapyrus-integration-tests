@@ -46,14 +46,10 @@ class ReposConfig:
             "https://github.com/chaintope/tapyrus-core.git",
             "master",
         )
-        # TEMPORARY: pointed at the Naviabheeman fork's docker-build-fix branch, not
-        # chaintope/tapyrus-seeder's master, because master doesn't build (see
-        # doc/work-done.md) -- docker-build-fix is chaintope/tapyrus-seeder#5, not yet
-        # merged. Switch back to chaintope/tapyrus-seeder @ master once #5 merges.
         self.seeder = RepoTarget(
             "tapyrus-seeder", "SEEDER",
-            "https://github.com/Naviabheeman/tapyrus-seeder.git",
-            "docker-build-fix",
+            "https://github.com/chaintope/tapyrus-seeder.git",
+            "master",
         )
 
     def __iter__(self):

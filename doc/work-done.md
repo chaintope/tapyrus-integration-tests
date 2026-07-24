@@ -12,14 +12,6 @@ done-vs-outstanding progress, and [`scripts.md`](scripts.md) for what each scrip
 
 ## Known issues (open)
 
-- **`tapyrus-seeder`'s `master` fails to build** -- reproduced for real (local full
-  E2E test): fails on bug #1 below (Alpine g++ rejecting a designated-initializer in
-  `dns.cpp`). All four fixes are up as
-  [`chaintope/tapyrus-seeder#5`](https://github.com/chaintope/tapyrus-seeder/pull/5),
-  not yet merged. **`SEEDER_REPO_REF`/`SEEDER_REPO_URL` default to the PR's own
-  branch** (`Naviabheeman/tapyrus-seeder` @ `docker-build-fix`) so at least one CI
-  trigger can go green before #5 merges -- switch back to `chaintope/tapyrus-seeder` @
-  `master` once it does.
 - **GitHub-hosted `ubuntu-latest` runner's CPU/disk sufficiency is unconfirmed** for 7
   core nodes + 3 signers + redis + seeder running concurrently -- may need
   self-hosted.
@@ -32,14 +24,9 @@ done-vs-outstanding progress, and [`scripts.md`](scripts.md) for what each scrip
   federation change/rotation** (the `--xfield` sign/computesig flow, multi-entry
   `federations.toml`) -- `chaintope/tapyrus-signer`'s own `master` already has the base
   ceremony (createkey/createnodevss/aggregate/genesis-signing, confirmed nearly
-  identical), and now builds out of the box too
-  ([`chaintope/tapyrus-signer#172`](https://github.com/chaintope/tapyrus-signer/pull/172)
-  merged -- confirmed directly against a fresh `chaintope/master` fetch, not just PR
-  metadata: its new tip is that fix commit, with `gmp-mpfr-sys`'s `c-no-tests` feature
-  present in `Cargo.toml`, and `cargo build --release` verified clean against it).
-  Override `SIGNER_REPO_URL`/`SIGNER_REPO_REF` to the `Naviabheeman` fork's
-  `163_federationChangeToml` branch when testing rotation (Milestone 3/4's rotation
-  items).
+  identical) and builds out of the box. Override `SIGNER_REPO_URL`/`SIGNER_REPO_REF` to
+  the `Naviabheeman` fork's `163_federationChangeToml` branch when testing rotation
+  (Milestone 3/4's rotation items).
 - **Signer count (3) / threshold (2) is hardcoded**, not a per-run variable -- the
   7-node topology in `docker-compose.yml` is wired 1:1 to exactly 3 signers; changing
   the count means redesigning the topology, not just passing a different number.
@@ -148,31 +135,6 @@ done-vs-outstanding progress, and [`scripts.md`](scripts.md) for what each scrip
   appending to it -- a bare `command: [-connect=core-1b]` crashes every such container
   (`bash -c "-connect=core-1b"` -> invalid option). Fixed by having every `command:`
   override repeat the full default invocation and append its own flags.
-- **`tapyrus-seeder`'s four real upstream bugs**, found and fixed in
-  [`chaintope/tapyrus-seeder#5`](https://github.com/chaintope/tapyrus-seeder/pull/5),
-  all confirmed live:
-  1. Build failure -- Alpine 3.7's g++ rejects a designated-initializer used for
-     `struct msghdr` in `dns.cpp` as "non-trivial" (not architecture-specific). Fixed
-     with plain field assignment instead.
-  2. Runtime segfault on the first real connection -- `char filename[25]` in
-     `main.cpp` is too small for its own `sprintf` format strings (up to 31 bytes
-     needed for a 10-digit network id), overflowing even the image's own default
-     production network id. Caught by Alpine/musl's fortified `sprintf` (SIGTRAP),
-     confirmed via `gdb` + a core dump. Fixed by bumping both `filename` buffers to 64
-     bytes.
-  3. Data race in the DNS threads -- `dns.cpp`'s global `listenSocket` was
-     checked-and-created with no synchronization across the 4 concurrent DNS threads.
-     Found via a ThreadSanitizer build on `ubuntu:22.04` (Alpine/musl has weak TSan
-     support). Fixed with a mutex.
-  4. Data race in the crawler-thread spawn loop -- `main.cpp`'s per-crawler-thread
-     `ThreadCrawler_options` was stack-allocated inside the spawning loop and reused
-     by the next iteration before the new thread reliably read it. Fixed by
-     heap-allocating it instead.
-
-     Verified end-to-end after all four fixes: 8/8 consecutive `docker compose`
-     restarts stayed up (vs. crashing on the very first run pre-fix, then ~1/3 of
-     restarts pre-fix-3/4); 0 TSan races across 8 runs (vs. every run before); `dig`
-     against the running container returned a real, live-discovered peer address.
 - **Building `tapyrus-core`'s Dockerfile** needs the real `tapyrus/builder:v0.7.0`
   image, not a stale, locally-mistagged image of the same name -- confirmed once by
   diffing digests. Environment-specific, unlikely to recur, noted here in case it
@@ -272,8 +234,8 @@ threshold-signing their own blocks from a common tip, reconnected, and confirmed
    active tip, as expected.
 
 **Scripted as `scripts/simulate_reorg.py`, re-verified end-to-end via the script (not
-by hand) at smoke scale** (`CHAIN_HEIGHT_BEFORE_REORG=5 REORG_LOSER_BLOCKS=2
-REORG_WINNER_MARGIN=1`, `ROUND_DURATION=60`): baseline reached height 5 with an
+by hand) at smoke scale** (`CHAIN_HEIGHT_BEFORE_REORG=5`, a 2-block loser fork, a
+1-block-longer winner fork, `ROUND_DURATION=60`): baseline reached height 5 with an
 identical tip on all 7 nodes; group A split off and built a 2-block fork to height 7
 (tip `04fe1a6d30e9...`); group B came back at the baseline tip, redis force-recreated
 fresh, all 3 signers repointed to `core-3a` and restarted; group B built a 3-block
@@ -387,8 +349,8 @@ instead of alone -- see the next entry.
   `round TPC send skipped` / `round colored action failed` warnings, not just the
   final exit code. `tapyrusd --help` shows `-fallbackfee=<amt>` with "(default:
   0.0002)" in its description, but that's documenting the example value, not the
-  actual default state -- the real default is disabled (0), matching Bitcoin Core's
-  own mainnet-safety convention; confirmed live (the exact error message says so, and
+  actual default state -- the real default is disabled (0), a deliberate
+  mainnet-safety convention; confirmed live (the exact error message says so, and
   setting it changes behavior). Fixed by adding `fallbackfee=0.0002` to
   `render_tapyrus_conf.py`'s rendered conf (safe to enable unconditionally here --
   there's no real fee market on a throwaway dev chain to misjudge). Verified for real:
@@ -427,7 +389,7 @@ instead of alone -- see the next entry.
   rework.
 - **`tapyrus-seeder` is included** for its own integration coverage even though
   nothing in the v1 scenario actually depends on it for peer discovery (container DNS
-  already handles that) -- worth exercising given the four real bugs found.
+  already handles that).
 - **Secrets scope**: this repo only ever generates local dev secrets
   (`generate_dev_secrets.py`); it never provisions real GitHub secrets. The only
   actual CI secret needed is the Slack webhook URL.
@@ -438,9 +400,9 @@ instead of alone -- see the next entry.
   section 6's "not on every PR" non-goal: that non-goal is about running the full-scale
   scenario against every PR opened on `tapyrus-core`/`tapyrus-signer` (cost/runtime
   prohibitive), not about validating this repo's own, rarely-changing PRs. The smoke
-  trigger runs the identical job at reduced scale (`reorg_loser_blocks`/
-  `reorg_winner_margin`, `tx_round_count`, `rotation_height_offset` all drop to
-  smaller fallbacks, keyed off `github.event_name` since `pull_request`/`push` runs
+  trigger runs the identical job at reduced scale (`reorg_length`, `tx_round_count`,
+  `federation_change_height` all drop to smaller fallbacks, keyed off
+  `github.event_name` since `pull_request`/`push` runs
   have no `inputs` context -- `chain_height_before_reorg` isn't in that list anymore;
   it's always derived from `tx_round_count`, so it shrinks along with it automatically
   rather than needing its own fallback) and a shorter

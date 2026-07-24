@@ -87,9 +87,11 @@ dispatch run that leaves a field blank gets the same value schedule does either 
   values and why).
 - Every other variable below falls back to a literal in the workflow's `env:` block
   (`inputs.x || 'literal'`), shown in the table below. `pull_request`/`push` runs use
-  smaller "smoke" values for the reorg variables instead of the full-scale defaults
-  below (see the workflow's `env:` block).
-
+  smaller "smoke" values for the reorg variable instead of the full-scale default
+  below (see the workflow's `env:` block). This table is the one place those numbers
+  are written down -- each input's own `description:` field just points back here
+  instead of restating them, so the two can't silently drift apart.
+  
 GitHub Actions caps `workflow_dispatch` at 10 inputs (exceeding it invalidates the
 whole workflow file, for every trigger -- see `doc/work-done.md`), so only variables
 with a wired-in consuming step get an actual input; the rest fall back straight to
@@ -101,20 +103,26 @@ override per-run yet.
 | `core_repo_ref` | see `config/repos.py` | `tapyrus-core` branch/tag/sha to check out |
 | `signer_repo_ref` | see `config/repos.py` | `tapyrus-signer` branch/tag/sha to check out (override to `163_federationChangeToml` on the `Naviabheeman` fork to test rotation) |
 | `seeder_repo_ref` | see `config/repos.py` | `tapyrus-seeder` branch/tag/sha to check out |
-| `tx_round_count` | `5` | Round-robin send/check/settle cycles `scripts/generate_traffic.py` runs -- each is 3 block-heights and 14 transactions (7 nodes x {TPC send, colored send-or-mint}), so this alone determines the tx/block/height totals for that step. Also determines the reorg's baseline height -- see below |
-| `reorg_loser_blocks` | `10` | Blocks the losing group builds past the baseline |
-| `reorg_winner_margin` | `2` | Extra blocks the winning group builds beyond `reorg_loser_blocks` (winner total = loser + margin, so a tie/shorter-winner is structurally impossible) |
+| `tx_round_count` | `500` (`20` on pull_request/push) | Round-robin send/check/settle cycles `scripts/generate_traffic.py` runs -- each is 3 block-heights and 14 transactions (7 nodes x {TPC send, colored send-or-mint}), so this alone determines the tx/block/height totals for that step. Also determines the reorg's baseline height -- see below |
+| `reorg_length` | `100` (`10` on pull_request/push) | Blocks each isolated group builds past the baseline before reconnecting at the tie. How many blocks past this the winning side needs before the reorg actually triggers is not configurable -- `scripts/simulate_reorg.py` builds both forks to this same height, reconnects, then probes one block at a time to find the real trigger point (has consistently been 1-2 blocks in practice, never a fixed protocol minimum) -- see `doc/scripts.md` |
 | `round_duration_seconds` | `60` | `tapyrus-signerd` round-duration (block interval) -- 60s avoids the `InvalidBlock` timing race a shorter duration hits, see `doc/work-done.md` |
 | `network_id` | `1905960821` | Tapyrus network id (prod mode, see `doc/work-done.md`), used by every core-* node's rendered `tapyrus.conf` and the `genesis.<id>` file `tapyrusd` looks for |
 | `slack_log_tail_lines` | `100` | Lines of the implicated container's log inlined in the Slack failure report |
 | `docker_build_platform` | *(empty, runner-native)* | Docker `--platform` for image builds -- local verification only ever used `linux/arm64` |
 
 Not yet real inputs (env-literal only, no per-run override -- see above):
-`tx_total_count` (`20`), `tx_tpc_percent` (`30`), `tx_interval_seconds` (`30`),
-`rotation_height_offset` (`10`), `max_block_size_new` (`2000000`), `prng_seed_base`
-(`github.run_id`). All feed steps that are still commented-out/TODO (Milestone 3/4).
+`federation_change_height` (`800`, `60` on pull_request/push), `max_block_size_new`
+(`2000000`). Both feed steps that are still commented-out/TODO (Milestone 3/4).
 Reintroduce as real inputs once a step lands for real, if the 10-input budget allows,
 or via a JSON "overrides" input / repo vars otherwise.
+
+**No input at all, and no env-literal fallback either** (not just not-yet-wired --
+gone entirely): `tx_total_count`, `tx_tpc_percent`, `tx_interval_seconds`. Earlier
+drafts of `scripts/generate_traffic.py` took independent knobs for total tx count,
+the TPC/colored-coin split, and per-send pacing; the script settled on a single
+`tx_round_count` knob instead (see `doc/work-done.md`'s "`generate_traffic.py`'s
+round-count-only design"), so these three no longer correspond to anything the script
+reads -- not obsolete inputs waiting for a slot, just dead names.
 
 **No input at all** (not even an env-literal fallback): `chain_height_before_reorg`.
 `CHAIN_HEIGHT_BEFORE_REORG` is always `TX_ROUND_COUNT + 2` (computed by the "Derive
@@ -125,13 +133,16 @@ rather than an independently-configured value that could silently drift out of s
 with it. `scripts/simulate_reorg.py` treats this as a floor, not a literal target: it
 waits until the chain reaches at least that height, then uses whatever height was
 *actually* reached (which is typically well past the floor, since traffic generation
-runs first) as the real reference point for the loser/winner fork targets -- see
+runs first) as the real reference point for both forks' target -- see
 `doc/work-done.md` for why that distinction matters.
 
 Not configurable per-run at all (hardcoded): the RPC port/user/pass (`12381` /
-`rpcuser` / `rpcpassword`), and the signer count (3) / threshold (2) -- the 7-node
+`rpcuser` / `rpcpassword`), the signer count (3) / threshold (2) -- the 7-node
 topology in `docker/docker-compose.yml` is wired 1:1 to exactly 3 signers, so changing
-the count means redesigning the topology, not just passing a different number.
+the count means redesigning the topology, not just passing a different number -- and
+`prng_seed_base` (always `github.run_id`): `doc/weekly-integration-test-plan.md`
+requires the PRNG be seeded deterministically per run so a failure is reproducible,
+so this is deliberately never a per-run override, not just an as-yet-unwired one.
 
 ## Developer notes
 
