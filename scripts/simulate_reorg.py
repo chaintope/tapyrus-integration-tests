@@ -96,7 +96,17 @@ CORE_RPC_PORT = "12381"
 REDIS_HOST = "redis"
 REDIS_PORT = "6379"
 HEIGHT_POLL_INTERVAL_SECONDS = 5
-HEIGHT_POLL_TIMEOUT_SECONDS = 600
+# A liveness timeout, not a total-duration budget for reaching the target height:
+# _wait_for_height watches getblockchaininfo's bestblockhash and only times out if it
+# stops changing (real forward progress stalls), not because reaching the target
+# takes a while -- REORG_LENGTH can be large, and group A signs with only 2 of 3
+# signers live (signer-2's target, core-3a, is down for the whole split -- see
+# doc/work-done.md's RPC-connectivity note), so roughly 1 in 3 rounds produces no
+# block at all. A flat total-duration timeout would have to assume a worst-case
+# stall rate up front; watching for actual stalls doesn't need to guess. Sized in
+# ROUND_DURATIONs so a few consecutive missed rounds don't look like a real stall.
+STALL_TIMEOUT_ROUND_MULTIPLIER = 4
+MIN_STALL_TIMEOUT_SECONDS = 180
 CONVERGENCE_TIMEOUT_SECONDS = 120
 CANARY_SEND_AMOUNT_TPC = 0.001
 # Reorg has consistently triggered within +2 blocks past the tie in practice (see
@@ -347,20 +357,42 @@ class ReorgSimulator:
         not the original `target` they asked for, stay correct regardless of how much
         the chain had already advanced -- see the CHAIN_HEIGHT_BEFORE_REORG note in
         this script's own docstring.
+
+        Watches getblockchaininfo's bestblockhash per node rather than assuming a
+        production rate: as long as at least one node's bestblockhash keeps changing
+        (real forward progress, however slow), the wait continues with no overall cap.
+        It only times out if that stalls -- no bestblockhash change anywhere in
+        node_names for STALL_TIMEOUT_ROUND_MULTIPLIER round-durations -- which is what
+        actually distinguishes "stuck" from "just needs more blocks."
         """
-        deadline = time.monotonic() + HEIGHT_POLL_TIMEOUT_SECONDS
+        stall_timeout_seconds = max(
+            MIN_STALL_TIMEOUT_SECONDS, int(self._round_duration) * STALL_TIMEOUT_ROUND_MULTIPLIER
+        )
+        last_state = None
+        last_progress_at = time.monotonic()
         while True:
-            heights = await asyncio.gather(*(self._node_height(name) for name in node_names))
+            infos = await asyncio.gather(*(self._node_chain_info(name) for name in node_names))
+            heights = [info["blocks"] if info else None for info in infos]
             if all(height is not None and height >= target for height in heights):
                 return min(heights)
-            if time.monotonic() >= deadline:
+
+            state = tuple(info["bestblockhash"] if info else None for info in infos)
+            now = time.monotonic()
+            if state != last_state:
+                last_state = state
+                last_progress_at = now
+            elif now - last_progress_at >= stall_timeout_seconds:
                 stuck = {name: h for name, h in zip(node_names, heights) if h is None or h < target}
-                raise TimeoutError(f"height {target} not reached within {HEIGHT_POLL_TIMEOUT_SECONDS}s: {stuck}")
+                raise TimeoutError(
+                    f"height {target} not reached and no bestblockhash change across {node_names} for "
+                    f"{stall_timeout_seconds}s ({self._round_duration}s/round x{STALL_TIMEOUT_ROUND_MULTIPLIER}): "
+                    f"{stuck}"
+                )
             await asyncio.sleep(HEIGHT_POLL_INTERVAL_SECONDS)
 
-    async def _node_height(self, name):
+    async def _node_chain_info(self, name):
         try:
-            return await self._clients[name].call("getblockcount")
+            return await self._clients[name].call("getblockchaininfo")
         except RpcUnreachable:
             return None
 
