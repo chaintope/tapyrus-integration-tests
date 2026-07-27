@@ -1,22 +1,33 @@
 #!/usr/bin/env python3
-"""Drive a genuine two-sided reorg: split the 7-node network into two isolated
-groups, let each independently threshold-sign its own fork from a common baseline,
-reconnect, then probe how many blocks past the tie it actually takes for the reorg to
-trigger -- not simulated, and not assumed.
+"""Drive a genuine two-sided reorg via strict alternation: only one group's core
+nodes are ever up and building at a time (never both, until the final reconnect), so
+neither side can influence or observe the other's blocks while forking -- not
+simulated, and not just isolated-by-network-stop while leaving room for ambiguity.
 
-This follows the 8-step recipe in doc/weekly-integration-test-plan.md section 4d
-(already run once by hand -- see doc/work-done.md's "Reorg -- full run transcript" for
-the verified transcript), with one deliberate departure: that transcript had the
-winning group build straight past the losing group's height by a fixed margin before
-ever reconnecting. There's no protocol rule that says a competing chain needs to be any
-particular number of blocks longer before tapyrus-core's chain selection switches to
-it -- one block of extra cumulative work is sufficient in principle. So instead of
-assuming a margin, this script builds both forks to the exact
-same height, reconnects at that tie, confirms the tie alone does NOT cause a reorg,
-then grows the winning side one block at a time -- checking after every new block
-whether the reorg has actually triggered yet -- and reports however many blocks it
-actually took. In practice this has never taken more than 2 (see
-doc/work-done.md), but the script measures it rather than hardcoding it.
+1. Build a common baseline (all 7 nodes).
+2. Stop group A entirely. Repoint all 3 signers to group B (core-3a) and let it build
+   REORG_LENGTH blocks alone.
+3. Stop group B, restart group A, reset redis fresh.
+4. Repoint all 3 signers back to group A's default mapping, inject the canary
+   transaction, and let group A build its OWN REORG_LENGTH blocks -- a genuinely
+   different set than group B's, since group A never saw group B's blocks or the
+   round-state that produced them.
+5. Reconnect group B alongside group A (both now at the same height, different tips --
+   a real tie) and confirm the tie alone doesn't cause a reorg.
+6. Repoint signers back to group B and extend ITS chain by exactly one more block.
+7. Confirm every node -- both former groups -- converges on group B's (now longer)
+   tip, with group A's own fork showing up as a real valid-fork via getchaintips.
+
+This replaced an earlier version of this script that built both forks to a tie by
+having group A build first (network-isolated) and group B build second, also
+isolated, from the same frozen baseline -- which turned out to still let the two
+forks' blocks end up byte-identical (same hash at every height), confirmed via a real
+run's container logs: group B's own locally-created blocks never became its accepted
+chain, it silently adopted group A's chain (including group A's canary transaction)
+at the same real-world second, meaning the two groups were never actually
+independent for the whole isolation window. The redesign here alternates which
+group's core nodes are even running, so there's no window where both sides are up
+and could relay/influence each other while each thinks it's building alone.
 
 Usage:
     ./scripts/simulate_reorg.py
@@ -45,32 +56,29 @@ here can only come from the live tapyrus-signerd trio's normal round-robin proce
 ROUND_DURATION cadence -- this script is inherently as slow as that process, not a
 shortcut around it.
 
-Signer-set-a's repoint step (recipe step 5) reuses
-scripts/assemble_signer_configs.py's SignerConfigAssembler directly (not a
-subprocess) to regenerate tapyrus-signer.toml with a new rpc-endpoint-host --
-pubkeys come from secrets/<set-name>/pubkeys.txt (persistent for the whole job); each
-node's to-address is re-read from its own already-written
+Every repoint reuses scripts/assemble_signer_configs.py's SignerConfigAssembler
+directly (not a subprocess) to regenerate tapyrus-signer.toml with a new
+rpc-endpoint-host -- pubkeys come from secrets/<set-name>/pubkeys.txt (persistent for
+the whole job); each node's to-address is re-read from its own already-written
 runtime/signers/node-<i>/tapyrus-signer.toml (via stdlib tomllib) rather than
 depending on the original "Collect coinbase addresses" step's /tmp file still being
-around -- keeps this script self-contained.
+around -- keeps this script self-contained. There are three repoints in this recipe,
+not one, so this is a shared helper (_repoint_signers), not a single-purpose step.
 
-Also verifies transactions aren't silently lost during the reorg: right after the
-split, sends one canary TPC transaction from CANARY_SENDER to CANARY_RECEIVER (both
-group A, using a UTXO that predates the split so it can't legitimately conflict with
-anything group B does) -- this gets mined into one of group A's now-doomed blocks. In
-tapyrus-core's reorg handling, a disconnected block's transactions are pushed back
-into the mempool unless their inputs are already spent on the new chain (a real
-conflict, correctly dropped) or they depend on an output that only existed on the
-losing side (an "orphan" case mempool logic doesn't always handle cleanly --
-historically one of this logic's more bug-prone corners).
-After reconnection, this script confirms the canary is either re-confirmed or back in
-the mempool -- not vanished. Deliberately the simple case only (one transaction, input
+Also verifies transactions aren't silently lost during the reorg: right when group A
+starts building its own fork, sends one canary TPC transaction from CANARY_SENDER to
+CANARY_RECEIVER (both group A, using a UTXO that predates the fork point so it can't
+legitimately conflict with anything group B does) -- this gets mined into one of
+group A's now-doomed blocks. In tapyrus-core's reorg handling, a disconnected block's
+transactions are pushed back into the mempool unless their inputs are already spent on
+the new chain (a real conflict, correctly dropped) or they depend on an output that
+only existed on the losing side (an "orphan" case mempool logic doesn't always handle
+cleanly -- historically one of this logic's more bug-prone corners). After
+reconnection, this script confirms the canary is either re-confirmed or back in the
+mempool -- not vanished. Deliberately the simple case only (one transaction, input
 predates the fork point, no legitimate conflict is possible) -- dependent-transaction
 chains and deliberate double-spend/conflict scenarios are real follow-ups, not
-attempted here. Confirms "not lost" (mempool or re-confirmed), not "re-mined into a
-new block": that would need signer-set-a restarted after reconnection to produce one
-more real block, which this script doesn't do (signers stay stopped once the reorg
-has triggered, matching the base recipe).
+attempted here.
 """
 import asyncio
 import os
@@ -91,6 +99,7 @@ from scripts.wait_for_topology import TopologyWaiter  # noqa: E402
 RPC_HOST = "127.0.0.1"
 DOCKER_DIR = REPO_ROOT / "docker"
 SIGNER_SET_NAME = "signer-set-a"
+SIGNER_COUNT = 3
 SIGNER_THRESHOLD = 2
 CORE_RPC_PORT = "12381"
 REDIS_HOST = "redis"
@@ -99,21 +108,17 @@ HEIGHT_POLL_INTERVAL_SECONDS = 5
 # A liveness timeout, not a total-duration budget for reaching the target height:
 # _wait_for_height watches getblockchaininfo's bestblockhash and only times out if it
 # stops changing (real forward progress stalls), not because reaching the target
-# takes a while -- REORG_LENGTH can be large, and group A signs with only 2 of 3
-# signers live (signer-2's target, core-3a, is down for the whole split -- see
-# doc/work-done.md's RPC-connectivity note), so roughly 1 in 3 rounds produces no
-# block at all. A flat total-duration timeout would have to assume a worst-case
-# stall rate up front; watching for actual stalls doesn't need to guess. Sized in
-# ROUND_DURATIONs so a few consecutive missed rounds don't look like a real stall.
+# takes a while -- REORG_LENGTH can be large, and whichever group is building alone
+# signs with only 2 of 3 signers live (the third signer's RPC target is on the other,
+# currently-stopped group -- see doc/work-done.md's RPC-connectivity note), so
+# roughly 1 in 3 rounds produces no block at all. A flat total-duration timeout would
+# have to assume a worst-case stall rate up front; watching for actual stalls doesn't
+# need to guess. Sized in ROUND_DURATIONs so a few consecutive missed rounds don't
+# look like a real stall.
 STALL_TIMEOUT_ROUND_MULTIPLIER = 4
 MIN_STALL_TIMEOUT_SECONDS = 180
 CONVERGENCE_TIMEOUT_SECONDS = 120
 CANARY_SEND_AMOUNT_TPC = 0.001
-# Reorg has consistently triggered within +2 blocks past the tie in practice (see
-# doc/work-done.md) -- this is a generous safety ceiling past that, not an expected
-# value. Exhausting it means something is actually broken (e.g. the repoint didn't
-# take, or P2P relay stalled), not just a slow round.
-MAX_TRIGGER_PROBE_BLOCKS = 5
 
 SIGNERS = ("signer-0", "signer-1", "signer-2")
 CANARY_SENDER = "core-1a"
@@ -134,6 +139,13 @@ GROUP_A = ("core-1a", "core-1b", "core-2a", "core-2b")
 GROUP_B = ("core-3a", "core-3b", "core-7")
 ALL_NODE_NAMES = tuple(name for name, _ in NODES)
 
+# The default mapping (signer-0 -> core-1a, signer-1 -> core-2a, signer-2 -> core-3a,
+# matching assemble_signer_configs.py's original bring-up) vs. all 3 pointed at
+# group B's one RPC-capable node -- group B has no other first-layer node to spread
+# across, by design (see doc/weekly-integration-test-plan.md section 4b).
+GROUP_A_RPC_HOSTS = ("core-1a", "core-2a", "core-3a")
+GROUP_B_RPC_HOSTS = ("core-3a",) * SIGNER_COUNT
+
 
 class ReorgError(Exception):
     """A reorg-recipe step didn't produce the expected chain state."""
@@ -147,32 +159,29 @@ class ReorgSimulator:
         self._reorg_length = reorg_length
         self._round_duration = round_duration
         self._clients = {name: CoreRpcClient(RPC_HOST, port, rpc_user, rpc_pass) for name, port in NODES}
-        self._losing_tip = None
-        self._winning_tip = None
-        self._winner_margin = None
+        self._group_a_tip = None
+        self._group_b_tip = None
         self._canary_txid = None
 
     async def run(self):
         await self._build_baseline()
-        await self._split()
+        await self._build_group_b_fork()
+        await self._restore_group_a()
         await self._inject_canary_transaction()
-        await self._build_losing_fork()
-        await self._bring_back_group_b()
-        await self._repoint_and_restart_signers()
-        await self._build_equal_fork()
-        await self._reconnect()
+        await self._build_group_a_fork()
+        await self._reconnect_group_b()
         await self._confirm_tie_holds()
-        await self._probe_reorg_trigger()
+        await self._extend_group_b_by_one_block()
         await self._confirm_convergence()
         await self._verify_canary_transaction_survived()
         log.info(
-            f"done. group A's {self._reorg_length}-block fork (tip {self._losing_tip[:12]}...) confirmed as a "
-            f"valid-fork on every ex-group-A node; the network converged on group B's chain once it was "
-            f"{self._winner_margin} block(s) longer (tip {self._winning_tip[:12]}...); the canary transaction "
+            f"done. group A's {self._reorg_length}-block fork (tip {self._group_a_tip[:12]}...) confirmed as a "
+            f"valid-fork on every node; every node -- both former groups -- converged on group B's "
+            f"{self._reorg_length + 1}-block chain (tip {self._group_b_tip[:12]}...); the canary transaction "
             f"({self._canary_txid[:12]}...) confirmed only on the losing fork was not lost."
         )
 
-    # -- recipe steps (doc/weekly-integration-test-plan.md section 4d) --------------
+    # -- recipe steps -----------------------------------------------------------
 
     async def _build_baseline(self):
         log.step(f"building baseline (target height {self._baseline_height}, all 7 nodes)")
@@ -187,13 +196,28 @@ class ReorgSimulator:
         log.info(f"baseline confirmed: all 7 nodes at height {self._baseline_height}, tip {tips[0][:12]}...")
         await self._compose("stop", *SIGNERS)
 
-    async def _split(self):
-        log.step("splitting the network: stopping core-3a/core-3b/core-7")
-        await self._compose("stop", "core-3a", "core-3b", "core-7")
-        # RPC mapping unchanged (signer-0/1 -> core-1a/core-2a, still live in group A);
-        # signer-2 (-> core-3a) will fail to start with no reachable RPC target --
-        # expected and harmless, matches the verified recipe.
+    async def _build_group_b_fork(self):
+        log.step("stopping group A -- group B builds its fork completely alone")
+        await self._compose("stop", *GROUP_A)
+        await self._repoint_signers(GROUP_B_RPC_HOSTS)
         await self._compose("start", *SIGNERS)
+
+        target = self._baseline_height + self._reorg_length
+        log.step(f"group B building its fork (target height {target})")
+        await self._wait_for_height(GROUP_B, target)
+        self._group_b_tip = await self._clients["core-3a"].call("getbestblockhash")
+        log.info(f"group B's fork tip: {self._group_b_tip[:12]}... (height {target})")
+        await self._compose("stop", *SIGNERS)
+
+    async def _restore_group_a(self):
+        log.step("stopping group B, restarting group A, resetting redis fresh")
+        await self._compose("stop", *GROUP_B)
+        await self._compose("start", *GROUP_A)
+        # No volume mounted on the redis service (docker/docker-compose.yml) -- its
+        # state is entirely in the container's writable layer, so recreating it is a
+        # true fresh reset, not just a process restart -- avoids any round-state
+        # carryover from group B's just-finished rounds bleeding into group A's.
+        await self._compose("up", "-d", "--force-recreate", "redis")
 
     async def _inject_canary_transaction(self):
         log.step(f"injecting a canary transaction ({CANARY_SENDER} -> {CANARY_RECEIVER}) into group A")
@@ -203,65 +227,24 @@ class ReorgSimulator:
         )
         log.info(f"canary transaction {self._canary_txid[:12]}... broadcast -- will confirm only on group A's fork")
 
-    async def _build_losing_fork(self):
-        target = self._baseline_height + self._reorg_length
-        log.step(f"group A building its fork (target height {target})")
-        await self._wait_for_height(GROUP_A, target)
-        self._losing_tip = await self._clients["core-1a"].call("getbestblockhash")
-        log.info(f"group A's fork tip: {self._losing_tip[:12]}... (height {target})")
-        await self._compose("stop", *SIGNERS, *GROUP_A)
-
-    async def _bring_back_group_b(self):
-        log.step("bringing group B back (still at the baseline tip)")
-        await self._compose("start", *GROUP_B)
-        # No volume mounted on the redis service (docker/docker-compose.yml) -- its
-        # state is entirely in the container's writable layer, so recreating it is a
-        # true fresh reset, not just a process restart.
-        log.step("resetting redis fresh")
-        await self._compose("up", "-d", "--force-recreate", "redis")
-
-    async def _repoint_and_restart_signers(self):
-        log.step("repointing all 3 signers' RPC target to core-3a")
-        set_dir = REPO_ROOT / "secrets" / SIGNER_SET_NAME
-        pubkeys = [line for line in (set_dir / "pubkeys.txt").read_text().splitlines() if line]
-        aggpubkey = (set_dir / "aggregated-public-key.txt").read_text().strip()
-        output_dir = REPO_ROOT / "runtime" / "signers"
-        addresses = [self._read_to_address(output_dir / f"node-{i}") for i in range(len(pubkeys))]
-
-        assembler = SignerConfigAssembler(
-            set_dir, SIGNER_THRESHOLD, aggpubkey,
-            CoreRpc(CORE_RPC_PORT, self._rpc_user, self._rpc_pass),
-            Redis(REDIS_HOST, REDIS_PORT),
-            self._round_duration,
-        )
-        # Every signer's RPC target repoints to core-3a -- the required fix, not
-        # optional: a signer with a dead RPC target can't contribute a threshold
-        # share at all, even purely as a non-master over Redis (confirmed in
-        # doc/work-done.md). Without this, group B would never resume signing.
-        assembler.run(pubkeys, addresses, ["core-3a"] * len(pubkeys), output_dir)
-
-        # Config is only read at tapyrus-signerd startup -- a bare restart of an
-        # already-stopped container picks up the rewritten bind-mounted file.
+    async def _build_group_a_fork(self):
+        log.step("repointing signers back to group A's default mapping and building its fork")
+        await self._repoint_signers(GROUP_A_RPC_HOSTS)
+        # signer-2 (-> core-3a) will fail to start with no reachable RPC target --
+        # group B is stopped for the whole of this step -- expected and harmless,
+        # matches the verified recipe: threshold 2 is met by signer-0/signer-1 alone.
         await self._compose("start", *SIGNERS)
 
-    def _read_to_address(self, node_dir):
-        with (node_dir / "tapyrus-signer.toml").open("rb") as f:
-            return tomllib.load(f)["signer"]["to-address"]
-
-    async def _build_equal_fork(self):
-        # Deliberately the SAME target group A built to, not a longer one -- the tie
-        # is the interesting state to reconnect at: see _confirm_tie_holds and
-        # _probe_reorg_trigger below.
         target = self._baseline_height + self._reorg_length
-        log.step(f"group B building an equal-length fork (target height {target})")
-        await self._wait_for_height(GROUP_B, target)
-        tip = await self._clients["core-3a"].call("getbestblockhash")
-        log.info(f"group B's equal-height fork tip: {tip[:12]}... (height {target})")
+        log.step(f"group A building its own, different fork (target height {target})")
+        await self._wait_for_height(GROUP_A, target)
+        self._group_a_tip = await self._clients["core-1a"].call("getbestblockhash")
+        log.info(f"group A's fork tip: {self._group_a_tip[:12]}... (height {target})")
         await self._compose("stop", *SIGNERS)
 
-    async def _reconnect(self):
-        log.step("reconnecting group A alongside group B")
-        await self._compose("start", *GROUP_A)
+    async def _reconnect_group_b(self):
+        log.step("reconnecting group B alongside group A")
+        await self._compose("start", *GROUP_B)
         waiter = TopologyWaiter(self._rpc_user, self._rpc_pass, CONVERGENCE_TIMEOUT_SECONDS, HEIGHT_POLL_INTERVAL_SECONDS)
         await waiter.run()
 
@@ -269,57 +252,85 @@ class ReorgSimulator:
         log.step("confirming the equal-height tie alone does not trigger a reorg")
         tips = await asyncio.gather(*(self._clients[name].call("getbestblockhash") for name in GROUP_A))
         for name, tip in zip(GROUP_A, tips):
-            if tip != self._losing_tip:
+            if tip != self._group_a_tip:
                 raise ReorgError(
-                    f"{name}: switched off its own tip ({self._losing_tip[:12]}..., now {tip[:12]}...) at the "
-                    f"tie alone, before group B ever built a longer chain -- a tie shouldn't cause a reorg"
+                    f"{name}: switched off its own tip ({self._group_a_tip[:12]}..., now {tip[:12]}...) at the "
+                    f"tie alone, before group B was ever longer -- a tie shouldn't cause a reorg"
                 )
-        log.info("confirmed: every ex-group-A node is still on its own tip at the tie -- no premature reorg")
+        log.info("confirmed: every group A node is still on its own tip at the tie -- no premature reorg")
 
-    async def _probe_reorg_trigger(self):
-        log.step("restarting group B's signers to probe how many blocks past the tie trigger the reorg")
+    async def _extend_group_b_by_one_block(self):
+        log.step("repointing signers back to group B and extending its chain by exactly 1 block")
+        await self._repoint_signers(GROUP_B_RPC_HOSTS)
         await self._compose("start", *SIGNERS)
-        for margin in range(1, MAX_TRIGGER_PROBE_BLOCKS + 1):
-            target = self._baseline_height + self._reorg_length + margin
-            await self._wait_for_height(GROUP_B, target)
-            candidate_tip = await self._clients["core-3a"].call("getbestblockhash")
-            ex_group_a_tips = await asyncio.gather(*(self._clients[name].call("getbestblockhash") for name in GROUP_A))
-            if all(tip == candidate_tip for tip in ex_group_a_tips):
-                self._winning_tip = candidate_tip
-                self._winner_margin = margin
-                await self._compose("stop", *SIGNERS)
-                log.info(f"reorg triggered at +{margin} block(s) past the tie (winning tip {candidate_tip[:12]}...)")
-                return
-            log.info(f"+{margin} block(s) past the tie: not triggered yet ({dict(zip(GROUP_A, ex_group_a_tips))})")
-        raise ReorgError(
-            f"reorg still not triggered after +{MAX_TRIGGER_PROBE_BLOCKS} block(s) past the tie -- "
-            f"has consistently taken 1-2 in practice, this many past that is a real bug, not a slow round"
-        )
+
+        target = self._baseline_height + self._reorg_length + 1
+        # ALL_NODE_NAMES, not just GROUP_B -- the point of this wait is confirming
+        # group A adopts group B's now-longer chain (the reorg itself), not just that
+        # group B produced one more block.
+        await self._wait_for_height(ALL_NODE_NAMES, target)
+        self._group_b_tip = await self._clients["core-3a"].call("getbestblockhash")
+        log.info(f"group B's chain extended to height {target} (tip {self._group_b_tip[:12]}...) -- all 7 nodes converged")
+        await self._compose("stop", *SIGNERS)
 
     async def _confirm_convergence(self):
-        log.step("confirming convergence via getchaintips")
+        log.step("confirming convergence via getchaintips (checking all 7 nodes, not stopping at the first mismatch)")
+        failures = []
+
         for name in GROUP_A:
             tips = await self._clients[name].call("getchaintips")
             active = [t for t in tips if t["status"] == "active"]
             forks = [t for t in tips if t["status"] == "valid-fork"]
             if len(tips) != 2 or len(active) != 1 or len(forks) != 1:
-                raise ReorgError(f"{name}: expected exactly 2 tips (1 active, 1 valid-fork), got {tips}")
-            if active[0]["hash"] != self._winning_tip:
-                raise ReorgError(f"{name}: active tip {active[0]['hash']} doesn't match group B's {self._winning_tip}")
-            if forks[0]["hash"] != self._losing_tip or forks[0]["branchlen"] != self._reorg_length:
-                raise ReorgError(
-                    f"{name}: valid-fork tip mismatch -- expected hash {self._losing_tip} "
+                failures.append(f"{name}: expected exactly 2 tips (1 active, 1 valid-fork), got {tips}")
+                continue
+            if active[0]["hash"] != self._group_b_tip:
+                failures.append(f"{name}: active tip {active[0]['hash']} doesn't match group B's {self._group_b_tip}")
+                continue
+            if forks[0]["hash"] != self._group_a_tip or forks[0]["branchlen"] != self._reorg_length:
+                failures.append(
+                    f"{name}: valid-fork tip mismatch -- expected hash {self._group_a_tip} "
                     f"branchlen {self._reorg_length}, got {forks[0]}"
                 )
+                continue
             log.info(f"{name}: confirmed -- active={active[0]['hash'][:12]}... valid-fork={forks[0]['hash'][:12]}... "
                       f"branchlen={forks[0]['branchlen']}")
 
-        # core-3a was on the winning side throughout -- never had a competing fork of
-        # its own to abandon, so it should show a single active tip, not two.
-        tips = await self._clients["core-3a"].call("getchaintips")
-        if len(tips) != 1 or tips[0]["status"] != "active":
-            raise ReorgError(f"core-3a: expected a single active tip (never split), got {tips}")
-        log.info(f"core-3a: confirmed -- single active tip {tips[0]['hash'][:12]}... (never had a competing fork)")
+        # core-3a/core-3b were on the winning side throughout, and are ONLY
+        # P2P-connected within group B (docker/docker-compose.yml), so neither ever
+        # even learns group A's fork exists -- each should show a single active tip.
+        for name in ("core-3a", "core-3b"):
+            tips = await self._clients[name].call("getchaintips")
+            if len(tips) != 1 or tips[0]["status"] != "active":
+                failures.append(f"{name}: expected a single active tip (never split), got {tips}")
+                continue
+            log.info(f"{name}: confirmed -- single active tip {tips[0]['hash'][:12]}... (never had a competing fork)")
+
+        # core-7 is different: it's P2P-connected to ALL THREE second-layer nodes
+        # (core-1b/core-2b/core-3b), bridging both groups by design (see
+        # docker-compose.yml's topology comment). So it legitimately learns group A's
+        # abandoned fork via header relay even though it was never asked to build or
+        # extend it -- confirmed live: it shows a second tip at group A's height with
+        # status "valid-headers" (headers relayed and known, not necessarily
+        # fully-validated as a real candidate), not "valid-fork" like the ex-group-A
+        # nodes, since group B's own chain was always at least as long by the time it
+        # reconnects. Only the ACTIVE tip is asserted here, not the tip count --
+        # unlike core-3a/core-3b, "exactly 1 tip" isn't the right invariant for it.
+        tips = await self._clients["core-7"].call("getchaintips")
+        active = [t for t in tips if t["status"] == "active"]
+        if len(active) != 1 or active[0]["hash"] != self._group_b_tip:
+            failures.append(f"core-7: expected a single active tip matching group B's {self._group_b_tip}, got {tips}")
+        else:
+            log.info(
+                f"core-7: confirmed -- active tip {active[0]['hash'][:12]}... matches group B "
+                f"({len(tips) - 1} other known tip(s) from its cross-group P2P links, expected)"
+            )
+
+        if failures:
+            raise ReorgError(
+                f"convergence check failed on {len(failures)}/{len(ALL_NODE_NAMES)} node(s):\n  "
+                + "\n  ".join(failures)
+            )
 
     async def _verify_canary_transaction_survived(self):
         log.step("verifying the canary transaction survived the reorg (not lost)")
@@ -345,6 +356,35 @@ class ReorgSimulator:
             f"canary transaction {self._canary_txid} was orphaned by the reorg (confirmations="
             f"{tx['confirmations']}) and never returned to the mempool -- appears to have been lost"
         )
+
+    # -- signer repointing --------------------------------------------------------
+
+    async def _repoint_signers(self, core_rpc_hosts):
+        """Rewrites tapyrus-signer.toml's rpc-endpoint-host for all 3 signers and
+        leaves them stopped, ready for the caller to start. Used three times in this
+        recipe (to group B, back to group A's default mapping, then to group B
+        again), not just once -- config is only read at tapyrus-signerd startup, so
+        a bare restart of an already-stopped container is what actually picks up the
+        rewritten bind-mounted file.
+        """
+        log.step(f"repointing all 3 signers' RPC targets to {core_rpc_hosts}")
+        set_dir = REPO_ROOT / "secrets" / SIGNER_SET_NAME
+        pubkeys = [line for line in (set_dir / "pubkeys.txt").read_text().splitlines() if line]
+        aggpubkey = (set_dir / "aggregated-public-key.txt").read_text().strip()
+        output_dir = REPO_ROOT / "runtime" / "signers"
+        addresses = [self._read_to_address(output_dir / f"node-{i}") for i in range(len(pubkeys))]
+
+        assembler = SignerConfigAssembler(
+            set_dir, SIGNER_THRESHOLD, aggpubkey,
+            CoreRpc(CORE_RPC_PORT, self._rpc_user, self._rpc_pass),
+            Redis(REDIS_HOST, REDIS_PORT),
+            self._round_duration,
+        )
+        assembler.run(pubkeys, addresses, list(core_rpc_hosts), output_dir)
+
+    def _read_to_address(self, node_dir):
+        with (node_dir / "tapyrus-signer.toml").open("rb") as f:
+            return tomllib.load(f)["signer"]["to-address"]
 
     # -- height polling ------------------------------------------------------------
 
@@ -417,8 +457,8 @@ async def main():
     round_duration = os.environ.get("ROUND_DURATION", "60")
 
     log.step(
-        f"simulating a reorg: baseline height {baseline_height}, both forks {reorg_length} block(s) "
-        f"before probing the trigger margin"
+        f"simulating a reorg: baseline height {baseline_height}, group B then group A each build "
+        f"{reorg_length} block(s) alone, then group B is extended by 1 more"
     )
     simulator = ReorgSimulator(rpc_user, rpc_pass, baseline_height, reorg_length, round_duration)
     await simulator.run()

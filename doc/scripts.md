@@ -324,23 +324,15 @@ assignment, and the balance-shortfall top-up mechanic). Implemented as `TrafficN
 
 ## `scripts/simulate_reorg.py`
 
-Drives a genuine two-sided reorg: splits the 7-node network into two isolated groups,
-lets each independently threshold-sign its own fork from a common baseline, builds
-both forks to the *same* height, reconnects at that tie, then grows the winning side
-one block at a time until the reorg actually triggers -- confirming the losing
-group's fork shows up as a real `valid-fork` tip via `getchaintips` once it does. Not
-simulated, and the trigger margin isn't assumed either: there's no tapyrus-core
-consensus rule requiring a competing chain to be any particular number of blocks
-longer before nodes switch to it (one block of extra height is sufficient in
-principle), so instead of building the winner straight past the loser by a fixed
-margin, the script measures how many blocks it actually takes live. Follows the 8-step
-recipe in `weekly-integration-test-plan.md` section 4d (already run once by hand, see
-`work-done.md`'s "Reorg -- full run transcript") with that one departure -- see the
-script's own module docstring for the full reasoning. Implemented as `ReorgSimulator`,
-following `generate_traffic.py`'s class-based/asyncio pattern. The first script to
-also drive `docker compose` itself (stop/start/force-recreate specific services), not
-just RPC -- via a small `_compose()` subprocess helper, matching `checkout_repos.py`'s
-`_run()` style.
+Drives a genuine two-sided reorg via strict alternation: only one group's core nodes
+are ever up and building at a time (never both, until the final reconnect), so
+neither side can influence or observe the other's blocks while forking. Confirms the
+losing group's fork shows up as a real `valid-fork` tip via `getchaintips`, not just
+that the height advanced. Implemented as `ReorgSimulator`, following
+`generate_traffic.py`'s class-based/asyncio pattern. The first script to also drive
+`docker compose` itself (stop/start/force-recreate specific services), not just RPC --
+via a small `_compose()` subprocess helper, matching `checkout_repos.py`'s `_run()`
+style.
 
 - **Usage**: `./scripts/simulate_reorg.py` (no arguments -- reads
   `CHAIN_HEIGHT_BEFORE_REORG` / `REORG_LENGTH` / `CORE_RPC_USER` / `CORE_RPC_PASS` /
@@ -349,15 +341,27 @@ just RPC -- via a small `_compose()` subprocess helper, matching `checkout_repos
 - Requires the 7-node topology and signer-set-a already up and converged (same
   precondition as `generate_traffic.py`, which this step runs right after in the
   workflow).
-- **Tie-then-probe, not a fixed margin**: both groups build to `REORG_LENGTH` blocks
-  past the baseline -- the same height, not one longer. After reconnecting at that
-  tie, `_confirm_tie_holds` asserts none of the ex-group-A nodes switched off their own
-  tip (a tie alone must not cause a reorg); `_probe_reorg_trigger` then restarts group
-  B's signers and, one block at a time, checks whether the ex-group-A nodes have
-  switched to group B's new tip yet, up to `MAX_TRIGGER_PROBE_BLOCKS` (5) attempts
-  before treating it as a real failure rather than a slow round. In every run so far
-  this has triggered at +1 or +2 blocks past the tie (see `work-done.md`) -- the script
-  reports however many it actually took rather than hardcoding that expectation.
+- **The recipe, in order**: build a common baseline (all 7 nodes) -- stop group A
+  entirely, repoint all 3 signers to group B (`core-3a`), let it build `REORG_LENGTH`
+  blocks completely alone -- stop group B, restart group A, reset redis fresh --
+  repoint signers back to group A's default mapping, inject the canary transaction,
+  let group A build its *own* `REORG_LENGTH` blocks (genuinely different from group
+  B's, since it never saw group B's blocks or round-state) -- reconnect group B
+  alongside group A (a real tie: same height, different tips) and confirm the tie
+  alone doesn't cause a reorg -- repoint signers to group B one more time and extend
+  its chain by exactly 1 block, waiting for **all 7 nodes** (not just group B) to
+  reach that height, since group A can only satisfy that by actually reorging --
+  confirm convergence via `getchaintips` on all 7 nodes -- verify the canary
+  survived.
+- **Replaced an earlier "tie-then-probe" design** that built both forks from the same
+  frozen baseline and then probed increasing margins past a tie. That version's
+  network isolation didn't stop the two forks from starting from the same baseline
+  fully; verified live (see `work-done.md`), it silently produced two byte-identical
+  forks -- group B's own locally-built blocks never became its accepted chain, it
+  silently adopted group A's chain (including group A's canary transaction) at the
+  same real-world second, meaning the two groups were never actually independent for
+  the whole isolation window. The alternating version here closes that gap by never
+  having both sides' core nodes up at once until the final reconnect.
 - **`CHAIN_HEIGHT_BEFORE_REORG` is a floor, not an assumed starting point**: the
   workflow always sets it to `TX_ROUND_COUNT + 2` (see the root `README.md`'s
   variable table), tying it to whatever `generate_traffic.py` produces first in the
@@ -366,42 +370,45 @@ just RPC -- via a small `_compose()` subprocess helper, matching `checkout_repos
   reference point for both forks' target height -- using the literal floor value
   instead would let already-elapsed height silently satisfy that target too,
   producing a no-op "reorg" (group A/B "build their fork" without any new blocks).
-  Confirmed live: running right after `generate_traffic.py` (chain already at height
-  11, floor at 4), the script logged `baseline confirmed: all 7 nodes at height 11`
-  and computed the fork target as 13 (11+2), not 6 (4+2).
 - **Why not `tapyrus-core`'s `generatetoaddress` RPC** (instant block mining): it needs
   the aggregate *private* key as a parameter, not available here by design (threshold-
   shared across the 3 signers, no single party holds it in a real ceremony). Blocks can
   only come from the live `tapyrus-signerd` trio's normal round-robin process at
-  `ROUND_DURATION` cadence -- this script is inherently as slow as that process (~10-12
-  min at smoke-scale values, under an hour at full-scale, both well inside the 3h/6h
-  timeout budgets).
-- The repoint step (recipe step 5) reuses `assemble_signer_configs.py`'s
-  `SignerConfigAssembler` directly (not a subprocess) -- pubkeys come from
-  `secrets/<set-name>/pubkeys.txt` (persists for the whole job); each node's
-  `to-address` is re-read from its own already-written
-  `runtime/signers/node-<i>/tapyrus-signer.toml` (via stdlib `tomllib`, Python 3.11+)
-  rather than depending on the original "Collect coinbase addresses" step's `/tmp` file
-  still being around -- keeps this script self-contained. The reconnect step (recipe
-  step 7) reuses `wait_for_topology.py`'s `TopologyWaiter` directly, same reasoning.
+  `ROUND_DURATION` cadence -- this script is inherently as slow as that process.
+- **Signers get repointed three times, not once** (to group B, back to group A's
+  default mapping, then to group B again) -- `_repoint_signers` is a shared helper,
+  reusing `assemble_signer_configs.py`'s `SignerConfigAssembler` directly (not a
+  subprocess) each time. Pubkeys come from `secrets/<set-name>/pubkeys.txt` (persists
+  for the whole job); each node's `to-address` is re-read from its own already-written
+  `runtime/signers/node-<i>/tapyrus-signer.toml` (via stdlib `tomllib`) rather than
+  depending on the original "Collect coinbase addresses" step's `/tmp` file still
+  being around. The reconnect step reuses `wait_for_topology.py`'s `TopologyWaiter`
+  directly, same reasoning.
+- **`core-7` needs a different convergence check than `core-3a`/`core-3b`**: found via
+  a real run, not anticipated in advance. `core-3a`/`core-3b` are only P2P-connected
+  within group B (see `docker-compose.yml`'s topology), so each should show a single
+  active `getchaintips` tip -- confirmed live. `core-7`, by design, is P2P-connected
+  to *all three* second-layer nodes, bridging both groups -- so it legitimately learns
+  group A's abandoned fork via header relay even though it never builds/extends it.
+  Confirmed live: it shows a second tip at group A's height with status
+  `valid-headers` (headers relayed and known, not necessarily fully-validated as a
+  real candidate), not `valid-fork` like the ex-group-A nodes, since group B's own
+  chain was always at least as long by the time `core-7` reconnects to it.
+  `_confirm_convergence` only asserts `core-7`'s *active* tip matches group B, not its
+  total tip count.
 - **Output**: none written to disk -- verification results are logged; a mismatch at
-  any step raises `ReorgError` (non-zero exit).
-- **Pre-redesign verification** (fixed-margin version, before the tie-then-probe
-  rewrite -- the underlying recipe and assertions are unchanged, but this run predates
-  `REORG_LENGTH`/`_probe_reorg_trigger` and hasn't been re-verified live yet): verified
-  end-to-end twice against a real 7-node + signer-set-a stack, standalone
-  (`CHAIN_HEIGHT_BEFORE_REORG=5`, a 2-block loser fork, a 1-block-longer winner fork,
-  ~12.5 min real runtime) and immediately after a real `generate_traffic.py` run in the
-  same job (same 2-block/1-block-margin shape, `CHAIN_HEIGHT_BEFORE_REORG` derived,
-  ~6 min on top of traffic generation's ~12 min). Both times, every
-  ex-group-A node showed exactly 2 `getchaintips` entries (one `active` matching
-  group B's winning tip, one `valid-fork` with `branchlen` matching group A's fork
-  length exactly); `core-3a` showed a single active tip, as expected (never had a
-  competing fork of its own to abandon).
-- **Active in the workflow**, right after "Generate round-robin TPC + colored-coin
-  traffic" -- both steps were uncommented together (along with their shared
-  prerequisite, signer-set-a bring-up); the per-node lifecycle/max-block-size and
-  rotation steps remain commented out, still genuinely unbuilt.
+  any step raises `ReorgError` (non-zero exit); failures across all 7 nodes are
+  collected and reported together, not just the first one hit.
+- **Verified live, twice, against a real 7-node + signer-set-a stack** (smoke scale,
+  `REORG_LENGTH=2`, `ROUND_DURATION=60`): both runs produced genuinely different
+  group A/group B forks (distinct tip hashes throughout, unlike the old design) and
+  converged correctly -- 6/7 nodes exactly matching expectations plus the `core-7`
+  nuance above on the first attempt; the second run (re-run against the same
+  long-lived containers without tearing down first) correctly flagged 3 leftover tips
+  on the ex-group-A nodes from the *first* run's still-present fork, which is accurate
+  reporting of real on-chain state, not a script bug -- a real CI run always starts
+  from fresh containers and wouldn't hit this.
+- **Active in the workflow**, right after "Generate traffic (before reorg)".
 
 ## `docker/docker-compose.yml`
 
