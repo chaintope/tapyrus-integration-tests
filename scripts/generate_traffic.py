@@ -128,13 +128,18 @@ class TrafficGenerator:
     def __init__(self, nodes, round_count):
         self._nodes = nodes
         self._round_count = round_count
-        # ledger[node_name][asset] -- asset is TPC or a color-id hex string.
-        self._ledger = {node.name: {TPC: 0.0} for node in nodes}
+        # ledger[node_name][asset] -- asset is TPC or a color-id hex string. TPC
+        # starts empty here, not at a hardcoded 0.0 -- seeded from each node's REAL
+        # current balance in _seed_ledger_with_current_balances() instead, since this
+        # script runs multiple times in the same job (before and after the
+        # reorg/rotation steps) against wallets that already carry a balance.
+        self._ledger = {node.name: {} for node in nodes}
         self._mismatches = []
         self._successful_round_actions = 0
 
     async def run(self):
         await self._collect_addresses()
+        await self._seed_ledger_with_current_balances()
         # Waiting for just one more block isn't enough: with 3 signers rotating as
         # block proposer, one new block only credits coinbase to whichever signer
         # proposed it, not all three -- core-1a/2a/3a need to each have proposed at
@@ -183,6 +188,17 @@ class TrafficGenerator:
             node.address = await node.rpc.call("getnewaddress")
 
         await asyncio.gather(*(collect(node) for node in self._nodes))
+
+    async def _seed_ledger_with_current_balances(self):
+        log.step("reading each node's current TPC balance to seed the ledger (not assuming a fresh 0.0 start)")
+
+        async def seed(node):
+            balance = await node.rpc.call("getbalance", [False])
+            self._ledger[node.name][TPC] = balance
+            if balance:
+                log.info(f"{node.name}: starting balance {balance} TPC (carried over from before this run)")
+
+        await asyncio.gather(*(seed(node) for node in self._nodes))
 
     async def _wait_for_funding_source_balances(self):
         log.step(f"waiting for each funding source to hold at least {FUNDING_AMOUNT_TPC} TPC")

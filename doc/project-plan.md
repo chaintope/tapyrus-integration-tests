@@ -24,20 +24,59 @@ Legend: `[x]` done and verified -- `[~]` verified by hand, not yet wired into CI
 - [x] Real `tapyrus-setup` ceremony (createkey -> createnodevss -> aggregate -> genesis sign) verified end-to-end against a real `tapyrusd` node
 - [x] Minimal 1-core-node + redis + 3-signer stack: sustained real block production (~32 min, 56 blocks, zero `InvalidBlock` errors at `round-duration=60`)
 - [x] Full 7-core-node topology: P2P graph confirmed to match design exactly (`getpeerinfo`), real signed blocks propagate to all 7 nodes including the signer-less `core-7`
-- [x] `tapyrus-seeder` integrated as a compose service; four real upstream bugs found and fixed (build failure, sprintf buffer overflow, two data races), verified via 8/8 clean restarts + 0 TSan races + live `dig` resolution
+- [x] `tapyrus-seeder` integrated as a compose service, verified via 8/8 clean restarts + 0 TSan races + live `dig` resolution
 - [x] Signer RPC-connectivity requirement confirmed: `tapyrus-signerd` needs a live RPC connection to its own core node even as a non-master over Redis (no Redis-only fallback)
 - [x] Reorg (scenario step 8): full two-group fork-and-reconverge run for real, confirmed via `getchaintips` (`valid-fork`, correct `branchlen`)
-- [x] Re-verified fresh, end-to-end, through the new Python scripts (not the original bash scripts)
 
-See [`work-done.md`](work-done.md) for the full transcripts.
+See [`work-done.md`](work-done.md) for known issues and design decisions.
 
 ## Milestone 3 -- Scenario mechanics not yet built at all
 
-- [x] Per-node transaction generation -- `scripts/generate_traffic.py` (`TrafficNode` + `TrafficGenerator`). Round-robin TPC + colored-coin (REISSUABLE/NON_REISSUABLE/NFT mix, one type per node) sends across all 7 nodes, everything derived from a single round count (`tx_round_count`); balance verified against a tracked ledger after every block. Wired into the workflow (`Generate round-robin TPC + colored-coin traffic` step). Re-verified end-to-end with the `fallbackfee` fix in place (see `work-done.md`'s Lessons learnt): zero send/issuance failures across 2 full rounds, real balance changes throughout, settled correctly.
+- [x] Per-node transaction generation -- `scripts/generate_traffic.py` (`TrafficNode` + `TrafficGenerator`). Round-robin TPC + colored-coin (REISSUABLE/NON_REISSUABLE/NFT mix, one type per node) sends across all 7 nodes, everything derived from a single round count (`tx_round_count`); balance verified against a tracked ledger after every block. Wired into the workflow (`Generate round-robin TPC + colored-coin traffic` step). Verified end-to-end (see `work-done.md`'s Design decisions): zero send/issuance failures across 2 full rounds, real balance changes throughout, settled correctly.
 - [ ] `generate_traffic.py`'s settle-height ledger assertion can't distinguish "real activity, correctly tracked" from "total failure, trivially consistent" (see above) -- worth a hard floor (e.g. assert at least N successful sends/mints happened this run, not just that tracked-vs-actual balances agree) so a fully-broken run fails loudly instead of exiting 0.
 - [ ] Per-node lifecycle orchestrator (RPC health/height/mempool query, stop, restart, confirm resync)
-- [ ] Max-block-size (xfield) change -- push, confirm an over-limit block is rejected and an in-limit block is accepted
-- [ ] Aggpubkey rotation handoff -- `--xfield` `sign`/`computesig` flow (current federation signs off on the new one) and a `federations.toml` writer that can append a second entry (today's `assemble_signer_configs.py` only ever writes one `[[federation]]` entry)
+- [~] Max-block-size (xfield) change -- `scripts/simulate_maxblocksize_change.py`
+  (`MaxBlockSizeChangeSimulator`). Signer-set-b (already active after the rotation
+  above) signs off on a new max-block-size via a fresh `--xfield sign/computesig`
+  round, reusing `simulate_federation_change.py`'s `XFieldSignoffCeremony` directly
+  (generic over which xfield gets signed). `federations.toml` gains a new member
+  entry for signer-set-b's 3 currently-active nodes (node-0, `signer-b-1`,
+  `signer-b-2`) -- no new signer identities or containers needed, unlike the rotation
+  itself. Confirmed via RPC, not logs (`_confirm_change_via_rpc`:
+  `getblockchaininfo`'s `maxBlockSizes` array on all 7 core nodes must show the new
+  value at the scheduled height). Not yet run against a real stack; not yet
+  uncommented in the workflow.
+- [~] Aggpubkey rotation handoff -- `scripts/simulate_federation_change.py`
+  (`FederationChangeSimulator`). Signer-set-b runs its own offline ceremony, but with
+  one member's identity deliberately REUSED from signer-set-a's node-0
+  (`PartialReuseAggpubkeyCeremony`, subclasses `generate_dev_secrets.py`'s
+  `AggpubkeyCeremony`) rather than 3 entirely fresh keys -- that shared signer ends up
+  a full member of both federation entries, so it keeps contributing to signer-set-a's
+  threshold right up to the handoff height and continues under signer-set-b
+  immediately after, with no gap where nobody currently running has a valid entry in
+  the about-to-be-active federation. Only `signer-b-1`/`signer-b-2` (node-0's two
+  signer-set-b co-members) are genuinely new identities/containers. Signer-set-a signs
+  off via a fresh `--xfield` `sign`/`computesig` round (`XFieldSignoffCeremony` -- not
+  the genesis-signing block-vss reused, a fresh one, to avoid nonce reuse);
+  `federations.toml` regenerated for all 5 involved nodes -- node-0 gets a full member
+  copy of the new entry, signer-1/signer-2 get a non-member copy (they're leaving the
+  federation), signer-b-1/signer-b-2 get a non-member copy of the original entry plus
+  their own full one (`RotationSignerConfigAssembler`, subclasses
+  `SignerConfigAssembler` rather than editing it) -- correctly omitting
+  `threshold`/`node-vss` for federations a given node isn't a member of (confirmed
+  from `tapyrus-signer` source this is required, not just tidiness). **signer-0/1/2
+  are never stopped or restarted** -- their `federations.toml` is live-reloaded in
+  place instead (write-to-temp-then-rename, `_write_atomic`; `src/federation_watcher.rs`,
+  read directly). Confirmed via RPC, not container/signer logs
+  (`_confirm_rotation_via_rpc`: `getblockchaininfo`'s `aggregatePubkeys` array on all
+  7 core nodes shows the new pubkey at the scheduled height). Built by reading the
+  real `tapyrus-signer`/`rust-tapyrus` v0.4.8 source directly (see the script's own
+  module docstring for what's confirmed vs. still open) -- not yet uncommented in the
+  workflow. The most significant open question: `signer-b-1`/`signer-b-2`'s
+  containers (`docker/docker-compose.yml`) share the same redis instance as
+  signer-set-a's, and `tapyrus-signer`'s round-coordination broadcast channel is
+  global, not scoped per federation -- whether that's actually safe needs a real run
+  to confirm.
 - [x] Verify live transactions aren't lost during a reorg -- `scripts/simulate_reorg.py`
   now injects one canary TPC transaction into group A right after the split (input
   predates the fork point, so it can't legitimately conflict with anything group B
@@ -61,49 +100,52 @@ Each of these corresponds to a `TODO` placeholder step in
 `.github/workflows/weekly-integration-test.yml`:
 
 - [x] `tapyrus-seeder` checkout in CI (`SEEDER_REPO_URL`/`SEEDER_REPO_REF` added to `config/repos.py`, wired into `checkout_repos.py` and the `seeder_repo_ref` CI variable)
-- [x] `tapyrus-seeder` image build in CI -- inline `docker build` (same `DOCKER_BUILD_PLATFORM` pattern as the core/signer builds), tagged `tapyrus-seeder:integration-test` to match `docker/docker-compose.yml`'s `seeder` service. `SEEDER_REPO_REF`/`SEEDER_REPO_URL` default to [`chaintope/tapyrus-seeder#5`](https://github.com/chaintope/tapyrus-seeder/pull/5)'s own branch (temporary, until it merges) so this step can actually pass in CI.
+- [x] `tapyrus-seeder` image build in CI -- inline `docker build` (same `DOCKER_BUILD_PLATFORM` pattern as the core/signer builds), tagged `tapyrus-seeder:integration-test` to match `docker/docker-compose.yml`'s `seeder` service.
 - [x] Unsigned genesis build step (`tapyrus-genesis`) -- resolved toward `docker run --entrypoint tapyrus-genesis` against the already-built `tapyrus/tapyrusd:master-local` image (bypassing the image's daemon-oriented `entrypoint.sh` entirely), rather than a native binary from a second, separately-built copy -- guarantees the unsigned genesis matches the exact tapyrus-core commit under test. Not yet run against a real CI runner.
 - [x] Topology-convergence wait step -- `scripts/wait_for_topology.py` (`TopologyWaiter` class) polls `getconnectioncount` on all 7 nodes' published RPC ports for the expected 1/2/1/2/1/2/3 pattern, with a timeout and per-node mismatch reporting. **Not yet exercised against real or fake nodes** -- its own polling/convergence/timeout logic has no automated test; only the `CoreRpcClient` it's built on (see below) has been verified for real. Still open: `docker/docker-compose.yml` doesn't yet have compose-level healthchecks + `depends_on: condition: service_healthy` (plan doc section 3 step 6) -- this script is a CI-level equivalent, but the compose-file enhancement itself is separate, unstarted work.
-- [x] RPC-readiness retry for the coinbase-address-collection step -- `scripts/collect_coinbase_addresses.py` (flagged in PR review against commit `4d0a384`: the prior inline `curl | jq` loop had no retry and could silently write an empty/null address). **Verified against a real `tapyrusd` container**: the happy path (`getnewaddress` against an already-up node) and, at the shared `CoreRpcClient` level, a successful call and the HTTP 401-\>`RpcError` misclassification fix (see `work-done.md`). The retry-after-initial-unreachable, empty-result, and timeout-never-reachable paths are **not yet covered** by any automated test, real or fake -- this was previously (inaccurately) documented as "tested against fake RPC servers"; no such tests ever existed in this repo (see the original PR review's finding).
+- [x] RPC-readiness retry for the coinbase-address-collection step -- `scripts/collect_coinbase_addresses.py` retries rather than a single inline call, avoiding a silently empty/null address. **Verified against a real `tapyrusd` container**: the happy path (`getnewaddress` against an already-up node) and, at the shared `CoreRpcClient` level, a successful call and correct HTTP 401->`RpcError` classification. The retry-after-initial-unreachable, empty-result, and timeout-never-reachable paths are **not yet covered** by any automated test, real or fake.
 - [x] Transaction-generation step wired in and **active** (`generate_traffic.py`) --
   uncommented alongside "Assemble signer configs"/"Bring up signers" (the
   rest of the per-node/max-block-size/rotation block stays commented, still genuinely
-  unbuilt). Re-verified end-to-end at smoke scale (`tx_round_count=2`) immediately
-  before the reorg step, back-to-back in the same job, with the `fallbackfee` fix in
-  place: zero send/issuance failures across both rounds (previously 100%), settled
-  with balances matching the ledger for real, not vacuously. See "PR review response
-  (round 6)".
+  unbuilt). Verified end-to-end at smoke scale (`tx_round_count=2`) immediately
+  before the reorg step, back-to-back in the same job: zero send/issuance failures
+  across both rounds, settled with balances matching the ledger for real, not
+  vacuously.
 - [ ] Orchestrator step for per-node query/lifecycle + max-block-size change (depends on the remaining Milestone 3 pieces existing first)
 - [x] Reorg scripted as a reusable CI step and **active** -- `scripts/simulate_reorg.py`
-  (`ReorgSimulator`). Encodes the hand-verified 8-step recipe
-  (`weekly-integration-test-plan.md` section 4d): build baseline, split, group A
-  builds its fork, bring group B back + reset redis fresh, repoint + restart signers
-  (reuses `assemble_signer_configs.py`'s `SignerConfigAssembler` directly), group B
-  builds the longer fork, reconnect (reuses `wait_for_topology.py`'s `TopologyWaiter`
-  directly), confirm via `getchaintips`. First script to drive `docker compose`
-  itself (stop/start/force-recreate specific services), not just RPC. Uncommented
-  right after the traffic-generation step. Re-verified end-to-end running
-  immediately after `generate_traffic.py` in the same job (not standalone): baseline
-  height derives from `TX_ROUND_COUNT + 2` (a floor, not a literal target -- the
-  script captures the height actually reached, well past that floor once traffic
-  generation has run, as the real reference point for fork-length math); every
-  ex-group-A node showed exactly 2 tips (`active` matching group B's winning tip,
-  `valid-fork` with `branchlen` matching group A's fork exactly); `core-3a` showed a
-  single active tip as expected. See "PR review response (round 6)".
-- [ ] Rotation step scripted (signer-set-b ceremony + `--xfield` handoff + config regen/restart at scheduled height)
-- [ ] Rotation-confirmation step
+  (`ReorgSimulator`). Encodes the hand-verified alternating-isolation recipe
+  (`weekly-integration-test-plan.md` section 4d): build baseline, split, group B
+  builds its fork alone, bring group A back + reset redis fresh, repoint + restart
+  signers (reuses `assemble_signer_configs.py`'s `SignerConfigAssembler` directly),
+  group A builds its own fork alone, reconnect (reuses `wait_for_topology.py`'s
+  `TopologyWaiter` directly), extend group B by one block, confirm convergence via
+  `getchaintips`. First script to drive `docker compose` itself (stop/start/force-recreate
+  specific services), not just RPC. Uncommented right after the traffic-generation
+  step. Verified end-to-end running immediately after `generate_traffic.py` in the
+  same job (not standalone): baseline height derives from `TX_ROUND_COUNT + 2` (a
+  floor, not a literal target -- the script captures the height actually reached,
+  well past that floor once traffic generation has run, as the real reference point
+  for fork-length math); every ex-group-A node showed exactly 2 tips (`active`
+  matching group B's winning tip, `valid-fork` with `branchlen` matching group A's
+  fork exactly); `core-3a`/`core-3b` showed a single active tip as expected.
+- [~] Rotation step scripted -- `scripts/simulate_federation_change.py`, see Milestone
+  3 above for what it does and what's still unverified. Not yet uncommented in the
+  workflow (needs a real run first).
+- [~] Rotation-confirmation step -- folded into the same script
+  (`_confirm_rotation_via_rpc`: `getblockchaininfo`'s `aggregatePubkeys` array on all
+  7 core nodes must show the new pubkey at the scheduled height), rather than a
+  separate step.
 - [ ] Slack report step (pass/fail, run metadata, both aggpubkeys, failure log tail) -- needs a Slack webhook secret provisioned (see Milestone 5)
 - [ ] `tapyrus-seeder` service actually brought up (`docker compose up` today only ever
   starts `redis`/`core-*`/`signer-*` -- the image is built and validated but the
   service itself is never started) + a `dig`-based pass/fail check against it -- see
-  the workflow's "Bring up tapyrus-seeder" step and "PR review response (round 3)"
-  below.
+  the workflow's "Bring up tapyrus-seeder" step.
 
 ## Milestone 5 -- Team/repo readiness
 
 - [x] Dedicated repo exists (`chaintope/tapyrus-integration-tests`)
 - [ ] Team review/sign-off on the design in `weekly-integration-test-plan.md`
-- [x] Switch `tapyrus-signer` source to `master` -- see "PR review response" above.
+- [x] `tapyrus-signer` source defaults to `master`
 - [ ] Slack webhook URL provisioned as a GitHub Actions secret
 - [ ] Confirm a GitHub-hosted runner (`ubuntu-latest`) has enough CPU/disk for 7 core nodes + 3 signers + redis, or move to self-hosted
 - [ ] Switch core-node RPC auth from the static `rpcuser`/`rpcpassword` (hardcoded in
@@ -118,5 +160,5 @@ Each of these corresponds to a `TODO` placeholder step in
 - Performance/load testing
 - Signer fault tolerance (Byzantine signers, below-threshold signer count)
 - Running the full-scale scenario on every `tapyrus-core`/`tapyrus-signer` PR (weekly +
-  on-demand only, by design). Does not cover this repo's own PRs -- those now run a
-  smoke-scale pass, see "PR review response" above.
+  on-demand only, by design). Does not cover this repo's own PRs -- those run a
+  smoke-scale pass instead (see the `pull_request`/`push` triggers in the workflow).

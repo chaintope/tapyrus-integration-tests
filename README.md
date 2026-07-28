@@ -99,11 +99,11 @@ input; the rest fall back straight to their `env:` literal on every trigger,
 | Variable | Default | Controls |
 | --- | --- | --- |
 | `core_repo_ref` | see `config/repos.py` | `tapyrus-core` branch/tag/sha to check out |
-| `signer_repo_ref` | see `config/repos.py` | `tapyrus-signer` branch/tag/sha to check out (override to `163_federationChangeToml` on the `Naviabheeman` fork to test rotation) |
+| `signer_repo_ref` | see `config/repos.py` | `tapyrus-signer` branch/tag/sha to check out |
 | `seeder_repo_ref` | see `config/repos.py` | `tapyrus-seeder` branch/tag/sha to check out |
 | `tx_round_count` | `60` (`10` on pull_request/push) | Round-robin send/check/settle cycles `scripts/generate_traffic.py` runs -- each is 3 block-heights and 14 transactions (7 nodes x {TPC send, colored send-or-mint}), so this alone determines the tx/block/height totals for that step. Also determines the reorg's baseline height -- see below. Sized against the CI timing budget, see `doc/work-done.md` |
 | `reorg_length` | `30` (`5` on pull_request/push) | Blocks each isolated group builds past the baseline, alone, before reconnecting at the tie (`scripts/simulate_reorg.py`: group B builds first while group A is stopped entirely, then group A builds its own, genuinely different set while group B is stopped). Group B is then always extended by exactly 1 more block to win -- not configurable, and not probed for -- see `doc/scripts.md` |
-| `round_duration_seconds` | `30` | `tapyrus-signerd` round-duration (block interval) -- untested at this value, see `doc/work-done.md`'s CI timing budget note (`60` is the last confirmed-clean value, `10` is confirmed to hit transient `InvalidBlock` errors) |
+| `round_duration_seconds` | `30` | `tapyrus-signerd` round-duration (block interval) -- verified clean, see `doc/work-done.md`'s Lessons learnt (`10` is confirmed to hit transient `InvalidBlock` errors) |
 | `network_id` | `1905960821` | Tapyrus network id (prod mode, see `doc/work-done.md`), used by every core-* node's rendered `tapyrus.conf` and the `genesis.<id>` file `tapyrusd` looks for |
 | `slack_log_tail_lines` | `100` | Lines of the implicated container's log inlined in the Slack failure report |
 | `docker_build_platform` | *(empty, runner-native)* | Docker `--platform` for image builds -- local verification only ever used `linux/arm64` |
@@ -133,10 +133,23 @@ waits until the chain reaches at least that height, then uses whatever height wa
 runs first) as the real reference point for both forks' target -- see
 `doc/work-done.md` for why that distinction matters.
 
-Not configurable per-run at all (hardcoded): the RPC port/user/pass (`12381` /
-`rpcuser` / `rpcpassword`), the signer count (3) / threshold (2) -- the 7-node
-topology in `docker/docker-compose.yml` is wired 1:1 to exactly 3 signers, so changing
-the count means redesigning the topology, not just passing a different number -- and
+Same treatment for `federation_change_height` and `max_block_size_height`:
+`FEDERATION_CHANGE_HEIGHT` is always `REORG_LENGTH` (computed by the "Derive
+FEDERATION_CHANGE_HEIGHT from REORG_LENGTH" workflow step), and `MAX_BLOCK_SIZE_HEIGHT`
+is always `FEDERATION_CHANGE_HEIGHT` in turn -- `scripts/simulate_federation_change.py`
+and `scripts/simulate_maxblocksize_change.py` each schedule their change this many
+blocks past whatever height the chain is at when *they* run (already well past the
+reorg/rotation and another traffic round by then), so there's no independently-meaningful
+absolute value to expose for either; tying each to the previous step's own height
+variable keeps them in the same ballpark instead of separately-tuned literals that
+could silently drift apart.
+
+Not configurable per-run at all (hardcoded): `max_block_size_new` (`2000000`, the new
+value `scripts/simulate_maxblocksize_change.py` pushes -- no per-run override yet),
+the RPC port/user/pass (`12381` / `rpcuser` / `rpcpassword`), the signer count (3) /
+threshold (2) -- the 7-node topology in `docker/docker-compose.yml` is wired 1:1 to
+exactly 3 signers, so changing the count means redesigning the topology, not just
+passing a different number -- and
 `prng_seed_base` (always `github.run_id`): `doc/weekly-integration-test-plan.md`
 requires the PRNG be seeded deterministically per run so a failure is reproducible,
 so this is deliberately never a per-run override, not just an as-yet-unwired one.

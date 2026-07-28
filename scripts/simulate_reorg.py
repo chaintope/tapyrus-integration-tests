@@ -25,17 +25,6 @@ simulated, and not just isolated-by-network-stop while leaving room for ambiguit
    repointed at group B, so whatever runs next in the same job can assume block
    production is live.
 
-This replaced an earlier version of this script that built both forks to a tie by
-having group A build first (network-isolated) and group B build second, also
-isolated, from the same frozen baseline -- which turned out to still let the two
-forks' blocks end up byte-identical (same hash at every height), confirmed via a real
-run's container logs: group B's own locally-created blocks never became its accepted
-chain, it silently adopted group A's chain (including group A's canary transaction)
-at the same real-world second, meaning the two groups were never actually
-independent for the whole isolation window. The redesign here alternates which
-group's core nodes are even running, so there's no window where both sides are up
-and could relay/influence each other while each thinks it's building alone.
-
 Usage:
     ./scripts/simulate_reorg.py
 
@@ -89,7 +78,6 @@ attempted here.
 """
 import asyncio
 import os
-import subprocess
 import sys
 import time
 import tomllib
@@ -99,12 +87,12 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.assemble_signer_configs import CoreRpc, Redis, SignerConfigAssembler  # noqa: E402
+from scripts.lib.compose import ComposeError, recreate_fresh, start_nodes, stop_nodes  # noqa: E402
 from scripts.lib.log import log  # noqa: E402
 from scripts.lib.rpc import CoreRpcClient, RpcError, RpcUnreachable  # noqa: E402
 from scripts.wait_for_topology import TopologyWaiter  # noqa: E402
 
 RPC_HOST = "127.0.0.1"
-DOCKER_DIR = REPO_ROOT / "docker"
 SIGNER_SET_NAME = "signer-set-a"
 SIGNER_COUNT = 3
 SIGNER_THRESHOLD = 2
@@ -125,16 +113,11 @@ HEIGHT_POLL_INTERVAL_SECONDS = 5
 STALL_TIMEOUT_ROUND_MULTIPLIER = 4
 MIN_STALL_TIMEOUT_SECONDS = 180
 CONVERGENCE_TIMEOUT_SECONDS = 120
-# Reaching the target height (_wait_for_height) doesn't mean every node has
-# PROPAGATED that same tip yet -- signers are still producing a block every
-# ROUND_DURATION at this point, so a one-shot poll can land mid-propagation and see a
-# stale tip on a lagging node. A few round-trips' worth of retrying is enough for P2P
-# relay among already-connected peers; this isn't waiting out block production like
-# _wait_for_height is.
+# Reaching the target height doesn't mean every node has propagated that tip yet --
+# a one-shot poll can land mid-propagation, so this retries briefly instead of failing.
 BASELINE_TIP_CONSISTENCY_TIMEOUT_SECONDS = 30
 CANARY_SEND_AMOUNT_TPC = 0.001
-# Same values collect_coinbase_addresses.py uses for the same "docker compose up just
-# means the container started, not that tapyrusd's RPC server is up" wait.
+# Same "container started != RPC ready" wait collect_coinbase_addresses.py does.
 RPC_READY_TIMEOUT_SECONDS = 120
 RPC_READY_POLL_INTERVAL_SECONDS = 3
 
@@ -215,48 +198,35 @@ class ReorgSimulator:
         # more block landing during the gap before the stop takes effect, silently
         # letting both forks share a block past the recorded baseline instead of
         # genuinely diverging from it.
-        await self._compose("stop", *SIGNERS)
+        await stop_nodes(*SIGNERS)
         self._baseline_height, tip = await self._wait_for_matching_tips(ALL_NODE_NAMES)
         log.info(f"baseline confirmed: all 7 nodes at height {self._baseline_height}, tip {tip[:12]}...")
 
     async def _build_group_b_fork(self):
         log.step("stopping group A -- group B builds its fork completely alone")
-        await self._compose("stop", *GROUP_A)
+        await stop_nodes(*GROUP_A)
         await self._repoint_signers(GROUP_B_RPC_HOSTS)
-        # "up -d --no-deps", not "start" -- signer-0/signer-1's depends_on
-        # (docker/docker-compose.yml) is core-1a/core-2a, both group A, which "start"
-        # would silently bring back up via dependency cascade (confirmed live: group A
-        # restarted seconds after this call, well before the real group A restart in
-        # _restore_group_a) -- exactly the cross-group leak this script's whole
-        # strict-alternation redesign exists to prevent. --no-deps starts only the
-        # named services.
-        await self._compose("up", "-d", "--no-deps", *SIGNERS)
+        await start_nodes(*SIGNERS)
 
         target = self._baseline_height + self._reorg_length
         log.step(f"group B building its fork (target height {target})")
         await self._wait_for_height(GROUP_B, target)
         self._group_b_tip = await self._clients["core-3a"].call("getbestblockhash")
         log.info(f"group B's fork tip: {self._group_b_tip[:12]}... (height {target})")
-        await self._compose("stop", *SIGNERS)
+        await stop_nodes(*SIGNERS)
 
     async def _restore_group_a(self):
         log.step("stopping group B, restarting group A, resetting redis fresh")
-        await self._compose("stop", *GROUP_B)
-        await self._compose("start", *GROUP_A)
+        await stop_nodes(*GROUP_B)
+        await start_nodes(*GROUP_A)
         # No volume mounted on the redis service (docker/docker-compose.yml) -- its
         # state is entirely in the container's writable layer, so recreating it is a
         # true fresh reset, not just a process restart -- avoids any round-state
         # carryover from group B's just-finished rounds bleeding into group A's.
-        await self._compose("up", "-d", "--force-recreate", "redis")
+        await recreate_fresh("redis")
 
     async def _inject_canary_transaction(self):
-        # _restore_group_a just restarted CANARY_SENDER/CANARY_RECEIVER's containers --
-        # "started" only means the process launched, not that tapyrusd's RPC server has
-        # finished initializing (same gotcha collect_coinbase_addresses.py retries
-        # through after the initial `docker compose up`). Without this wait, the
-        # getnewaddress call below is the first RPC either node sees post-restart and
-        # can hit warmup's RpcUnreachable, which is wider open on a slower CI runner
-        # than in local runs.
+        # _restore_group_a just restarted these containers -- RPC may still be warming up.
         await asyncio.gather(*(self._wait_for_rpc_ready(name) for name in (CANARY_SENDER, CANARY_RECEIVER)))
         log.step(f"injecting a canary transaction ({CANARY_SENDER} -> {CANARY_RECEIVER}) into group A")
         address = await self._clients[CANARY_RECEIVER].call("getnewaddress")
@@ -271,22 +241,18 @@ class ReorgSimulator:
         # signer-2 (-> core-3a) will fail to start with no reachable RPC target --
         # group B is stopped for the whole of this step -- expected and harmless,
         # matches the verified recipe: threshold 2 is met by signer-0/signer-1 alone.
-        # "up -d --no-deps", not "start" -- signer-2's own depends_on is core-3a
-        # (group B), which "start" would cascade back up (confirmed live: core-3a
-        # restarted immediately, ~5 minutes before the real reconnect below),
-        # defeating group B's isolation for the rest of this step.
-        await self._compose("up", "-d", "--no-deps", *SIGNERS)
+        await start_nodes(*SIGNERS)
 
         target = self._baseline_height + self._reorg_length
         log.step(f"group A building its own, different fork (target height {target})")
         await self._wait_for_height(GROUP_A, target)
         self._group_a_tip = await self._clients["core-1a"].call("getbestblockhash")
         log.info(f"group A's fork tip: {self._group_a_tip[:12]}... (height {target})")
-        await self._compose("stop", *SIGNERS)
+        await stop_nodes(*SIGNERS)
 
     async def _reconnect_group_b(self):
         log.step("reconnecting group B alongside group A")
-        await self._compose("start", *GROUP_B)
+        await start_nodes(*GROUP_B)
         waiter = TopologyWaiter(self._rpc_user, self._rpc_pass, CONVERGENCE_TIMEOUT_SECONDS, HEIGHT_POLL_INTERVAL_SECONDS)
         await waiter.run()
 
@@ -304,11 +270,7 @@ class ReorgSimulator:
     async def _extend_group_b_by_two_blocks(self):
         log.step("repointing signers back to group B and extending its chain by 2 blocks")
         await self._repoint_signers(GROUP_B_RPC_HOSTS)
-        # "up -d --no-deps" for the same depends_on-cascade reason as the other two
-        # signer starts above -- both groups are already up by this point so it can't
-        # leak isolation here, but using "start" would be one more place to remember
-        # to fix if that ever changes.
-        await self._compose("up", "-d", "--no-deps", *SIGNERS)
+        await start_nodes(*SIGNERS)
 
         # +2, not +1 -- confirmed live: core-3a still shows its own just-abandoned tip
         # as valid-headers (not yet valid-fork) after only one, one round behind every
@@ -320,7 +282,7 @@ class ReorgSimulator:
         await self._wait_for_height(ALL_NODE_NAMES, target)
         self._group_b_tip = await self._clients["core-3a"].call("getbestblockhash")
         log.info(f"group B's chain extended to height {target} (tip {self._group_b_tip[:12]}...) -- all 7 nodes converged")
-        await self._compose("stop", *SIGNERS)
+        await stop_nodes(*SIGNERS)
 
     async def _confirm_convergence(self):
         log.step("confirming convergence via getchaintips (checking all 7 nodes, not stopping at the first mismatch)")
@@ -359,8 +321,8 @@ class ReorgSimulator:
         # (core-1b/core-2b/core-3b), bridging both groups by design (see
         # docker-compose.yml's topology comment). So it legitimately learns group A's
         # abandoned fork via header relay even though it was never asked to build or
-        # extend it -- confirmed live: it shows a second tip at group A's height with
-        # status "valid-headers" (headers relayed and known, not necessarily
+        # extend it -- it shows a second tip at group A's height with status
+        # "valid-headers" (headers relayed and known, not necessarily
         # fully-validated as a real candidate), not "valid-fork" like the ex-group-A
         # nodes, since group B's own chain was always at least as long by the time it
         # reconnects. Only the ACTIVE tip is asserted here, not the tip count --
@@ -418,7 +380,7 @@ class ReorgSimulator:
         """
         log.step("restoring signers to their default RPC mapping and leaving them running")
         await self._repoint_signers(GROUP_A_RPC_HOSTS)
-        await self._compose("up", "-d", "--no-deps", *SIGNERS)
+        await start_nodes(*SIGNERS)
 
     # -- signer repointing --------------------------------------------------------
 
@@ -542,18 +504,6 @@ class ReorgSimulator:
                     raise TimeoutError(f"{name}'s RPC never became reachable within {RPC_READY_TIMEOUT_SECONDS}s: {exc}")
                 await asyncio.sleep(RPC_READY_POLL_INTERVAL_SECONDS)
 
-    # -- docker compose -------------------------------------------------------------
-
-    async def _compose(self, *args):
-        log.info(f"docker compose {' '.join(args)}")
-        process = await asyncio.create_subprocess_exec(
-            "docker", "compose", *args, cwd=str(DOCKER_DIR),
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await process.communicate()
-        if process.returncode != 0:
-            raise subprocess.CalledProcessError(process.returncode, ("docker", "compose", *args), stdout, stderr)
-
 
 async def main():
     rpc_user = os.environ.get("CORE_RPC_USER", "rpcuser")
@@ -573,6 +523,6 @@ async def main():
 if __name__ == "__main__":
     try:
         asyncio.run(main())
-    except (ReorgError, TimeoutError, subprocess.CalledProcessError, RpcError, RpcUnreachable) as exc:
+    except (ReorgError, TimeoutError, ComposeError, RpcError, RpcUnreachable) as exc:
         log.error(str(exc))
         sys.exit(1)

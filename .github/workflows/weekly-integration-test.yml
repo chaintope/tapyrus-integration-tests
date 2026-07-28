@@ -21,7 +21,7 @@ on:
       core_repo_ref:
         description: 'tapyrus-core ref (branch/tag/sha) -- leave blank for config/repos.py''s default'
       signer_repo_ref:
-        description: 'tapyrus-signer ref (branch/tag/sha) -- leave blank for config/repos.py''s default; override to 163_federationChangeToml on the Naviabheeman fork to test rotation'
+        description: 'tapyrus-signer ref (branch/tag/sha) -- leave blank for config/repos.py''s default'
       seeder_repo_ref:
         description: 'tapyrus-seeder ref (branch/tag/sha) -- leave blank for config/repos.py''s default'
 
@@ -121,6 +121,21 @@ jobs:
         # value that could silently drift out of sync with it.
         run: echo "CHAIN_HEIGHT_BEFORE_REORG=$((TX_ROUND_COUNT + 2))" >> "$GITHUB_ENV"
 
+      - name: Derive FEDERATION_CHANGE_HEIGHT from REORG_LENGTH
+        # Not a workflow_dispatch input -- scripts/simulate_federation_change.py
+        # schedules its rotation this many blocks past whatever height the chain is
+        # at when IT runs (itself already well past the reorg + a traffic round), so
+        # there's no independently-meaningful absolute value to expose here; tying it
+        # to REORG_LENGTH keeps the two in the same ballpark instead of two
+        # separately-tuned literals that could silently drift apart.
+        run: echo "FEDERATION_CHANGE_HEIGHT=$REORG_LENGTH" >> "$GITHUB_ENV"
+
+      - name: Derive MAX_BLOCK_SIZE_HEIGHT from FEDERATION_CHANGE_HEIGHT
+        # Same reasoning as FEDERATION_CHANGE_HEIGHT above -- not a workflow_dispatch
+        # input, tied to the previous step's own height variable so it stays in the
+        # same ballpark instead of a separately-tuned literal.
+        run: echo "MAX_BLOCK_SIZE_HEIGHT=$FEDERATION_CHANGE_HEIGHT" >> "$GITHUB_ENV"
+
       - name: Checkout tapyrus-core + tapyrus-signer + tapyrus-seeder
         run: ./scripts/checkout_repos.py
 
@@ -175,23 +190,38 @@ jobs:
           GENESIS_BLOCK_WITH_SIG=$(cat ../secrets/signer-set-a/genesis.hex) \
             docker compose up -d signer-0 signer-1 signer-2
 
-      - name: Generate TPC + colored-coin traffic
+      - name: Generate traffic (before reorg)
         run: ./scripts/generate_traffic.py "$TX_ROUND_COUNT"
-
-      # - name: Per-node query/stop-restart + max-block-size change
-      #   run: echo "TODO -- not yet scripted -- see doc/project-plan.md Milestone 3/4"
 
       - name: Reorg
         run: ./scripts/simulate_reorg.py
 
-      # Still genuinely unbuilt (Milestone 3/4) -- kept commented out.
-      # - name: Generate signer-set-b aggpubkey (offline ceremony)
-      #   run: ./scripts/generate_dev_secrets.py signer-set-b 3 2
-      # - name: Sign off rotation handoff + regenerate federations.toml (both entries)
-      #   run: echo "TODO -- not yet scripted -- see doc/project-plan.md Milestone 3/4"
+      - name: Generate traffic (before federation change)
+        run: ./scripts/generate_traffic.py "$TX_ROUND_COUNT"
 
-      # - name: Confirm rotation took effect
-      #   run: echo "TODO -- not yet scripted -- see doc/project-plan.md Milestone 4"
+      # - name: Federation change (aggpubkey rotation)
+      #   run: ./scripts/simulate_federation_change.py
+      # Built (scripts/simulate_federation_change.py, brings up signer-b-1/signer-b-2
+      # alongside signer-0/1/2 -- see docker-compose.yml), but not yet uncommented
+      # here, unlike simulate_reorg.py above (which only got uncommented after a real
+      # run) -- see the script's own module docstring for what's confirmed from
+      # source vs. still an open question (signer-set-b sharing signer-set-a's redis
+      # instance in particular). No new CI secret needed for the ceremony itself --
+      # signer-set-b's keys are generated fresh in-runner same as signer-set-a's,
+      # nothing pre-provisioned or committed (see
+      # doc/weekly-integration-test-plan.md's "Key management in CI" open question).
+
+      - name: Generate traffic (before max-block-size change)
+        run: ./scripts/generate_traffic.py "$TX_ROUND_COUNT"
+
+      # - name: Max block size change
+      #   run: ./scripts/simulate_maxblocksize_change.py
+      # Built (scripts/simulate_maxblocksize_change.py), same shape as the federation
+      # change step above -- signer-set-b (already active after that step) signs off
+      # on a new MAX_BLOCK_SIZE_NEW via a fresh --xfield sign/computesig round,
+      # federations.toml gains an entry for it, live-reloaded in place. Not yet
+      # uncommented here, and depends on the federation-change step above having run
+      # first (signer-set-b must already be the active federation).
 
       - name: Collect logs
         if: always()
@@ -213,4 +243,11 @@ jobs:
 
       # - name: Send Slack report
       #   if: always()
+      #   env:
+      #     SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
       #   run: echo "TODO -- not yet scripted -- see doc/project-plan.md Milestone 4"
+      # TODO -- needs SLACK_WEBHOOK_URL provisioned as a repository-level GitHub
+      # Actions secret (Settings -> Secrets and variables -> Actions) before this can
+      # go live -- only the repo owner/an admin can add that, not a contributor via a
+      # PR (and a fork's own CI run wouldn't have it either). Until it's set, keep
+      # this step commented out rather than referencing an unset secrets.* value.

@@ -5,7 +5,7 @@ output, and known limitations, in the order the CI workflow calls them. See the 
 [`README.md`](../README.md) for how these fit into the overall CI flow,
 [`weekly-integration-test-plan.md`](weekly-integration-test-plan.md) section 4a for
 the full ceremony design these scripts implement, and [`work-done.md`](work-done.md)
-for gotchas found the hard way, bugs fixed, and design-decision rationale.
+for known issues, gotchas, and design-decision rationale.
 
 All scripts are Python 3 (stdlib only, no third-party dependencies), executable
 directly (`./scripts/<name>.py ...`) or via `python3 scripts/<name>.py ...`. Every
@@ -41,6 +41,12 @@ Shared code the scripts below import rather than duplicate:
   calls can still run concurrently. Raises `RpcUnreachable` (connection refused,
   timeout -- treat as "not ready yet") separately from `RpcError` (the node answered
   with a JSON-RPC error).
+- `lib/compose.py` -- `start_nodes()`/`stop_nodes()`/`bring_up()`/`recreate_fresh()`,
+  thin wrappers around `docker compose <subcommand> <service names>` (run from
+  `docker/`), used by `simulate_reorg.py` and `simulate_federation_change.py`. Every
+  function takes explicit service names rather than a fixed/implied set -- each
+  caller already knows exactly which ones it means at a given point in its recipe.
+  Raises `ComposeError` on a non-zero exit.
 
 ## `config/repos.py`
 
@@ -55,13 +61,10 @@ also what a schedule-triggered run (no `inputs` context) and any local/manual
 invocation fall back to.
 
 - `SIGNER_REPO_URL` / `SIGNER_REPO_REF` -- default
-  `https://github.com/chaintope/tapyrus-signer.git` @ `master`, which has the base
-  `tapyrus-setup` ceremony (createkey/createnodevss/aggregate/genesis-sign) but not
-  the federation-change/rotation ceremony (`--xfield` sign/computesig, multi-entry
-  `federations.toml`). Override both to
-  `https://github.com/Naviabheeman/tapyrus-signer.git` @ `163_federationChangeToml`
-  to test rotation, e.g.:
-  `SIGNER_REPO_URL=https://github.com/Naviabheeman/tapyrus-signer.git SIGNER_REPO_REF=163_federationChangeToml`.
+  `https://github.com/chaintope/tapyrus-signer.git` @ `master`, which has the full
+  `tapyrus-setup` ceremony (createkey/createnodevss/aggregate/genesis-sign), the
+  federation-change/rotation ceremony (`--xfield` sign/computesig, multi-entry
+  `federations.toml`), and `federations.toml` live-reload.
 - `CORE_REPO_URL` / `CORE_REPO_REF` -- default
   `https://github.com/chaintope/tapyrus-core.git` @ `master`.
 - `SEEDER_REPO_URL` / `SEEDER_REPO_REF` -- default
@@ -175,19 +178,16 @@ just string formatting and a file write, nothing to overlap.
 - **No `port=` (P2P listen port) override**: deliberately left at prod mode's own
   default (`2357`) rather than pinned to dev mode's old `12383` -- `-connect=` in
   `docker/docker-compose.yml` has no explicit port, so it resolves against the
-  chain's *default* P2P port, not this conf's `port=`. Pinning `port=` here desyncs
-  from that and silently breaks every P2P edge (see `work-done.md`'s Lessons learnt
-  for the full incident -- caught only by testing the real 7-node topology, not a
-  single container).
+  chain's *default* P2P port, not this conf's `port=`. Pinning `port=` here would
+  desync from that and silently break every P2P edge (see `work-done.md`'s Design
+  decisions).
 - **`fallbackfee=0.0002`, `dbcache=64`, `maxorphantx=20`, `mempoolexpiry=2`** (hours):
   `fallbackfee` is required, not just tuning -- `tapyrusd`'s real default is disabled,
   and on the brand-new chain every run starts, `estimatesmartfee` never has enough
-  history to let `sendtoaddress`/`issuetoken` succeed without it (confirmed live:
-  `scripts/generate_traffic.py` generated zero real transactions without this, every
-  call failing with `-4 Fee estimation failed`, yet the step still exited 0 -- see
-  `work-done.md`'s Lessons learnt). The other three are memory/lifetime bounds sized
-  down from their production-node defaults for a small, short-lived, closed-topology
-  test chain (7 fixed peers, a handful of blocks, a run measured in hours not weeks).
+  history to let `sendtoaddress`/`issuetoken` succeed without it (see `work-done.md`'s
+  Design decisions). The other three are memory/lifetime bounds sized down from their
+  production-node defaults for a small, short-lived, closed-topology test chain (7
+  fixed peers, a handful of blocks, a run measured in hours not weeks).
 - **Known limitation**: not wired into the `seeder` service's `-i`/`-s` flags (still
   hardcoded to `1905960821` in `docker/docker-compose.yml`) -- deliberately, since the
   seeder isn't brought up by any `docker compose up` invocation yet at all (see
@@ -298,9 +298,8 @@ assignment, and the balance-shortfall top-up mechanic). Implemented as `TrafficN
   balance mismatch raises `TrafficGenerationError` (non-zero exit) after all rounds run,
   listing every mismatch found, not just the first.
 - Verified end-to-end against a real 7-node stack (`round_count=2`, all three
-  colored-coin types) -- see `doc/work-done.md`'s Lessons learnt for the bugs this
-  found and fixed (a `gettransaction` fee-shape gap, a funding-phase timing gap).
-- **Requires `fallbackfee` set** (see `render_tapyrus_conf.py` above, which now sets
+  colored-coin types).
+- **Requires `fallbackfee` set** (see `render_tapyrus_conf.py` above, which sets
   it) -- without it, every funding/send/issuance call on a brand-new chain fails with
   `-4 Fee estimation failed`. This incident is why `run()` now tracks how many of the
   `round_count * 14` round actions actually succeeded and raises
@@ -333,8 +332,7 @@ losing group's fork shows up as a real `valid-fork` tip via `getchaintips`, not 
 that the height advanced. Implemented as `ReorgSimulator`, following
 `generate_traffic.py`'s class-based/asyncio pattern. The first script to also drive
 `docker compose` itself (stop/start/force-recreate specific services), not just RPC --
-via a small `_compose()` subprocess helper, matching `checkout_repos.py`'s `_run()`
-style.
+via `scripts/lib/compose.py`'s shared helpers.
 
 - **Usage**: `./scripts/simulate_reorg.py` (no arguments -- reads
   `CHAIN_HEIGHT_BEFORE_REORG` / `REORG_LENGTH` / `CORE_RPC_USER` / `CORE_RPC_PASS` /
@@ -355,15 +353,6 @@ style.
   reach that height, since group A can only satisfy that by actually reorging --
   confirm convergence via `getchaintips` on all 7 nodes -- verify the canary
   survived.
-- **Replaced an earlier "tie-then-probe" design** that built both forks from the same
-  frozen baseline and then probed increasing margins past a tie. That version's
-  network isolation didn't stop the two forks from starting from the same baseline
-  fully; verified live (see `work-done.md`), it silently produced two byte-identical
-  forks -- group B's own locally-built blocks never became its accepted chain, it
-  silently adopted group A's chain (including group A's canary transaction) at the
-  same real-world second, meaning the two groups were never actually independent for
-  the whole isolation window. The alternating version here closes that gap by never
-  having both sides' core nodes up at once until the final reconnect.
 - **`CHAIN_HEIGHT_BEFORE_REORG` is a floor, not an assumed starting point**: the
   workflow always sets it to `TX_ROUND_COUNT + 2` (see the root `README.md`'s
   variable table), tying it to whatever `generate_traffic.py` produces first in the
@@ -386,18 +375,17 @@ style.
   depending on the original "Collect coinbase addresses" step's `/tmp` file still
   being around. The reconnect step reuses `wait_for_topology.py`'s `TopologyWaiter`
   directly, same reasoning.
-- **`core-7` needs a different convergence check than `core-3a`/`core-3b`**: found via
-  a real run, not anticipated in advance. `core-3a`/`core-3b` are only P2P-connected
-  within group B (see `docker-compose.yml`'s topology), so each should show a single
-  active `getchaintips` tip -- confirmed live. `core-7`, by design, is P2P-connected
-  to *all three* second-layer nodes, bridging both groups -- so it legitimately learns
-  group A's abandoned fork via header relay even though it never builds/extends it.
-  Confirmed live: it shows a second tip at group A's height with status
-  `valid-headers` (headers relayed and known, not necessarily fully-validated as a
-  real candidate), not `valid-fork` like the ex-group-A nodes, since group B's own
-  chain was always at least as long by the time `core-7` reconnects to it.
-  `_confirm_convergence` only asserts `core-7`'s *active* tip matches group B, not its
-  total tip count.
+- **`core-7` needs a different convergence check than `core-3a`/`core-3b`**:
+  `core-3a`/`core-3b` are only P2P-connected within group B (see
+  `docker-compose.yml`'s topology), so each should show a single active
+  `getchaintips` tip. `core-7`, by design, is P2P-connected to *all three*
+  second-layer nodes, bridging both groups -- so it legitimately learns group A's
+  abandoned fork via header relay even though it never builds/extends it, showing a
+  second tip at group A's height with status `valid-headers` (headers relayed and
+  known, not necessarily fully-validated as a real candidate), not `valid-fork` like
+  the ex-group-A nodes, since group B's own chain was always at least as long by the
+  time `core-7` reconnects to it. `_confirm_convergence` only asserts `core-7`'s
+  *active* tip matches group B, not its total tip count.
 - **Output**: none written to disk -- verification results are logged; a mismatch at
   any step raises `ReorgError` (non-zero exit); failures across all 7 nodes are
   collected and reported together, not just the first one hit.
@@ -410,7 +398,68 @@ style.
   on the ex-group-A nodes from the *first* run's still-present fork, which is accurate
   reporting of real on-chain state, not a script bug -- a real CI run always starts
   from fresh containers and wouldn't hit this.
-- **Active in the workflow**, right after "Generate TPC + colored-coin traffic".
+- **Active in the workflow**, right after "Generate traffic (before reorg)".
+
+## `scripts/simulate_federation_change.py`
+
+Drives a genuine aggpubkey rotation: signer-set-b runs its own offline ceremony (one
+member's identity deliberately reused from signer-set-a's node-0, so it stays a valid
+signer straight through the handoff), signer-set-a signs off on the handoff via
+`tapyrus-setup`'s `--xfield sign/computesig` flow, `federations.toml` is regenerated
+for all 5 involved signer nodes, signer-set-b's two genuinely new identities
+(`signer-b-1`/`signer-b-2`) are brought up alongside the still-running signer-set-a,
+and the script waits for the scheduled height to confirm the new aggpubkey took
+effect. Implemented as `FederationChangeSimulator`. See the script's own module
+docstring for the full design (xfield encoding, `federations.toml` membership rules,
+the shared node-0 identity, live-reload mechanics, the shared-redis open question).
+
+- **Usage**: `./scripts/simulate_federation_change.py` (no arguments -- reads
+  `CORE_RPC_USER` / `CORE_RPC_PASS` / `ROUND_DURATION` / `FEDERATION_CHANGE_HEIGHT`
+  from the environment).
+- Requires signer-set-a already generated and signing (same precondition as
+  `simulate_reorg.py`).
+- **signer-0/1/2 are never stopped or restarted** -- their `federations.toml` is
+  live-reloaded in place (write-to-temp-then-rename, matching
+  `federation_watcher.rs`'s own requirement for a complete-file write).
+- **Confirmed via RPC, not container/signer logs**: `_confirm_rotation_via_rpc`
+  checks `getblockchaininfo`'s `aggregatePubkeys` array on all 7 core nodes for the
+  new pubkey at the scheduled height -- core's own consensus-level record, not
+  anything the script or a signer log merely claims happened.
+- **Output**: none written to disk -- verification results are logged; a mismatch
+  raises `CeremonyError` (non-zero exit).
+- **Not yet uncommented in the workflow** -- needs a confirmed real run first, same
+  bar `simulate_reorg.py` cleared before it was wired in.
+
+## `scripts/simulate_maxblocksize_change.py`
+
+Drives a genuine max-block-size (xfield) change: the currently-active federation
+(signer-set-b, after `simulate_federation_change.py`'s rotation) signs off on a new
+max-block-size via the same `--xfield sign/computesig` flow, `federations.toml` gains
+a new entry for it on signer-set-b's 3 active members, live-reloaded in place, and the
+script waits for the scheduled height to confirm the new value took effect.
+Implemented as `MaxBlockSizeChangeSimulator`, reusing `simulate_federation_change.py`'s
+`XFieldSignoffCeremony` directly (it's generic over which xfield gets signed).
+
+- **Usage**: `./scripts/simulate_maxblocksize_change.py` (no arguments -- reads
+  `CORE_RPC_USER` / `CORE_RPC_PASS` / `ROUND_DURATION` / `MAX_BLOCK_SIZE_HEIGHT` /
+  `MAX_BLOCK_SIZE_NEW` from the environment).
+- **Requires signer-set-b already active** -- `simulate_federation_change.py`'s
+  rotation must have already been confirmed; this step signs off using signer-set-b's
+  own key material, not signer-set-a's.
+- **Simpler than the rotation script**: no new signer identities and no membership
+  change -- all 3 currently-active members (node-0, `signer-b-1`, `signer-b-2`) sign
+  off on and remain full members of the new entry too, so no new containers are
+  brought up.
+- **`--xfield` encoding differs from AggregatePublicKey's**: `MaxBlockSize(u32)` has a
+  fixed-size payload -- type tag `0x02` followed by the raw 4-byte little-endian u32,
+  no CompactSize length prefix (unlike the pubkey's variable-length payload).
+  Verified against rust-tapyrus v0.4.8's own `xfield_max_block_size_test` vector. See
+  `_maxblocksize_xfield_hex`.
+- **Confirmed via RPC**: `_confirm_change_via_rpc` checks `getblockchaininfo`'s
+  `maxBlockSizes` array on all 7 core nodes for the new value at the scheduled height
+  -- note the key is a decimal string (`XFieldMaxBlockSize::ToString()` =
+  `std::to_string(data)`), not hex like `aggregatePubkeys`.
+- **Not yet uncommented in the workflow** -- needs a confirmed real run first.
 
 ## `docker/docker-compose.yml`
 
