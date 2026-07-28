@@ -11,11 +11,7 @@ name: Weekly Cross-Repo Integration Test
 on:
   schedule:
     - cron: '0 3 * * 0' # Sunday 03:00 UTC / Sunday 12:00 noon JST
-  # Inputs deliberately have no `default:` -- GitHub Actions doesn't let that field
-  # hold an expression, and schedule/pull_request/push runs have no `inputs` context at
-  # all, so a workflow_dispatch-only default couldn't be shared with those triggers
-  # anyway. Every actual default lives in the env: block below instead, in one place --
-  # leave a field blank on a manual dispatch and you get the same value schedule uses.
+  # No input default: -- defaults live in the env: block below. See doc/work-done.md.
   workflow_dispatch:
     inputs:
       core_repo_ref:
@@ -45,18 +41,12 @@ on:
       docker_build_platform:
         description: 'Docker --platform for image builds; leave empty for the runner''s native platform'
 
-  # Smoke run for changes to this repo's own scripts/compose/workflow -- proves the
-  # pipeline still works end-to-end without waiting for Sunday's full-scale run to find
-  # out.
+  # Smoke run for this repo's own scripts/compose/workflow changes.
   pull_request:
     paths-ignore:
       - 'doc/**'
-  # TEMPORARY: push.branches is '**' (any branch), not just 'main', as a workaround for
-  # this fork's first-time-contributor approval gate blocking pull_request runs while
-  # this PR is still unreviewed -- verifiable by pushing to the PR branch directly, no
-  # merge or approval needed. Once merged, this double-runs: any push to a PR branch in
-  # the base repo fires both pull_request AND push (two identical smoke runs per
-  # commit). Narrow back to `branches: [main]` once merged -- see doc/project-plan.md.
+  # TEMPORARY: '**' not 'main' -- works around this fork's first-time-contributor
+  # approval gate. Narrow to [main] once merged -- see doc/project-plan.md.
   push:
     branches:
       - '**'
@@ -67,16 +57,12 @@ permissions:
   contents: read
 
 concurrency:
-  # event_name is part of the key so a push-triggered smoke run can't cancel an
-  # in-progress schedule-triggered full-scale run (both would otherwise share the same
-  # github.ref on main).
+  # event_name in the key: a push-triggered smoke run can't cancel a scheduled full run.
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
-  # No literal fallback here (unlike the smoke-scale variables below) -- an
-  # unset/blank ref resolves to config/repos.py's own default, the single source of
-  # truth for these three, rather than a second copy of the same value living here.
+  # No literal fallback -- an unset ref resolves to config/repos.py's own default.
   DOCKER_BUILD_PLATFORM: ${{ inputs.docker_build_platform || '' }}
   CORE_REPO_REF: ${{ inputs.core_repo_ref }}
   SIGNER_REPO_REF: ${{ inputs.signer_repo_ref }}
@@ -98,10 +84,7 @@ env:
 jobs:
   integration-test:
     runs-on: ubuntu-latest
-    # Smoke: 3h. Full: 6h. Generous headroom for a cold run's full C++ tapyrus-core
-    # Docker build + a signer image build + a native `cargo build --release` (with its
-    # own vendored GMP build) back to back, on a 2-core runner -- worth re-measuring
-    # against a real run and tightening back down once actual timings are in.
+    # Smoke: 3h. Full: 6h. Headroom for cold image builds + cargo build --release.
     timeout-minutes: ${{ (github.event_name == 'pull_request' || github.event_name == 'push') && 180 || 360 }}
     steps:
       - name: Checkout this repo
@@ -113,27 +96,13 @@ jobs:
           python-version: '3.11'
 
       - name: Derive CHAIN_HEIGHT_BEFORE_REORG from TX_ROUND_COUNT
-        # env: block expressions have no arithmetic operators, so this can't just be
-        # a literal `${{ }}` fallback like the other variables -- always
-        # TX_ROUND_COUNT + 2, tying the reorg's baseline height directly to whatever
-        # scripts/generate_traffic.py will actually have produced by the time
-        # scripts/simulate_reorg.py runs, rather than an independently-configured
-        # value that could silently drift out of sync with it.
+        # env: expressions have no arithmetic -- ties the reorg baseline to TX_ROUND_COUNT.
         run: echo "CHAIN_HEIGHT_BEFORE_REORG=$((TX_ROUND_COUNT + 2))" >> "$GITHUB_ENV"
 
       - name: Derive FEDERATION_CHANGE_HEIGHT from REORG_LENGTH
-        # Not a workflow_dispatch input -- scripts/simulate_federation_change.py
-        # schedules its rotation this many blocks past whatever height the chain is
-        # at when IT runs (itself already well past the reorg + a traffic round), so
-        # there's no independently-meaningful absolute value to expose here; tying it
-        # to REORG_LENGTH keeps the two in the same ballpark instead of two
-        # separately-tuned literals that could silently drift apart.
         run: echo "FEDERATION_CHANGE_HEIGHT=$REORG_LENGTH" >> "$GITHUB_ENV"
 
       - name: Derive MAX_BLOCK_SIZE_HEIGHT from FEDERATION_CHANGE_HEIGHT
-        # Same reasoning as FEDERATION_CHANGE_HEIGHT above -- not a workflow_dispatch
-        # input, tied to the previous step's own height variable so it stays in the
-        # same ballpark instead of a separately-tuned literal.
         run: echo "MAX_BLOCK_SIZE_HEIGHT=$FEDERATION_CHANGE_HEIGHT" >> "$GITHUB_ENV"
 
       - name: Checkout tapyrus-core + tapyrus-signer + tapyrus-seeder
@@ -197,31 +166,19 @@ jobs:
         run: ./scripts/simulate_reorg.py
 
       - name: Generate traffic (before federation change)
-        run: ./scripts/generate_traffic.py "$TX_ROUND_COUNT"
+        run: ./scripts/generate_traffic.py 5
 
-      # - name: Federation change (aggpubkey rotation)
-      #   run: ./scripts/simulate_federation_change.py
-      # Built (scripts/simulate_federation_change.py, brings up signer-b-1/signer-b-2
-      # alongside signer-0/1/2 -- see docker-compose.yml), but not yet uncommented
-      # here, unlike simulate_reorg.py above (which only got uncommented after a real
-      # run) -- see the script's own module docstring for what's confirmed from
-      # source vs. still an open question (signer-set-b sharing signer-set-a's redis
-      # instance in particular). No new CI secret needed for the ceremony itself --
-      # signer-set-b's keys are generated fresh in-runner same as signer-set-a's,
-      # nothing pre-provisioned or committed (see
-      # doc/weekly-integration-test-plan.md's "Key management in CI" open question).
+      - name: Federation change (aggpubkey rotation)
+        run: ./scripts/simulate_federation_change.py
 
       - name: Generate traffic (before max-block-size change)
-        run: ./scripts/generate_traffic.py "$TX_ROUND_COUNT"
+        run: ./scripts/generate_traffic.py 5
 
-      # - name: Max block size change
-      #   run: ./scripts/simulate_maxblocksize_change.py
-      # Built (scripts/simulate_maxblocksize_change.py), same shape as the federation
-      # change step above -- signer-set-b (already active after that step) signs off
-      # on a new MAX_BLOCK_SIZE_NEW via a fresh --xfield sign/computesig round,
-      # federations.toml gains an entry for it, live-reloaded in place. Not yet
-      # uncommented here, and depends on the federation-change step above having run
-      # first (signer-set-b must already be the active federation).
+      - name: Max block size change
+        run: ./scripts/simulate_maxblocksize_change.py
+
+      - name: Generate traffic (after max-block-size change)
+        run: ./scripts/generate_traffic.py 5
 
       - name: Collect logs
         if: always()
@@ -245,9 +202,4 @@ jobs:
       #   if: always()
       #   env:
       #     SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-      #   run: echo "TODO -- not yet scripted -- see doc/project-plan.md Milestone 4"
-      # TODO -- needs SLACK_WEBHOOK_URL provisioned as a repository-level GitHub
-      # Actions secret (Settings -> Secrets and variables -> Actions) before this can
-      # go live -- only the repo owner/an admin can add that, not a contributor via a
-      # PR (and a fork's own CI run wouldn't have it either). Until it's set, keep
-      # this step commented out rather than referencing an unset secrets.* value.
+      #   run: echo "TODO -- needs SLACK_WEBHOOK_URL provisioned first, see doc/project-plan.md Milestone 4"
