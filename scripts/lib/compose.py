@@ -63,11 +63,11 @@ async def stop_nodes(*service_names):
 
 
 async def bring_up(*service_names):
-    """`docker compose up -d <service_names>` -- for services with no container yet
-    (first-time creation), unlike start_nodes/stop_nodes which only ever act on
-    already-created ones.
+    """`docker compose up -d --no-deps <service_names>` -- for services with no
+    container yet (first-time creation), unlike start_nodes/stop_nodes which only
+    ever act on already-created ones. --no-deps for the same reason as start_nodes.
     """
-    await compose("up", "-d", *service_names)
+    await compose("up", "-d", "--no-deps", *service_names)
 
 
 async def recreate_fresh(*service_names):
