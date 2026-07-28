@@ -143,7 +143,7 @@ class TrafficGenerator:
         # pending in some node's mempool -- getbalance only counts confirmed balance,
         # so seeding from it now and having that transaction confirm mid-run would
         # silently offset the ledger by exactly its amount for the rest of the run.
-        await self._wait_for_next_block()
+        await self._wait_for_empty_mempool()
         await self._seed_ledger_with_current_balances()
         # Waiting for just one more block isn't enough: with 3 signers rotating as
         # block proposer, one new block only credits coinbase to whichever signer
@@ -358,6 +358,25 @@ class TrafficGenerator:
             log.info(f"{sender.name}: minted a fresh {TOKEN_TYPE_NAMES[sender.token_type]} color (old one exhausted)")
 
     # -- height polling ------------------------------------------------------------
+
+    async def _wait_for_empty_mempool(self):
+        deadline = time.monotonic() + HEIGHT_POLL_TIMEOUT_SECONDS
+        while True:
+            mempools = await asyncio.gather(*(self._node_mempool(node) for node in self._nodes))
+            if all(mempool == [] for mempool in mempools):
+                return
+            if time.monotonic() >= deadline:
+                raise TrafficGenerationError(
+                    f"mempool(s) still non-empty after {HEIGHT_POLL_TIMEOUT_SECONDS}s: "
+                    f"{ {node.name: mempool for node, mempool in zip(self._nodes, mempools)} }"
+                )
+            await asyncio.sleep(HEIGHT_POLL_INTERVAL_SECONDS)
+
+    async def _node_mempool(self, node):
+        try:
+            return await node.rpc.call("getrawmempool")
+        except RpcUnreachable:
+            return None
 
     async def _current_height(self):
         heights = await asyncio.gather(*(node.rpc.call("getblockcount") for node in self._nodes))
