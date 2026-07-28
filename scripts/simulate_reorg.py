@@ -209,7 +209,14 @@ class ReorgSimulator:
         log.step("stopping group A -- group B builds its fork completely alone")
         await self._compose("stop", *GROUP_A)
         await self._repoint_signers(GROUP_B_RPC_HOSTS)
-        await self._compose("start", *SIGNERS)
+        # "up -d --no-deps", not "start" -- signer-0/signer-1's depends_on
+        # (docker/docker-compose.yml) is core-1a/core-2a, both group A, which "start"
+        # would silently bring back up via dependency cascade (confirmed live: group A
+        # restarted seconds after this call, well before the real group A restart in
+        # _restore_group_a) -- exactly the cross-group leak this script's whole
+        # strict-alternation redesign exists to prevent. --no-deps starts only the
+        # named services.
+        await self._compose("up", "-d", "--no-deps", *SIGNERS)
 
         target = self._baseline_height + self._reorg_length
         log.step(f"group B building its fork (target height {target})")
@@ -250,7 +257,11 @@ class ReorgSimulator:
         # signer-2 (-> core-3a) will fail to start with no reachable RPC target --
         # group B is stopped for the whole of this step -- expected and harmless,
         # matches the verified recipe: threshold 2 is met by signer-0/signer-1 alone.
-        await self._compose("start", *SIGNERS)
+        # "up -d --no-deps", not "start" -- signer-2's own depends_on is core-3a
+        # (group B), which "start" would cascade back up (confirmed live: core-3a
+        # restarted immediately, ~5 minutes before the real reconnect below),
+        # defeating group B's isolation for the rest of this step.
+        await self._compose("up", "-d", "--no-deps", *SIGNERS)
 
         target = self._baseline_height + self._reorg_length
         log.step(f"group A building its own, different fork (target height {target})")
@@ -279,7 +290,11 @@ class ReorgSimulator:
     async def _extend_group_b_by_one_block(self):
         log.step("repointing signers back to group B and extending its chain by exactly 1 block")
         await self._repoint_signers(GROUP_B_RPC_HOSTS)
-        await self._compose("start", *SIGNERS)
+        # "up -d --no-deps" for the same depends_on-cascade reason as the other two
+        # signer starts above -- both groups are already up by this point so it can't
+        # leak isolation here, but using "start" would be one more place to remember
+        # to fix if that ever changes.
+        await self._compose("up", "-d", "--no-deps", *SIGNERS)
 
         target = self._baseline_height + self._reorg_length + 1
         # ALL_NODE_NAMES, not just GROUP_B -- the point of this wait is confirming
