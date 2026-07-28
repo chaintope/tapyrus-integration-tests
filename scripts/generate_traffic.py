@@ -139,6 +139,11 @@ class TrafficGenerator:
 
     async def run(self):
         await self._collect_addresses()
+        # A prior step (e.g. simulate_reorg.py's canary) can leave a transaction
+        # pending in some node's mempool -- getbalance only counts confirmed balance,
+        # so seeding from it now and having that transaction confirm mid-run would
+        # silently offset the ledger by exactly its amount for the rest of the run.
+        await self._wait_for_next_block()
         await self._seed_ledger_with_current_balances()
         # Waiting for just one more block isn't enough: with 3 signers rotating as
         # block proposer, one new block only credits coinbase to whichever signer
