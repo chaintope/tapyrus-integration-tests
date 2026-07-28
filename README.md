@@ -92,20 +92,18 @@ dispatch run that leaves a field blank gets the same value schedule does either 
   are written down -- each input's own `description:` field just points back here
   instead of restating them, so the two can't silently drift apart.
   
-GitHub Actions caps `workflow_dispatch` at 10 inputs (exceeding it invalidates the
-whole workflow file, for every trigger -- see `doc/work-done.md`), so only variables
-with a wired-in consuming step get an actual input; the rest fall back straight to
-their `env:` literal on every trigger, `workflow_dispatch` included, with no way to
-override per-run yet.
+Only variables with a wired-in consuming step get an actual `workflow_dispatch`
+input; the rest fall back straight to their `env:` literal on every trigger,
+`workflow_dispatch` included, with no way to override per-run yet.
 
 | Variable | Default | Controls |
 | --- | --- | --- |
 | `core_repo_ref` | see `config/repos.py` | `tapyrus-core` branch/tag/sha to check out |
 | `signer_repo_ref` | see `config/repos.py` | `tapyrus-signer` branch/tag/sha to check out (override to `163_federationChangeToml` on the `Naviabheeman` fork to test rotation) |
 | `seeder_repo_ref` | see `config/repos.py` | `tapyrus-seeder` branch/tag/sha to check out |
-| `tx_round_count` | `500` (`20` on pull_request/push) | Round-robin send/check/settle cycles `scripts/generate_traffic.py` runs -- each is 3 block-heights and 14 transactions (7 nodes x {TPC send, colored send-or-mint}), so this alone determines the tx/block/height totals for that step. Also determines the reorg's baseline height -- see below |
-| `reorg_length` | `100` (`10` on pull_request/push) | Blocks each isolated group builds past the baseline, alone, before reconnecting at the tie (`scripts/simulate_reorg.py`: group B builds first while group A is stopped entirely, then group A builds its own, genuinely different set while group B is stopped). Group B is then always extended by exactly 1 more block to win -- not configurable, and not probed for -- see `doc/scripts.md` |
-| `round_duration_seconds` | `60` | `tapyrus-signerd` round-duration (block interval) -- 60s avoids the `InvalidBlock` timing race a shorter duration hits, see `doc/work-done.md` |
+| `tx_round_count` | `60` (`10` on pull_request/push) | Round-robin send/check/settle cycles `scripts/generate_traffic.py` runs -- each is 3 block-heights and 14 transactions (7 nodes x {TPC send, colored send-or-mint}), so this alone determines the tx/block/height totals for that step. Also determines the reorg's baseline height -- see below. Sized against the CI timing budget, see `doc/work-done.md` |
+| `reorg_length` | `30` (`5` on pull_request/push) | Blocks each isolated group builds past the baseline, alone, before reconnecting at the tie (`scripts/simulate_reorg.py`: group B builds first while group A is stopped entirely, then group A builds its own, genuinely different set while group B is stopped). Group B is then always extended by exactly 1 more block to win -- not configurable, and not probed for -- see `doc/scripts.md` |
+| `round_duration_seconds` | `30` | `tapyrus-signerd` round-duration (block interval) -- untested at this value, see `doc/work-done.md`'s CI timing budget note (`60` is the last confirmed-clean value, `10` is confirmed to hit transient `InvalidBlock` errors) |
 | `network_id` | `1905960821` | Tapyrus network id (prod mode, see `doc/work-done.md`), used by every core-* node's rendered `tapyrus.conf` and the `genesis.<id>` file `tapyrusd` looks for |
 | `slack_log_tail_lines` | `100` | Lines of the implicated container's log inlined in the Slack failure report |
 | `docker_build_platform` | *(empty, runner-native)* | Docker `--platform` for image builds -- local verification only ever used `linux/arm64` |
@@ -113,8 +111,7 @@ override per-run yet.
 Not yet real inputs (env-literal only, no per-run override -- see above):
 `federation_change_height` (`800`, `60` on pull_request/push), `max_block_size_new`
 (`2000000`). Both feed steps that are still commented-out/TODO (Milestone 3/4).
-Reintroduce as real inputs once a step lands for real, if the 10-input budget allows,
-or via a JSON "overrides" input / repo vars otherwise.
+Reintroduce as real inputs once a step lands for real.
 
 **No input at all, and no env-literal fallback either** (not just not-yet-wired --
 gone entirely): `tx_total_count`, `tx_tpc_percent`, `tx_interval_seconds`. Earlier

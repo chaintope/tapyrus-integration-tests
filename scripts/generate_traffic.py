@@ -95,6 +95,17 @@ TOKEN_TOPUP_AMOUNT = 3
 ROUND_SEND_AMOUNT_TOKEN = 1
 TPC = "TPC"
 
+# _send_node_round catches RpcError/RpcUnreachable per action and just warns, on
+# purpose (one node's bad round shouldn't abort everyone else's) -- but that means a
+# systemic failure (e.g. the fallbackfee incident, see doc/work-done.md, where every
+# sendtoaddress call failed) leaves the ledger untouched right along with the real
+# balances, so _verify_round's ledger-vs-actual comparison matches trivially and the
+# run exits 0 despite doing nothing. This floor catches that: at least this fraction
+# of the round_count * 14 (7 nodes x {TPC send, colored send-or-mint}) actions must
+# actually succeed, or the run is treated as failed regardless of what the ledger
+# comparison says.
+MIN_SUCCESSFUL_ACTION_FRACTION = 0.5
+
 
 class TrafficGenerationError(Exception):
     """Balance verification found a mismatch, or a round-robin action failed."""
@@ -120,6 +131,7 @@ class TrafficGenerator:
         # ledger[node_name][asset] -- asset is TPC or a color-id hex string.
         self._ledger = {node.name: {TPC: 0.0} for node in nodes}
         self._mismatches = []
+        self._successful_round_actions = 0
 
     async def run(self):
         await self._collect_addresses()
@@ -143,12 +155,24 @@ class TrafficGenerator:
             settle_height = await self._wait_for_next_block()
             await self._verify_round(settle_height)
 
+        expected_actions = self._round_count * len(self._nodes) * 2
+        min_required_actions = max(1, int(expected_actions * MIN_SUCCESSFUL_ACTION_FRACTION))
+        if self._successful_round_actions < min_required_actions:
+            raise TrafficGenerationError(
+                f"only {self._successful_round_actions}/{expected_actions} round actions actually "
+                f"succeeded (need at least {min_required_actions}) -- a ledger that matches reality "
+                f"isn't enough on its own, since a systemic failure leaves both sides untouched"
+            )
+
         if self._mismatches:
             raise TrafficGenerationError(
                 f"{len(self._mismatches)} balance mismatch(es) across the run:\n"
                 + "\n".join(self._mismatches)
             )
-        log.info(f"done. all {self._round_count} round(s) settled with balances matching the ledger")
+        log.info(
+            f"done. all {self._round_count} round(s) settled with balances matching the ledger "
+            f"({self._successful_round_actions}/{expected_actions} round actions succeeded)"
+        )
 
     # -- setup: addresses, funding, issuance -----------------------------------
 
@@ -262,11 +286,13 @@ class TrafficGenerator:
     async def _send_node_round(self, sender, target):
         try:
             await self._send_tpc(sender, target)
+            self._successful_round_actions += 1
         except (RpcError, RpcUnreachable) as exc:
             log.warn(f"{sender.name}: round TPC send skipped ({exc})")
 
         try:
             await self._send_or_topup_color(sender, target)
+            self._successful_round_actions += 1
         except (RpcError, RpcUnreachable) as exc:
             log.warn(f"{sender.name}: round colored action failed ({exc})")
 

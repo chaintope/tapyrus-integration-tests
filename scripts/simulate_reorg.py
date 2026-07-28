@@ -118,7 +118,18 @@ HEIGHT_POLL_INTERVAL_SECONDS = 5
 STALL_TIMEOUT_ROUND_MULTIPLIER = 4
 MIN_STALL_TIMEOUT_SECONDS = 180
 CONVERGENCE_TIMEOUT_SECONDS = 120
+# Reaching the target height (_wait_for_height) doesn't mean every node has
+# PROPAGATED that same tip yet -- signers are still producing a block every
+# ROUND_DURATION at this point, so a one-shot poll can land mid-propagation and see a
+# stale tip on a lagging node. A few round-trips' worth of retrying is enough for P2P
+# relay among already-connected peers; this isn't waiting out block production like
+# _wait_for_height is.
+BASELINE_TIP_CONSISTENCY_TIMEOUT_SECONDS = 30
 CANARY_SEND_AMOUNT_TPC = 0.001
+# Same values collect_coinbase_addresses.py uses for the same "docker compose up just
+# means the container started, not that tapyrusd's RPC server is up" wait.
+RPC_READY_TIMEOUT_SECONDS = 120
+RPC_READY_POLL_INTERVAL_SECONDS = 3
 
 SIGNERS = ("signer-0", "signer-1", "signer-2")
 CANARY_SENDER = "core-1a"
@@ -190,9 +201,7 @@ class ReorgSimulator:
         # already ran first in the same job) is what both forks' targets get computed
         # from, not the original literal value. See _wait_for_height.
         self._baseline_height = await self._wait_for_height(ALL_NODE_NAMES, self._baseline_height)
-        tips = await asyncio.gather(*(self._clients[name].call("getbestblockhash") for name in ALL_NODE_NAMES))
-        if len(set(tips)) != 1:
-            raise ReorgError(f"baseline tips don't match across all 7 nodes: {dict(zip(ALL_NODE_NAMES, tips))}")
+        tips = await self._wait_for_matching_tips(ALL_NODE_NAMES)
         log.info(f"baseline confirmed: all 7 nodes at height {self._baseline_height}, tip {tips[0][:12]}...")
         await self._compose("stop", *SIGNERS)
 
@@ -220,6 +229,14 @@ class ReorgSimulator:
         await self._compose("up", "-d", "--force-recreate", "redis")
 
     async def _inject_canary_transaction(self):
+        # _restore_group_a just restarted CANARY_SENDER/CANARY_RECEIVER's containers --
+        # "started" only means the process launched, not that tapyrusd's RPC server has
+        # finished initializing (same gotcha collect_coinbase_addresses.py retries
+        # through after the initial `docker compose up`). Without this wait, the
+        # getnewaddress call below is the first RPC either node sees post-restart and
+        # can hit warmup's RpcUnreachable, which is wider open on a slower CI runner
+        # than in local runs.
+        await asyncio.gather(*(self._wait_for_rpc_ready(name) for name in (CANARY_SENDER, CANARY_RECEIVER)))
         log.step(f"injecting a canary transaction ({CANARY_SENDER} -> {CANARY_RECEIVER}) into group A")
         address = await self._clients[CANARY_RECEIVER].call("getnewaddress")
         self._canary_txid = await self._clients[CANARY_SENDER].call(
@@ -430,11 +447,43 @@ class ReorgSimulator:
                 )
             await asyncio.sleep(HEIGHT_POLL_INTERVAL_SECONDS)
 
+    async def _wait_for_matching_tips(self, node_names):
+        """Polls getbestblockhash across node_names until they all agree, retrying
+        for BASELINE_TIP_CONSISTENCY_TIMEOUT_SECONDS instead of failing on the first
+        mismatch -- see that constant's comment.
+        """
+        deadline = time.monotonic() + BASELINE_TIP_CONSISTENCY_TIMEOUT_SECONDS
+        while True:
+            tips = await asyncio.gather(*(self._clients[name].call("getbestblockhash") for name in node_names))
+            if len(set(tips)) == 1:
+                return tips
+            if time.monotonic() >= deadline:
+                raise ReorgError(
+                    f"baseline tips still don't match across all 7 nodes after "
+                    f"{BASELINE_TIP_CONSISTENCY_TIMEOUT_SECONDS}s: {dict(zip(node_names, tips))}"
+                )
+            await asyncio.sleep(HEIGHT_POLL_INTERVAL_SECONDS)
+
     async def _node_chain_info(self, name):
         try:
             return await self._clients[name].call("getblockchaininfo")
         except RpcUnreachable:
             return None
+
+    async def _wait_for_rpc_ready(self, name):
+        """Retries a cheap RPC call against `name` until it answers or
+        RPC_READY_TIMEOUT_SECONDS elapses -- same "container started != RPC ready"
+        wait collect_coinbase_addresses.py does after its own `docker compose up`.
+        """
+        deadline = time.monotonic() + RPC_READY_TIMEOUT_SECONDS
+        while True:
+            try:
+                await self._clients[name].call("getblockcount")
+                return
+            except RpcUnreachable as exc:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"{name}'s RPC never became reachable within {RPC_READY_TIMEOUT_SECONDS}s: {exc}")
+                await asyncio.sleep(RPC_READY_POLL_INTERVAL_SECONDS)
 
     # -- docker compose -------------------------------------------------------------
 
@@ -467,6 +516,6 @@ async def main():
 if __name__ == "__main__":
     try:
         asyncio.run(main())
-    except (ReorgError, TimeoutError, subprocess.CalledProcessError) as exc:
+    except (ReorgError, TimeoutError, subprocess.CalledProcessError, RpcError, RpcUnreachable) as exc:
         log.error(str(exc))
         sys.exit(1)

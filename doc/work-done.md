@@ -15,6 +15,20 @@ done-vs-outstanding progress, and [`scripts.md`](scripts.md) for what each scrip
 - **GitHub-hosted `ubuntu-latest` runner's CPU/disk sufficiency is unconfirmed** for 7
   core nodes + 3 signers + redis + seeder running concurrently -- may need
   self-hosted.
+- **CI timing budget: full-scale scenario timing is bounded by GitHub-hosted's 6h
+  hard cap**, which can't be raised past regardless of `timeout-minutes`. Block
+  production only comes from the live signer round-robin at `ROUND_DURATION` cadence,
+  no instant-mining shortcut (see `simulate_reorg.py`'s docstring), so total scenario
+  time is `blocks x ROUND_DURATION` (roughly -- the reorg's isolated-build halves only
+  have 2 of 3 signers live, so they run at ~2/3 the block rate). `tx_round_count=60` /
+  `reorg_length=30` (full-scale) and `tx_round_count=10` / `reorg_length=5` (smoke)
+  work out to `~90min` traffic + `~40min` reorg for full-scale, well inside the 6h cap
+  alongside the ~1.5h image/cargo builds. `round_duration=30` is **untested**: only
+  `10` (transient `InvalidBlock` errors, see below) and `60` (clean, 32min/56 blocks)
+  have real-run data behind them. `30` sits between the two on the theory that the
+  `InvalidBlock` race is tied to how tight the round boundary is relative to signing
+  latency, not a hard cliff at any specific value, but that's not yet confirmed live
+  -- verify with a real run and fall back to `60` if `InvalidBlock` errors reappear.
 - **`docker/docker-compose.yml` has no compose-level healthchecks** /
   `depends_on: condition: service_healthy` yet (plan doc section 3 step 6 guidance).
   `scripts/wait_for_topology.py` is a CI-level equivalent -- arguably stronger, since
@@ -406,7 +420,7 @@ instead of alone -- see the next entry.
   have no `inputs` context -- `chain_height_before_reorg` isn't in that list anymore;
   it's always derived from `tx_round_count`, so it shrinks along with it automatically
   rather than needing its own fallback) and a shorter
-  `timeout-minutes` (60 vs. 360). `tx_round_count` is the one of these already wired to
+  `timeout-minutes` (180 vs. 360). `tx_round_count` is the one of these already wired to
   a real step (`generate_traffic.py`); the reorg/rotation variables still aren't
   consumed by anything -- wired in now so the smoke run is already fast once Milestone
   3/4 finishes landing them, rather than needing a second pass then. Not yet verified against

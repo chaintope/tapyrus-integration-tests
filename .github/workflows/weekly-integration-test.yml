@@ -16,8 +16,6 @@ on:
   # all, so a workflow_dispatch-only default couldn't be shared with those triggers
   # anyway. Every actual default lives in the env: block below instead, in one place --
   # leave a field blank on a manual dispatch and you get the same value schedule uses.
-  # GitHub Actions caps workflow_dispatch at 10 inputs -- exceeding it makes the whole
-  # workflow file invalid (startup_failure on every trigger, not just workflow_dispatch).
   workflow_dispatch:
     inputs:
       core_repo_ref:
@@ -88,9 +86,11 @@ env:
   CORE_RPC_PORT: '12381'
   CORE_RPC_USER: 'rpcuser'
   CORE_RPC_PASS: 'rpcpassword'
-  TX_ROUND_COUNT: ${{ inputs.tx_round_count || ((github.event_name == 'pull_request' || github.event_name == 'push') && '20' || '500') }}
-  ROUND_DURATION: ${{ inputs.round_duration_seconds || '60' }}
-  REORG_LENGTH: ${{ inputs.reorg_length || ((github.event_name == 'pull_request' || github.event_name == 'push') && '10' || '100') }}
+  # Re-sized against the block-production math in doc/work-done.md's "CI timing
+  # budget" note -- see there for the reasoning behind these values.
+  TX_ROUND_COUNT: ${{ inputs.tx_round_count || ((github.event_name == 'pull_request' || github.event_name == 'push') && '10' || '60') }}
+  ROUND_DURATION: ${{ inputs.round_duration_seconds || '30' }}
+  REORG_LENGTH: ${{ inputs.reorg_length || ((github.event_name == 'pull_request' || github.event_name == 'push') && '5' || '30') }}
   FEDERATION_CHANGE_HEIGHT: ${{ inputs.federation_change_height || ((github.event_name == 'pull_request' || github.event_name == 'push') && '60' || '800') }}
   MAX_BLOCK_SIZE_NEW: ${{ inputs.max_block_size_new || '2000000' }}
   SLACK_LOG_TAIL_LINES: ${{ inputs.slack_log_tail_lines || '100' }}

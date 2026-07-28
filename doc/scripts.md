@@ -302,17 +302,19 @@ assignment, and the balance-shortfall top-up mechanic). Implemented as `TrafficN
   found and fixed (a `gettransaction` fee-shape gap, a funding-phase timing gap).
 - **Requires `fallbackfee` set** (see `render_tapyrus_conf.py` above, which now sets
   it) -- without it, every funding/send/issuance call on a brand-new chain fails with
-  `-4 Fee estimation failed`, and the script still **exits 0** (its settle-height
-  assertion can't tell "real activity, correctly tracked" apart from "total failure,
-  trivially consistent" -- both a never-funded node's ledger and its actual balance
-  stay `0.0`). A green run is not by itself evidence traffic was generated -- check
-  the log for `round TPC send skipped` / `round colored action failed` warnings. With
-  the fix, re-verified live: zero such warnings across 2 full rounds, real balance
-  changes throughout. See `doc/work-done.md`'s Lessons learnt for the full incident.
-- **Active in the workflow**, right after "Bring up signer-set-a" -- uncommented
-  along with `simulate_reorg.py` (which runs right after it) and their shared
-  prerequisite, signer-set-a bring-up; the per-node lifecycle/max-block-size and
-  rotation steps remain commented out, still genuinely unbuilt.
+  `-4 Fee estimation failed`. This incident is why `run()` now tracks how many of the
+  `round_count * 14` round actions actually succeeded and raises
+  `TrafficGenerationError` if fewer than `MIN_SUCCESSFUL_ACTION_FRACTION` did, instead
+  of relying solely on the settle-height ledger comparison -- a never-funded node's
+  ledger and its actual balance both stay `0.0`, so that comparison alone can't tell
+  "real activity, correctly tracked" apart from "total failure, trivially consistent."
+  Re-verified live after the `fallbackfee` fix: zero `round TPC send skipped` / `round
+  colored action failed` warnings across 2 full rounds, real balance changes
+  throughout. See `doc/work-done.md`'s Lessons learnt for the full incident.
+- **Active in the workflow**, right after "Bring up signers" -- uncommented along
+  with `simulate_reorg.py` (which runs right after it) and their shared prerequisite,
+  signer-set-a bring-up; the per-node lifecycle/max-block-size and rotation steps
+  remain commented out, still genuinely unbuilt.
 - **Known limitation**: `core-1a`/`2a`/`3a`'s TPC balance is intentionally excluded from
   the settle-height assertion (logged, not asserted) -- they receive ongoing coinbase
   income whenever they propose a block, at a rate this script can't predict in advance.
@@ -408,7 +410,7 @@ style.
   on the ex-group-A nodes from the *first* run's still-present fork, which is accurate
   reporting of real on-chain state, not a script bug -- a real CI run always starts
   from fresh containers and wouldn't hit this.
-- **Active in the workflow**, right after "Generate traffic (before reorg)".
+- **Active in the workflow**, right after "Generate TPC + colored-coin traffic".
 
 ## `docker/docker-compose.yml`
 
