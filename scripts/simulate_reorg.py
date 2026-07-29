@@ -14,7 +14,10 @@ simulated, and not just isolated-by-network-stop while leaving room for ambiguit
    round-state that produced them.
 5. Reconnect group B alongside group A (both now at the same height, different tips --
    a real tie) and confirm the tie alone doesn't cause a reorg.
-6. Repoint signers back to group B and extend ITS chain by exactly one more block.
+6. Repoint signers back to group B and extend ITS chain by two more blocks, not one
+   -- confirmed live: after just one, core-3a still shows its own just-abandoned tip
+   as valid-headers rather than valid-fork, one round behind every other node; the
+   second block is what it takes for core-3a specifically to finish reclassifying it.
 7. Confirm every node -- both former groups -- converges on group B's (now longer)
    tip, with group A's own fork showing up as a real valid-fork via getchaintips.
 
@@ -182,13 +185,13 @@ class ReorgSimulator:
         await self._build_group_a_fork()
         await self._reconnect_group_b()
         await self._confirm_tie_holds()
-        await self._extend_group_b_by_one_block()
+        await self._extend_group_b_by_two_blocks()
         await self._confirm_convergence()
         await self._verify_canary_transaction_survived()
         log.info(
             f"done. group A's {self._reorg_length}-block fork (tip {self._group_a_tip[:12]}...) confirmed as a "
             f"valid-fork on every node; every node -- both former groups -- converged on group B's "
-            f"{self._reorg_length + 1}-block chain (tip {self._group_b_tip[:12]}...); the canary transaction "
+            f"{self._reorg_length + 2}-block chain (tip {self._group_b_tip[:12]}...); the canary transaction "
             f"({self._canary_txid[:12]}...) confirmed only on the losing fork was not lost."
         )
 
@@ -293,8 +296,8 @@ class ReorgSimulator:
                 )
         log.info("confirmed: every group A node is still on its own tip at the tie -- no premature reorg")
 
-    async def _extend_group_b_by_one_block(self):
-        log.step("repointing signers back to group B and extending its chain by exactly 1 block")
+    async def _extend_group_b_by_two_blocks(self):
+        log.step("repointing signers back to group B and extending its chain by 2 blocks")
         await self._repoint_signers(GROUP_B_RPC_HOSTS)
         # "up -d --no-deps" for the same depends_on-cascade reason as the other two
         # signer starts above -- both groups are already up by this point so it can't
@@ -302,10 +305,13 @@ class ReorgSimulator:
         # to fix if that ever changes.
         await self._compose("up", "-d", "--no-deps", *SIGNERS)
 
-        target = self._baseline_height + self._reorg_length + 1
+        # +2, not +1 -- confirmed live: core-3a still shows its own just-abandoned tip
+        # as valid-headers (not yet valid-fork) after only one, one round behind every
+        # other node. See this module's docstring step 6.
+        target = self._baseline_height + self._reorg_length + 2
         # ALL_NODE_NAMES, not just GROUP_B -- the point of this wait is confirming
         # group A adopts group B's now-longer chain (the reorg itself), not just that
-        # group B produced one more block.
+        # group B produced more blocks.
         await self._wait_for_height(ALL_NODE_NAMES, target)
         self._group_b_tip = await self._clients["core-3a"].call("getbestblockhash")
         log.info(f"group B's chain extended to height {target} (tip {self._group_b_tip[:12]}...) -- all 7 nodes converged")
@@ -539,7 +545,7 @@ async def main():
 
     log.step(
         f"simulating a reorg: baseline height {baseline_height}, group B then group A each build "
-        f"{reorg_length} block(s) alone, then group B is extended by 1 more"
+        f"{reorg_length} block(s) alone, then group B is extended by 2 more"
     )
     simulator = ReorgSimulator(rpc_user, rpc_pass, baseline_height, reorg_length, round_duration)
     await simulator.run()
