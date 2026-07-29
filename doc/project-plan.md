@@ -35,7 +35,7 @@ See [`work-done.md`](work-done.md) for known issues and design decisions.
 - [x] Per-node transaction generation -- `scripts/generate_traffic.py` (`TrafficNode` + `TrafficGenerator`). Round-robin TPC + colored-coin (REISSUABLE/NON_REISSUABLE/NFT mix, one type per node) sends across all 7 nodes, everything derived from a single round count (`tx_round_count`); balance verified against a tracked ledger after every block. Wired into the workflow (`Generate round-robin TPC + colored-coin traffic` step). Verified end-to-end (see `work-done.md`'s Design decisions): zero send/issuance failures across 2 full rounds, real balance changes throughout, settled correctly.
 - [ ] `generate_traffic.py`'s settle-height ledger assertion can't distinguish "real activity, correctly tracked" from "total failure, trivially consistent" (see above) -- worth a hard floor (e.g. assert at least N successful sends/mints happened this run, not just that tracked-vs-actual balances agree) so a fully-broken run fails loudly instead of exiting 0.
 - [ ] Per-node lifecycle orchestrator (RPC health/height/mempool query, stop, restart, confirm resync)
-- [~] Max-block-size (xfield) change -- `scripts/simulate_maxblocksize_change.py`
+- [x] Max-block-size (xfield) change -- `scripts/simulate_maxblocksize_change.py`
   (`MaxBlockSizeChangeSimulator`). Signer-set-b (already active after the rotation
   above) signs off on a new max-block-size via a fresh `--xfield sign/computesig`
   round, reusing `simulate_federation_change.py`'s `XFieldSignoffCeremony` directly
@@ -44,9 +44,10 @@ See [`work-done.md`](work-done.md) for known issues and design decisions.
   `signer-b-2`) -- no new signer identities or containers needed, unlike the rotation
   itself. Confirmed via RPC, not logs (`_confirm_change_via_rpc`:
   `getblockchaininfo`'s `maxBlockSizes` array on all 7 core nodes must show the new
-  value at the scheduled height). Not yet run against a real stack; not yet
-  uncommented in the workflow.
-- [~] Aggpubkey rotation handoff -- `scripts/simulate_federation_change.py`
+  value at the scheduled height). Verified live and uncommented in the workflow (see
+  `work-done.md`'s note on a `tapyrus-setup` offline xfield-signing bug hit and fixed
+  upstream along the way).
+- [x] Aggpubkey rotation handoff -- `scripts/simulate_federation_change.py`
   (`FederationChangeSimulator`). Signer-set-b runs its own offline ceremony, but with
   one member's identity deliberately REUSED from signer-set-a's node-0
   (`PartialReuseAggpubkeyCeremony`, subclasses `generate_dev_secrets.py`'s
@@ -71,12 +72,10 @@ See [`work-done.md`](work-done.md) for known issues and design decisions.
   (`_confirm_rotation_via_rpc`: `getblockchaininfo`'s `aggregatePubkeys` array on all
   7 core nodes shows the new pubkey at the scheduled height). Built by reading the
   real `tapyrus-signer`/`rust-tapyrus` v0.4.8 source directly (see the script's own
-  module docstring for what's confirmed vs. still open) -- not yet uncommented in the
-  workflow. The most significant open question: `signer-b-1`/`signer-b-2`'s
-  containers (`docker/docker-compose.yml`) share the same redis instance as
-  signer-set-a's, and `tapyrus-signer`'s round-coordination broadcast channel is
-  global, not scoped per federation -- whether that's actually safe needs a real run
-  to confirm.
+  module docstring for what's confirmed vs. still open). Verified live and uncommented
+  in the workflow, including `signer-b-1`/`signer-b-2` sharing signer-set-a's redis
+  instance and global round-coordination channel -- no cross-talk observed across
+  several full runs.
 - [x] Verify live transactions aren't lost during a reorg -- `scripts/simulate_reorg.py`
   now injects one canary TPC transaction into group A right after the split (input
   predates the fork point, so it can't legitimately conflict with anything group B

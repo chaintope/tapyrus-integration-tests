@@ -312,8 +312,9 @@ assignment, and the balance-shortfall top-up mechanic). Implemented as `TrafficN
   throughout. See `doc/work-done.md`'s Lessons learnt for the full incident.
 - **Active in the workflow**, right after "Bring up signers" -- uncommented along
   with `simulate_reorg.py` (which runs right after it) and their shared prerequisite,
-  signer-set-a bring-up; the per-node lifecycle/max-block-size and rotation steps
-  remain commented out, still genuinely unbuilt.
+  signer-set-a bring-up; the per-node lifecycle orchestrator is the one piece still
+  genuinely unbuilt (rotation and max-block-size change are both active too, see
+  their own sections below).
 - **Known limitation**: `core-1a`/`2a`/`3a`'s TPC balance is intentionally excluded from
   the settle-height assertion (logged, not asserted) -- they receive ongoing coinbase
   income whenever they propose a block, at a rate this script can't predict in advance.

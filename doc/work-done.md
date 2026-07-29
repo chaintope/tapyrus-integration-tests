@@ -29,8 +29,22 @@ done-vs-outstanding progress, and [`scripts.md`](scripts.md) for what each scrip
   7-node topology in `docker-compose.yml` is wired 1:1 to exactly 3 signers; changing
   the count means redesigning the topology, not just passing a different number.
 - **Scenario mechanics not yet built** (see `project-plan.md` Milestone 3/4 for the
-  tracked list): lifecycle orchestrator, max-block-size xfield change, rotation
-  handoff not yet uncommented in the workflow, Slack report.
+  tracked list): lifecycle orchestrator, Slack report.
+- **`tapyrus-setup`'s offline `--xfield sign`/`computesig` rejected a fresh, otherwise
+  valid signature with `InvalidSig` roughly half the time** -- confirmed via repeated
+  isolated trials (2/6 accepted, all 3 verifying nodes always agreeing, so it was the
+  signature itself, not a per-node view difference). Root cause: `Sign::format_signature`
+  (`sign.rs`) encoded a signature's `v` point as only its x-coordinate, discarding the
+  y-parity entirely, before it was re-parsed back into a point on the
+  `federation_watcher.rs` verification side (`multi_party_signature_from_hex`) --
+  whichever y the reconstruction assumed only matched the original half the time. (An
+  earlier theory -- that the positive/negative Schnorr share selection in
+  `crypto/vss.rs` is re-derived inconsistently across the separate `sign`/`computesig`
+  process invocations -- was tested and ruled out: 60/60 fresh ceremony rounds against
+  the real `tapyrus-setup` binary verified correctly, and that selection is a pure
+  function of public VSS commitment data, identical across every process by
+  construction.) This was a `tapyrus-signer` bug, not this repo's scripts; fixed
+  upstream.
 - **Planned runner-matrix expansion**: once CI is stable on a single `ubuntu-latest`
   runner, add macOS (native arm64) and x86_64 nodes to the runner mix, so each
   platform builds natively instead of relying on `DOCKER_BUILD_PLATFORM`-forced QEMU
