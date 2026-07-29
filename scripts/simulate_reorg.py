@@ -376,7 +376,9 @@ class ReorgSimulator:
         no restore step here, a canary transaction still unconfirmed at this point
         (an expected outcome, not a failure -- see _verify_canary_transaction_survived)
         would sit in group A's mempools forever, since nothing would be running to
-        ever mine it.
+        ever mine it. Confirmed live: this is exactly what made a later
+        generate_traffic.py invocation's mempool-emptiness wait hang for its full
+        timeout, no matter how long that timeout was raised to.
         """
         log.step("restoring signers to their default RPC mapping and leaving them running")
         await self._repoint_signers(GROUP_A_RPC_HOSTS)
