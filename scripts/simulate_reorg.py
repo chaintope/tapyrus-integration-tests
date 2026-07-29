@@ -20,6 +20,10 @@ simulated, and not just isolated-by-network-stop while leaving room for ambiguit
    second block is what it takes for core-3a specifically to finish reclassifying it.
 7. Confirm every node -- both former groups -- converges on group B's (now longer)
    tip, with group A's own fork showing up as a real valid-fork via getchaintips.
+8. Restore signers to their default per-signer RPC mapping and leave them running --
+   the network is left exactly as this script found it, not stopped and still
+   repointed at group B, so whatever runs next in the same job can assume block
+   production is live.
 
 This replaced an earlier version of this script that built both forks to a tie by
 having group A build first (network-isolated) and group B build second, also
@@ -188,6 +192,7 @@ class ReorgSimulator:
         await self._extend_group_b_by_two_blocks()
         await self._confirm_convergence()
         await self._verify_canary_transaction_survived()
+        await self._restore_default_signers()
         log.info(
             f"done. group A's {self._reorg_length}-block fork (tip {self._group_a_tip[:12]}...) confirmed as a "
             f"valid-fork on every node; every node -- both former groups -- converged on group B's "
@@ -400,6 +405,20 @@ class ReorgSimulator:
             f"canary transaction {self._canary_txid} was orphaned by the reorg (confirmations="
             f"{tx['confirmations']}) and never returned to the mempool -- appears to have been lost"
         )
+
+    async def _restore_default_signers(self):
+        """Leaves the network exactly as this script found it -- signers running,
+        pointed at the default per-signer mapping -- instead of stopped and still
+        repointed at group B from the last recipe step. Whatever runs next in the
+        same job (e.g. generate_traffic.py) assumes block production is live: with
+        no restore step here, a canary transaction still unconfirmed at this point
+        (an expected outcome, not a failure -- see _verify_canary_transaction_survived)
+        would sit in group A's mempools forever, since nothing would be running to
+        ever mine it.
+        """
+        log.step("restoring signers to their default RPC mapping and leaving them running")
+        await self._repoint_signers(GROUP_A_RPC_HOSTS)
+        await self._compose("up", "-d", "--no-deps", *SIGNERS)
 
     # -- signer repointing --------------------------------------------------------
 
