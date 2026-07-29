@@ -200,10 +200,16 @@ class ReorgSimulator:
         # ACTUAL height reached (which can be higher, e.g. if generate_traffic.py
         # already ran first in the same job) is what both forks' targets get computed
         # from, not the original literal value. See _wait_for_height.
-        self._baseline_height = await self._wait_for_height(ALL_NODE_NAMES, self._baseline_height)
-        tips = await self._wait_for_matching_tips(ALL_NODE_NAMES)
-        log.info(f"baseline confirmed: all 7 nodes at height {self._baseline_height}, tip {tips[0][:12]}...")
+        await self._wait_for_height(ALL_NODE_NAMES, self._baseline_height)
+        # Stop signers BEFORE capturing the real baseline, not after -- block
+        # production only comes from the signer trio, so this is the first point
+        # nothing can move the chain further. Capturing height/tip earlier risks one
+        # more block landing during the gap before the stop takes effect, silently
+        # letting both forks share a block past the recorded baseline instead of
+        # genuinely diverging from it.
         await self._compose("stop", *SIGNERS)
+        self._baseline_height, tip = await self._wait_for_matching_tips(ALL_NODE_NAMES)
+        log.info(f"baseline confirmed: all 7 nodes at height {self._baseline_height}, tip {tip[:12]}...")
 
     async def _build_group_b_fork(self):
         log.step("stopping group A -- group B builds its fork completely alone")
@@ -463,19 +469,30 @@ class ReorgSimulator:
             await asyncio.sleep(HEIGHT_POLL_INTERVAL_SECONDS)
 
     async def _wait_for_matching_tips(self, node_names):
-        """Polls getbestblockhash across node_names until they all agree, retrying
-        for BASELINE_TIP_CONSISTENCY_TIMEOUT_SECONDS instead of failing on the first
-        mismatch -- see that constant's comment.
+        """Polls getblockchaininfo across node_names until both height AND
+        bestblockhash agree, retrying for BASELINE_TIP_CONSISTENCY_TIMEOUT_SECONDS
+        instead of failing on the first mismatch -- see that constant's comment.
+        Returns (height, tip) once agreed.
+
+        Checking height alongside the hash (not bestblockhash alone) matters because
+        this is called right after stopping the signers, while a block from just
+        before the stop can still be propagating. A node that already applied it and
+        one that hasn't briefly disagree on bestblockhash for an obviously-expected
+        reason; without the height dimension a caller has no way to tell that apart
+        from a real divergence.
         """
         deadline = time.monotonic() + BASELINE_TIP_CONSISTENCY_TIMEOUT_SECONDS
         while True:
-            tips = await asyncio.gather(*(self._clients[name].call("getbestblockhash") for name in node_names))
-            if len(set(tips)) == 1:
-                return tips
+            infos = await asyncio.gather(*(self._node_chain_info(name) for name in node_names))
+            heights = [info["blocks"] if info else None for info in infos]
+            tips = [info["bestblockhash"] if info else None for info in infos]
+            if len(set(heights)) == 1 and len(set(tips)) == 1:
+                return heights[0], tips[0]
             if time.monotonic() >= deadline:
                 raise ReorgError(
-                    f"baseline tips still don't match across all 7 nodes after "
-                    f"{BASELINE_TIP_CONSISTENCY_TIMEOUT_SECONDS}s: {dict(zip(node_names, tips))}"
+                    f"baseline height/tip still don't match across all 7 nodes after "
+                    f"{BASELINE_TIP_CONSISTENCY_TIMEOUT_SECONDS}s: "
+                    f"{dict(zip(node_names, zip(heights, tips)))}"
                 )
             await asyncio.sleep(HEIGHT_POLL_INTERVAL_SECONDS)
 
