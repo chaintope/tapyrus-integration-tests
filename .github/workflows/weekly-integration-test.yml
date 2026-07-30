@@ -1,0 +1,216 @@
+# Weekly cross-repo integration test (tapyrus-core + tapyrus-signer + tapyrus-seeder).
+# See doc/weekly-integration-test-plan.md section 3 for the full step-by-step design,
+# doc/work-done.md for known issues/lessons learnt/design decisions, and
+# doc/project-plan.md for tracked progress.
+#
+# schedule/workflow_dispatch run the full-scale scenario; pull_request/push (to this
+# repo itself, path-filtered) run the same flow at smoke scale -- see the env: block
+# below and doc/work-done.md.
+name: Weekly Cross-Repo Integration Test
+
+on:
+  schedule:
+    - cron: '0 3 * * 0' # Sunday 03:00 UTC / Sunday 12:00 noon JST
+  # Inputs deliberately have no `default:` -- GitHub Actions doesn't let that field
+  # hold an expression, and schedule/pull_request/push runs have no `inputs` context at
+  # all, so a workflow_dispatch-only default couldn't be shared with those triggers
+  # anyway. Every actual default lives in the env: block below instead, in one place --
+  # leave a field blank on a manual dispatch and you get the same value schedule uses.
+  workflow_dispatch:
+    inputs:
+      core_repo_ref:
+        description: 'tapyrus-core ref (branch/tag/sha) -- leave blank for config/repos.py''s default'
+      signer_repo_ref:
+        description: 'tapyrus-signer ref (branch/tag/sha) -- leave blank for config/repos.py''s default; override to 163_federationChangeToml on the Naviabheeman fork to test rotation'
+      seeder_repo_ref:
+        description: 'tapyrus-seeder ref (branch/tag/sha) -- leave blank for config/repos.py''s default'
+
+      # --- transaction generation (scripts/generate_traffic.py) ---
+      tx_round_count:
+        description: 'Round-robin send/check/settle cycles to run (3 block-heights and 14 transactions each); also sets the reorg baseline height (tx_round_count + 2) -- see reorg_length. Leave blank for the default -- see README.md''s variable table (defaults live in the env: block below, not restated here to avoid drift).'
+
+      # --- reorg shape ---
+      reorg_length:
+        description: 'Blocks each isolated group builds past the baseline before reconnecting at the tie. How many blocks past this the winning side needs before the reorg actually triggers is no longer an input -- simulate_reorg.py probes for it live, see doc/scripts.md. Leave blank for the default -- see README.md''s variable table.'
+
+      # --- block interval ---
+      round_duration_seconds:
+        description: 'tapyrus-signerd round-duration. Leave blank for the default -- see README.md''s variable table.'
+
+      # --- misc ---
+      network_id:
+        description: 'Tapyrus network id (prod mode -- see doc/work-done.md), used by every core-* node''s rendered tapyrus.conf and the genesis.<id> file tapyrusd looks for. Not yet wired into the seeder (deferred, see the "Bring up tapyrus-seeder" step). Leave blank for the default -- see README.md''s variable table.'
+      slack_log_tail_lines:
+        description: 'Lines of the implicated container''s log to inline in the Slack failure report. Leave blank for the default -- see README.md''s variable table.'
+      docker_build_platform:
+        description: 'Docker --platform for image builds; leave empty for the runner''s native platform'
+
+  # Smoke run for changes to this repo's own scripts/compose/workflow -- proves the
+  # pipeline still works end-to-end without waiting for Sunday's full-scale run to find
+  # out.
+  pull_request:
+    paths-ignore:
+      - 'doc/**'
+  # TEMPORARY: push.branches is '**' (any branch), not just 'main', as a workaround for
+  # this fork's first-time-contributor approval gate blocking pull_request runs while
+  # this PR is still unreviewed -- verifiable by pushing to the PR branch directly, no
+  # merge or approval needed. Once merged, this double-runs: any push to a PR branch in
+  # the base repo fires both pull_request AND push (two identical smoke runs per
+  # commit). Narrow back to `branches: [main]` once merged -- see doc/project-plan.md.
+  push:
+    branches:
+      - '**'
+    paths-ignore:
+      - 'doc/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  # event_name is part of the key so a push-triggered smoke run can't cancel an
+  # in-progress schedule-triggered full-scale run (both would otherwise share the same
+  # github.ref on main).
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # No literal fallback here (unlike the smoke-scale variables below) -- an
+  # unset/blank ref resolves to config/repos.py's own default, the single source of
+  # truth for these three, rather than a second copy of the same value living here.
+  DOCKER_BUILD_PLATFORM: ${{ inputs.docker_build_platform || '' }}
+  CORE_REPO_REF: ${{ inputs.core_repo_ref }}
+  SIGNER_REPO_REF: ${{ inputs.signer_repo_ref }}
+  SEEDER_REPO_REF: ${{ inputs.seeder_repo_ref }}
+  PRNG_SEED_BASE: ${{ github.run_id }}
+  NETWORK_ID: ${{ inputs.network_id || '1905960821' }}
+  CORE_RPC_PORT: '12381'
+  CORE_RPC_USER: 'rpcuser'
+  CORE_RPC_PASS: 'rpcpassword'
+  # Re-sized against the block-production math in doc/work-done.md's "CI timing
+  # budget" note -- see there for the reasoning behind these values.
+  TX_ROUND_COUNT: ${{ inputs.tx_round_count || ((github.event_name == 'pull_request' || github.event_name == 'push') && '10' || '60') }}
+  ROUND_DURATION: ${{ inputs.round_duration_seconds || '30' }}
+  REORG_LENGTH: ${{ inputs.reorg_length || ((github.event_name == 'pull_request' || github.event_name == 'push') && '5' || '30') }}
+  FEDERATION_CHANGE_HEIGHT: ${{ inputs.federation_change_height || ((github.event_name == 'pull_request' || github.event_name == 'push') && '60' || '800') }}
+  MAX_BLOCK_SIZE_NEW: ${{ inputs.max_block_size_new || '2000000' }}
+  SLACK_LOG_TAIL_LINES: ${{ inputs.slack_log_tail_lines || '100' }}
+
+jobs:
+  integration-test:
+    runs-on: ubuntu-latest
+    # Smoke: 3h. Full: 6h. Generous headroom for a cold run's full C++ tapyrus-core
+    # Docker build + a signer image build + a native `cargo build --release` (with its
+    # own vendored GMP build) back to back, on a 2-core runner -- worth re-measuring
+    # against a real run and tightening back down once actual timings are in.
+    timeout-minutes: ${{ (github.event_name == 'pull_request' || github.event_name == 'push') && 180 || 360 }}
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Derive CHAIN_HEIGHT_BEFORE_REORG from TX_ROUND_COUNT
+        # env: block expressions have no arithmetic operators, so this can't just be
+        # a literal `${{ }}` fallback like the other variables -- always
+        # TX_ROUND_COUNT + 2, tying the reorg's baseline height directly to whatever
+        # scripts/generate_traffic.py will actually have produced by the time
+        # scripts/simulate_reorg.py runs, rather than an independently-configured
+        # value that could silently drift out of sync with it.
+        run: echo "CHAIN_HEIGHT_BEFORE_REORG=$((TX_ROUND_COUNT + 2))" >> "$GITHUB_ENV"
+
+      - name: Checkout tapyrus-core + tapyrus-signer + tapyrus-seeder
+        run: ./scripts/checkout_repos.py
+
+      - name: Build tapyrus-core image (tapyrus/tapyrusd:master-local)
+        run: |
+          docker build ${DOCKER_BUILD_PLATFORM:+--platform "$DOCKER_BUILD_PLATFORM"} \
+            -t tapyrus/tapyrusd:master-local -f workdir/tapyrus-core/Dockerfile workdir/tapyrus-core
+      - name: Build tapyrus-signer image (tapyrus-signer:integration-test)
+        run: |
+          docker build ${DOCKER_BUILD_PLATFORM:+--platform "$DOCKER_BUILD_PLATFORM"} \
+            -t tapyrus-signer:integration-test workdir/tapyrus-signer
+      - name: Build tapyrus-seeder image (tapyrus-seeder:integration-test)
+        run: |
+          docker build ${DOCKER_BUILD_PLATFORM:+--platform "$DOCKER_BUILD_PLATFORM"} \
+            -t tapyrus-seeder:integration-test workdir/tapyrus-seeder
+
+      - name: Build tapyrus-setup binary
+        run: cd workdir/tapyrus-signer && cargo build --release
+      - name: Generate signer-set-a aggpubkey (section 4a steps 1-3)
+        run: ./scripts/generate_dev_secrets.py signer-set-a 3 2
+
+      - name: Build unsigned genesis
+        run: |
+          docker run --rm --entrypoint tapyrus-genesis tapyrus/tapyrusd:master-local \
+            -signblockpubkey=$(cat secrets/signer-set-a/aggregated-public-key.txt) \
+            > /tmp/unsigned-genesis.hex
+      - name: Sign genesis
+        run: TAPYRUS_SETUP_THRESHOLD=2 ./scripts/sign_genesis.py signer-set-a /tmp/unsigned-genesis.hex secrets/signer-set-a/genesis.hex
+
+      - name: Render tapyrus.conf
+        run: ./scripts/render_tapyrus_conf.py
+      - name: Bring up redis + 7 core nodes
+        run: |
+          cd docker
+          GENESIS_BLOCK_WITH_SIG=$(cat ../secrets/signer-set-a/genesis.hex) \
+            docker compose up -d redis core-1a core-1b core-2a core-2b core-3a core-3b core-7
+      - name: Wait for topology to converge
+        run: ./scripts/wait_for_topology.py
+      - name: Collect coinbase addresses from each first-layer node
+        run: |
+          ./scripts/collect_coinbase_addresses.py 12381 12383 12385 --output /tmp/addrs.txt
+          printf 'core-1a\ncore-2a\ncore-3a\n' > /tmp/core-rpc-hosts.txt
+      - name: Bring up tapyrus-seeder
+        run: echo "TODO -- image is built above but the seeder service is never started (no docker compose up includes it) and there's no dig-based pass/fail check -- see doc/project-plan.md Milestone 4"
+      - name: Assemble signer configs
+        run: |
+          ROUND_DURATION="$ROUND_DURATION" ./scripts/assemble_signer_configs.py signer-set-a 2 \
+            /tmp/core-rpc-hosts.txt "$CORE_RPC_PORT" "$CORE_RPC_USER" "$CORE_RPC_PASS" redis 6379 /tmp/addrs.txt
+      - name: Bring up signers
+        run: |
+          cd docker
+          GENESIS_BLOCK_WITH_SIG=$(cat ../secrets/signer-set-a/genesis.hex) \
+            docker compose up -d signer-0 signer-1 signer-2
+
+      - name: Generate TPC + colored-coin traffic
+        run: ./scripts/generate_traffic.py "$TX_ROUND_COUNT"
+
+      # - name: Per-node query/stop-restart + max-block-size change
+      #   run: echo "TODO -- not yet scripted -- see doc/project-plan.md Milestone 3/4"
+
+      - name: Reorg
+        run: ./scripts/simulate_reorg.py
+
+      # Still genuinely unbuilt (Milestone 3/4) -- kept commented out.
+      # - name: Generate signer-set-b aggpubkey (offline ceremony)
+      #   run: ./scripts/generate_dev_secrets.py signer-set-b 3 2
+      # - name: Sign off rotation handoff + regenerate federations.toml (both entries)
+      #   run: echo "TODO -- not yet scripted -- see doc/project-plan.md Milestone 3/4"
+
+      # - name: Confirm rotation took effect
+      #   run: echo "TODO -- not yet scripted -- see doc/project-plan.md Milestone 4"
+
+      - name: Collect logs
+        if: always()
+        run: |
+          mkdir -p logs
+          cd docker
+          for c in $(docker compose ps -a --format '{{.Name}}'); do
+            docker logs "$c" > "../logs/$c.log" 2>&1 || true
+          done
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: container-logs
+          path: logs/
+      - name: Teardown
+        if: always()
+        run: cd docker && docker compose down
+
+      # - name: Send Slack report
+      #   if: always()
+      #   run: echo "TODO -- not yet scripted -- see doc/project-plan.md Milestone 4"

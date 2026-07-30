@@ -1,0 +1,7 @@
+/secrets/
+/workdir/
+/runtime/
+/logs/
+/docker/generated/
+__pycache__/
+*.pyc

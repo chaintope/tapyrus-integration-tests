@@ -1,0 +1,169 @@
+# 7-core-node + redis + 3-signer stack --
+#
+# STATUS: verified end-to-end. Brought up for real (all 7 core nodes + redis + 3
+# signer-set-a containers). Two real bugs were found and fixed along the way --
+# see "CONNECT/LISTEN DESIGN" and "COMMAND OVERRIDE" below.
+#
+# CORE IMAGE: uses tapyrus/tapyrusd:master-local, built locally from tapyrus-core's
+# real master branch.
+#
+# Topology (plan doc section 4b):
+#   first layer:  core-1a, core-2a, core-3a  -- each is the RPC target for one signer
+#                 (signer-0 -> core-1a, signer-1 -> core-2a, signer-2 -> core-3a)
+#   second layer: core-1b, core-2b, core-3b  -- each P2P-connected only to its
+#                 corresponding first-layer node
+#   core-7:       P2P-connected to ALL THREE second-layer nodes (core-1b, core-2b,
+#                 core-3b) -- the plan doc's own wording ("any two ... e.g.") only
+#                 specifies two, which would leave core-3a/core-3b as an isolated
+#                 island with no path to the other 5 nodes. Connecting to all three
+#                 keeps the network connected, which the sync/lifecycle/reorg scenario
+#                 steps depend on. Deliberate deviation from the doc's literal wording --
+#                 confirmed with the team, not an oversight.
+#
+# All 7 nodes stay on this one flat compose network (not segmented into separate
+# Docker networks per edge) -- deliberately, per the plan doc, so a future adversary
+# node (connecting P2P to two first-layer nodes) remains buildable without rework.
+#
+# NETWORK/CONF: each core-* node mounts ./generated/tapyrus.conf (gitignored, rendered
+# by scripts/render_tapyrus_conf.py before `docker compose up` -- see the workflow)
+# with networkid=$NETWORK_ID -- see doc/work-done.md.
+#
+services:
+  redis:
+    image: redis:5.0-alpine
+    command: redis-server
+
+  # --- first layer: one per signer, each an RPC target. No -connect needed --
+  # (see "CONNECT/LISTEN DESIGN" above) -- these just accept their -b sibling's
+  # inbound connection via plain default listen=1.
+  core-1a:
+    image: tapyrus/tapyrusd:master-local
+    environment:
+      GENESIS_BLOCK_WITH_SIG: ${GENESIS_BLOCK_WITH_SIG}
+    volumes:
+      - ./generated/tapyrus.conf:/etc/tapyrus/tapyrus.conf
+    ports:
+      - '12381:12381'
+
+  core-2a:
+    image: tapyrus/tapyrusd:master-local
+    environment:
+      GENESIS_BLOCK_WITH_SIG: ${GENESIS_BLOCK_WITH_SIG}
+    volumes:
+      - ./generated/tapyrus.conf:/etc/tapyrus/tapyrus.conf
+    ports:
+      - '12383:12381'
+
+  core-3a:
+    image: tapyrus/tapyrusd:master-local
+    environment:
+      GENESIS_BLOCK_WITH_SIG: ${GENESIS_BLOCK_WITH_SIG}
+    volumes:
+      - ./generated/tapyrus.conf:/etc/tapyrus/tapyrus.conf
+    ports:
+      - '12385:12381'
+
+  # --- second layer: dials its first-layer parent, and re-enables listen=1 --
+  # so core-7 can also dial in to it.
+  core-1b:
+    image: tapyrus/tapyrusd:master-local
+    environment:
+      GENESIS_BLOCK_WITH_SIG: ${GENESIS_BLOCK_WITH_SIG}
+    volumes:
+      - ./generated/tapyrus.conf:/etc/tapyrus/tapyrus.conf
+    command: tapyrusd -datadir=$${DATA_DIR} -conf=$${CONF_DIR}/tapyrus.conf -connect=core-1a -listen=1
+    ports:
+      - '12382:12381'
+
+  core-2b:
+    image: tapyrus/tapyrusd:master-local
+    environment:
+      GENESIS_BLOCK_WITH_SIG: ${GENESIS_BLOCK_WITH_SIG}
+    volumes:
+      - ./generated/tapyrus.conf:/etc/tapyrus/tapyrus.conf
+    command: tapyrusd -datadir=$${DATA_DIR} -conf=$${CONF_DIR}/tapyrus.conf -connect=core-2a -listen=1
+    ports:
+      - '12384:12381'
+
+  core-3b:
+    image: tapyrus/tapyrusd:master-local
+    environment:
+      GENESIS_BLOCK_WITH_SIG: ${GENESIS_BLOCK_WITH_SIG}
+    volumes:
+      - ./generated/tapyrus.conf:/etc/tapyrus/tapyrus.conf
+    command: tapyrusd -datadir=$${DATA_DIR} -conf=$${CONF_DIR}/tapyrus.conf -connect=core-3a -listen=1
+    ports:
+      - '12386:12381'
+
+  # --- node 7: dials all three second-layer nodes; nothing dials into it, so
+  # no -listen=1 override needed here.
+  core-7:
+    image: tapyrus/tapyrusd:master-local
+    environment:
+      GENESIS_BLOCK_WITH_SIG: ${GENESIS_BLOCK_WITH_SIG}
+    volumes:
+      - ./generated/tapyrus.conf:/etc/tapyrus/tapyrus.conf
+    command: >-
+      tapyrusd -datadir=$${DATA_DIR} -conf=$${CONF_DIR}/tapyrus.conf
+      -connect=core-1b -connect=core-2b -connect=core-3b
+    ports:
+      - '12387:12381'
+
+  # --- signer-set-a: RPC target is each signer's first-layer node ----------
+  signer-0:
+    image: tapyrus-signer:integration-test
+    volumes:
+      - ../runtime/signers/node-0:/etc/tapyrus
+    depends_on:
+      - redis
+      - core-1a
+
+  signer-1:
+    image: tapyrus-signer:integration-test
+    volumes:
+      - ../runtime/signers/node-1:/etc/tapyrus
+    depends_on:
+      - redis
+      - core-2a
+
+  signer-2:
+    image: tapyrus-signer:integration-test
+    volumes:
+      - ../runtime/signers/node-2:/etc/tapyrus
+    depends_on:
+      - redis
+      - core-3a
+
+  # --- tapyrus-seeder: Crawls the network starting from core-1a and serves the resulting
+  # address list over DNS. -i/-s hardcode 1905960821 (not wired to NETWORK_ID -- the
+  # seeder service is never actually brought up yet, see the workflow's "Bring up
+  # tapyrus-seeder" TODO step; wire it in once that lands). -s's port is 2357, prod
+  # mode's default P2P port (confirmed against a real container's "Bound to
+  # 0.0.0.0:2357" log line) -- NOT core-*'s rpcport (12381/83/85). See
+  # render_tapyrus_conf.py and doc/work-done.md for why core-* has no explicit `port=`
+  # override: -connect=<service-name> (no port suffix) resolves against the chain's
+  # default P2P port too, so both sides have to agree on that same default, not a
+  # value pinned here or in the conf.
+  # entrypoint is fully overridden below rather than appended to,
+  # since this image's ENTRYPOINT is a plain JSON-array exec form (no bash -c wrapper
+  # like tapyrusd's, so no COMMAND OVERRIDE gotcha here). -h/-n/-m are placeholder
+  # values -- harmless, since nothing outside this compose network ever queries them.
+  seeder:
+    image: tapyrus-seeder:integration-test
+    entrypoint:
+      - tapyrusseed
+      - -i
+      - '1905960821'
+      - -s
+      - '1905960821:core-1a:2357'
+      - -h
+      - seed.tapyrus-integration-tests.local
+      - -n
+      - ns.tapyrus-integration-tests.local
+      - -m
+      - test.tapyrus-integration-tests.local
+    ports:
+      - '5390:53/udp'
+      - '5390:53/tcp'
+    depends_on:
+      - core-1a
