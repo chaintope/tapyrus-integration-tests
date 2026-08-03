@@ -173,9 +173,6 @@ Everything not yet implemented or not yet testable, in one place:
   the balance-shortfall top-up mechanic would trigger much more often.
 - **Team review/sign-off** on the design in `weekly-integration-test-plan.md`.
 - **Slack webhook URL** provisioned as a GitHub Actions secret.
-- **GitHub-hosted `ubuntu-latest` runner's CPU/disk sufficiency is unconfirmed** for 7
-  core nodes + 3 signers + redis + seeder running concurrently -- may need
-  self-hosted.
 - **Core-node RPC auth** is the static `rpcuser`/`rpcpassword` (hardcoded in
   `scripts/render_tapyrus_conf.py`, `CORE_RPC_USER`/`CORE_RPC_PASS` in the workflow's
   `env:` block, and every script that calls `CoreRpcClient`) -- switching to cookie

@@ -13,9 +13,6 @@ tested), and [`scripts.md`](scripts.md) for what each script does.
 
 ## Known issues (open)
 
-- **GitHub-hosted `ubuntu-latest` runner's CPU/disk sufficiency is unconfirmed** for 7
-  core nodes + 3 signers + redis + seeder running concurrently -- may need
-  self-hosted.
 - **CI timing budget is bounded by GitHub-hosted's 6h hard cap**, which can't be
   raised past regardless of `timeout-minutes`. Block production only comes from the
   live signer round-robin at `ROUND_DURATION` cadence (no instant-mining shortcut),
@@ -32,10 +29,6 @@ tested), and [`scripts.md`](scripts.md) for what each script does.
   the count means redesigning the topology, not just passing a different number.
 - **Scenario mechanics not yet built** (see `project-plan.md`'s Outstanding work for
   the tracked list): per-node lifecycle orchestrator.
-- **Planned runner-matrix expansion**: once CI is stable on a single `ubuntu-latest`
-  runner, add macOS (native arm64) and x86_64 nodes to the runner mix, so each
-  platform builds natively instead of relying on `DOCKER_BUILD_PLATFORM`-forced QEMU
-  emulation on a mismatched runner architecture.
 - **`scripts/generate_traffic.py`'s hardcoded constants worth revisiting eventually**:
   `FUNDING_AMOUNT_TPC`/`TOKEN_ISSUE_AMOUNT`/etc. were picked conservatively and work
   fine at small round counts, but haven't been stress-tested at a larger round count
@@ -51,14 +44,13 @@ tested), and [`scripts.md`](scripts.md) for what each script does.
   `_run_setup`/`extract_vss_for`/`require_executable` across scripts, and a shared
   `docker compose` service-control module (`scripts/lib/compose.py`) rather than each
   script owning its own subprocess helper.
-- **Reorg mechanic**: forced via federation rotation (a second, disjoint signer set
-  signs off on the handoff via `--xfield`), not a network partition -- a genuine
-  two-sided fork built by two isolated groups independently threshold-signing their
-  own blocks from a common tip, then reconnected. `scripts/simulate_reorg.py` drives
-  this via strict alternation: only one group's core nodes are ever up and building
-  at a time (never both, until the final reconnect), so neither side can influence or
-  observe the other's blocks while forking. See the script's own module docstring for
-  the exact step sequence.
+- **Reorg mechanic**: genuine network isolation, within the current federation (no
+  rotation involved) -- `scripts/simulate_reorg.py` drives this via strict
+  alternation: only one group's core nodes are ever up and building at a time (never
+  both, until the final reconnect), so the same signer set independently
+  threshold-signs two genuinely different forks from a common tip, each isolated
+  group unable to influence or observe the other's blocks while forking. See the
+  script's own module docstring for the exact step sequence.
 - **`tapyrus-genesis` invocation in CI**: runs via
   `docker run --rm --entrypoint tapyrus-genesis` against the already-built
   `tapyrus/tapyrusd:master-local` image, bypassing the image's own `entrypoint.sh`
@@ -74,8 +66,8 @@ tested), and [`scripts.md`](scripts.md) for what each script does.
   `scripts/render_tapyrus_conf.py` renders a prod-mode conf (no `-dev` on the
   `tapyrus-genesis` call either -- prod is simply what you get by omitting `-dev`)
   with `networkid=$NETWORK_ID`, mounted into all 7 core-* services. Not wired into the
-  seeder -- it isn't brought up by any `docker compose up` invocation yet at all (see
-  `project-plan.md`'s Outstanding work).
+  seeder's own `-i`/`-s` flags, which stay hardcoded to `1905960821` regardless of
+  `NETWORK_ID` (see `docker-compose.yml`'s own `seeder` comment).
 - **P2P topology relies on the chain's default port, not an explicit `port=`**:
   `docker/docker-compose.yml`'s `-connect=<service-name>` targets have no explicit
   port, and `tapyrus-core` resolves a portless `-connect` against the *chain's own
@@ -96,47 +88,31 @@ tested), and [`scripts.md`](scripts.md) for what each script does.
   orphan real transactions), and `mempoolexpiry=2` (hours; 336h/2-week default targets
   a long-running production node, not a several-hour CI job).
 - **`generate_traffic.py`'s round-count-only design**: everything (block-height
-  budget, transaction count) derives from one number, `tx_round_count`, rather than
-  independent knobs for total tx count and send interval. Earlier drafts had a
-  separate `tx_interval_seconds` (pacing between sends from the same node) and
-  `tx_total_count` -- both dropped once the design settled on exactly one send per
-  node per round: with no sequence of same-node sends within a round, there's nothing
-  left for an interval to pace, and the total is just `round_count * 14` (7 nodes x
-  {TPC, colored}) by construction, so a separate total would only ever have to agree
-  with that derived number or drift from it.
-- **Colored-coin balance shortfall mints instead of skipping**: rather than issue
-  every node's full lifetime token supply once at the start (all colored-coin
-  activity then front-loaded into one phase, nothing but transfers for the rest of
-  the run), each node only ever holds a small working balance
-  (`TOKEN_ISSUE_AMOUNT`/`TOKEN_TOPUP_AMOUNT` = 3). A round where the sender doesn't
-  have enough issues/reissues more instead of transferring -- still exactly one
-  transaction for that node, so total tx count per round stays fixed at 14 regardless
-  of how many nodes hit a shortfall that round. This is also why NFT nodes (forced to
-  `value=1`) end up minting a fresh NFT color on almost every other round -- expected,
-  not a bug: they transfer their one unit away, then have zero until the next mint.
-- **Top-up timing needs no cross-round lookahead**: an earlier draft of this design
-  considered checking one round ahead (during round K's settle phase, top up for
-  round K+1's send) specifically to avoid a same-round top-up-then-spend needing to
-  chain onto its own unconfirmed output. Dropped once the source read showed
-  `issuetoken`'s NON_REISSUABLE/NFT path selects its input UTXO explicitly
-  (`coin_control.Select(out)`) and only checks `IsMine(...) == ISMINE_SPENDABLE` -- no
-  confirmation-depth check -- so spending a same-round unconfirmed self-send is
-  expected to work, confirmed live in the local E2E run. A shortfall now just
-  substitutes a mint for that round's transfer, with no phase held back a round to
-  accommodate it.
+  budget, transaction count) derives from one number, `tx_round_count` -- exactly one
+  send per node per round, so the total is always `round_count * 14` (7 nodes x
+  {TPC, colored}) by construction, with no separate total/interval knob to drift from
+  that.
+- **Colored-coin balance shortfall mints instead of skipping**: each node only ever
+  holds a small working balance (`TOKEN_ISSUE_AMOUNT`/`TOKEN_TOPUP_AMOUNT` = 3). A
+  round where the sender doesn't have enough issues/reissues more instead of
+  transferring -- still exactly one transaction for that node, so total tx count per
+  round stays fixed at 14 regardless of how many nodes hit a shortfall. NFT nodes
+  (forced to `value=1`) mint a fresh NFT color on almost every other round as a
+  result -- expected, not a bug: they transfer their one unit away, then have zero
+  until the next mint.
+- **Top-up timing needs no cross-round lookahead**: `issuetoken`'s NON_REISSUABLE/NFT
+  path selects its input UTXO explicitly (`coin_control.Select(out)`) and only checks
+  `IsMine(...) == ISMINE_SPENDABLE` -- no confirmation-depth check -- so a same-round
+  top-up-then-spend chaining onto its own unconfirmed output works fine.
 - **Per-transaction fee tracked via `gettransaction`, not predicted**: the ledger's
   TPC bookkeeping reads each transaction's actual fee back from `gettransaction`
-  right after broadcasting it, rather than trying to predict it from a fee rate and
-  an assumed tx size. Fee-rate-based prediction would have needed tx vsize to be
-  near-constant across every transaction shape this script produces (plain TPC send,
-  colored transfer, REISSUABLE's 2-tx issuance, NON_REISSUABLE/NFT's single-tx
-  issuance) to stay accurate -- reading the real fee sidesteps needing that
-  assumption to hold at all.
+  right after broadcasting it, rather than predicting it from a fee rate and assumed
+  tx size -- sidesteps needing tx vsize to stay near-constant across this script's
+  several different transaction shapes.
 - **`generate_traffic.py` seeds its ledger from each node's real on-chain balance**
-  at startup (`getbalance`), rather than assuming every node starts at `0.0` -- the
-  workflow runs this script multiple times in the same job (before and after the
-  reorg/rotation steps), so a node can genuinely carry a non-zero balance into a
-  later invocation.
+  at startup (`getbalance`) -- the workflow runs this script multiple times in the
+  same job (before and after the reorg/rotation steps), so a node can genuinely
+  carry a non-zero balance into a later invocation.
 - **`core-1a`/`2a`/`3a`'s TPC balance can't be predicted by the traffic-generation
   ledger, and that's expected, not a bug**: these 3 nodes are each credited a fresh
   50 TPC `"generate"`-category transaction every time they propose a block as that
@@ -170,10 +146,6 @@ tested), and [`scripts.md`](scripts.md) for what each script does.
   invocation and appends its own flags.
 - **`tapyrus-setup createkey` always produces mainnet-prefixed WIFs** (`K`/`L`,
   `0x80`), unlike tapyrus-core's own `-dev` network convention (`c` prefix, `0xef`).
-- **On macOS, building tapyrus-signer outside Docker also needs
-  `brew install gmp` + `LIBRARY_PATH=/opt/homebrew/lib`** for the linker to find the
-  system `libgmp` a transitive dependency wants (separate from the vendored
-  `gmp-mpfr-sys` build).
 - **A benign warning, any `round-duration`**: a non-master signer's own `submitblock`
   call occasionally races a block another signer already submitted, and
   tapyrus-core's `"duplicate"` string response doesn't match what the Rust client's
@@ -188,8 +160,7 @@ tested), and [`scripts.md`](scripts.md) for what each script does.
   shot**: a container reported "running" only means the process started, not that
   `tapyrusd`'s RPC server has finished initializing. `scripts/collect_coinbase_addresses.py`
   retries each node via `lib/rpc.py`'s `RpcUnreachable` until it answers (or times out
-  loudly) and raises on an empty address instead of writing one. All of the real,
-  exercisable retry paths are now confirmed live -- see `project-plan.md`.
+  loudly) and raises on an empty address instead of writing one.
 - **`RPC_IN_WARMUP` (-28) is a real, common state to retry through, not just
   connection-refused/timeout**: `tapyrusd` serves `-28` as HTTP 500 with a JSON-RPC
   error body, which is exactly the readiness window right after `docker compose up`.
@@ -199,33 +170,20 @@ tested), and [`scripts.md`](scripts.md) for what each script does.
   error. A bad-credentials 401 has no response body at all
   (`HTTPReq_JSONRPC`'s auth-failure path calls `WriteReply` with no body argument) --
   doesn't crash the JSON parse.
-- **`workflow_dispatch` inputs have no `default:`**: every default used to be written
-  twice -- once as the input's `default:`, once as the `env:` block's `|| 'literal'`
-  fallback -- a real drift risk if one got updated without the other (flagged in PR
-  review). `workflow_dispatch.inputs.*.default` can't hold an expression, and
-  `schedule`/`pull_request`/`push` runs have no `inputs` context at all, so there was
-  no way to make `env:` read the input's declared default programmatically -- the
-  literal had to live somewhere outside the input either way. Chose to remove it from
-  the input side rather than the env side: `env:` keeps `inputs.x || 'literal'` as the
-  one place each default is written, and every input's `description:` now states its
-  default in words instead. A manual dispatch run left blank resolves to the exact
-  same value `schedule` uses -- the only visible change is the dispatch form showing
-  blank fields instead of pre-filled ones.
-- **`pull_request`/`push` smoke trigger, scoped to this repo's own changes**: added so
-  a change to `scripts/**`, `docker/**`, `config/**`, or the workflow itself is
-  validated before merge, not just discovered on the following Sunday's scheduled
-  run. This is deliberately read as a different concern from
-  `weekly-integration-test-plan.md` section 6's "not on every PR" non-goal: that
-  non-goal is about running the full-scale scenario against every PR opened on
-  `tapyrus-core`/`tapyrus-signer` (cost/runtime prohibitive), not about validating
-  this repo's own, rarely-changing PRs. The smoke trigger runs the identical job at
-  reduced scale (`reorg_length`, `tx_round_count` drop to smaller fallbacks, keyed off
-  `github.event_name` since `pull_request`/`push` runs have no `inputs` context --
-  neither `chain_height_before_reorg` nor `federation_change_height` is in that list;
-  both are always derived from another variable, so they shrink along with it
-  automatically) and a shorter `timeout-minutes` (180 vs. 360). Confirmed working on a
-  real `pull_request`-triggered run, not just locally-simulated env vars -- see
-  `project-plan.md`.
+- **`workflow_dispatch` inputs have no `default:`**: `workflow_dispatch.inputs.*.default`
+  can't hold an expression, and `schedule`/`pull_request`/`push` runs have no `inputs`
+  context at all -- so every default lives in the `env:` block's `inputs.x || 'literal'`
+  fallback instead (the one place each is written, avoiding the drift risk of writing
+  it twice), with each input's `description:` stating its default in words. A manual
+  dispatch run left blank resolves to the exact same value `schedule` uses.
+- **`pull_request`/`push` smoke trigger, scoped to this repo's own changes**: a change
+  to `scripts/**`, `docker/**`, `config/**`, or the workflow itself is validated before
+  merge, not just discovered on the following Sunday's scheduled run -- a different
+  concern from `weekly-integration-test-plan.md` section 6's "not on every PR"
+  non-goal (that's about the full-scale scenario against `tapyrus-core`/`tapyrus-signer`
+  PRs, cost/runtime prohibitive). Runs the identical job at reduced scale, keyed off
+  `github.event_name` since these triggers have no `inputs` context, and a shorter
+  `timeout-minutes` (180 vs. 360).
 - **`CHAIN_HEIGHT_BEFORE_REORG`/`FEDERATION_CHANGE_HEIGHT` are floors/offsets, not
   literal targets**: `CHAIN_HEIGHT_BEFORE_REORG` is always `TX_ROUND_COUNT + 2`, and
   `simulate_reorg.py`'s `_build_baseline` waits until the chain reaches at least that
@@ -241,15 +199,11 @@ tested), and [`scripts.md`](scripts.md) for what each script does.
   case in CI) -- every log write in `scripts/lib/log.py` uses `flush=True` so output
   interleaves correctly with subprocess output.
 - **Core network topology**: enforced entirely via `-connect=`, all 7 nodes on one
-  flat Docker network (not segmented per edge), so a planned future adversary-node
-  extension (connecting P2P to two first-layer nodes) remains buildable without
-  rework.
-- **`tapyrus-seeder` genuinely bootstraps a new node in this scenario now**
-  (`scripts/verify_seeder.py`) -- container DNS handles peer discovery for the fixed
-  7-node topology itself (nothing there depends on the seeder), but the seeder is no
-  longer just included for its own standalone coverage: a brand-new 8th node with no
-  hardcoded topology knowledge discovers and connects to the network entirely through
-  it.
+  flat Docker network, not segmented per edge.
+- **`tapyrus-seeder` genuinely bootstraps a new node** (`scripts/verify_seeder.py`):
+  a brand-new 8th node with no hardcoded topology knowledge discovers and connects to
+  the network entirely through it. Container DNS handles peer discovery for the fixed
+  7-node topology itself -- nothing there depends on the seeder.
 - **Secrets scope**: this repo only ever generates local dev secrets
   (`generate_dev_secrets.py`); it never provisions real GitHub secrets. The only
   actual CI secret needed is the Slack webhook URL.
@@ -355,6 +309,10 @@ tested), and [`scripts.md`](scripts.md) for what each script does.
 
 ## Developer notes
 
+- **Building `tapyrus-signer` outside Docker on macOS** also needs
+  `brew install gmp` + `LIBRARY_PATH=/opt/homebrew/lib`, for the linker to find the
+  system `libgmp` a transitive dependency wants (separate from the vendored
+  `gmp-mpfr-sys` build).
 - **Configuring the Slack webhook** (`scripts/send_slack_report.py`,
   `SLACK_WEBHOOK_URL`): Slack webhooks are per-app, not per-workspace, so this needs
   a one-time setup, not just a repo secret:
@@ -415,4 +373,7 @@ successfully:
 [run](https://github.com/chaintope/tapyrus-integration-tests/actions/runs/30790964795/job/91614204236).
 This also confirms the smoke trigger's `inputs.<name> || (...)` fallback expressions
 evaluate correctly on a real `pull_request` event, closing the one open question
-local testing couldn't exercise (`on:` trigger behavior).
+local testing couldn't exercise (`on:` trigger behavior). It also settles the
+GitHub-hosted `ubuntu-latest` runner's capacity for this workload -- 7 core nodes +
+3 signers + redis ran concurrently on a real hosted runner with no resource
+problems, so that no longer needs to be tracked as an open question.
