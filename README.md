@@ -63,14 +63,17 @@ A single `integration-test` job runs these steps in order:
 10. **Max block size change**: signer-set-b signs off on a new max-block-size via the
     same `--xfield` flow, confirmed in effect via RPC at the scheduled height
     (`scripts/simulate_maxblocksize_change.py`).
-11. **Bring up tapyrus-seeder** and confirm it resolves a real peer via `dig`
-    *(image is built, but the service itself is never started -- see
-    `doc/project-plan.md`'s Outstanding work)*.
+11. **Bring up tapyrus-seeder** and verify it end-to-end (`scripts/verify_seeder.py`):
+    confirms it reports only genuinely-listening nodes (never `core-7`, the one node
+    that doesn't listen in this topology), then brings up a brand-new 8th node with
+    no `-connect` at all and confirms it genuinely auto-bootstraps onto the network
+    through the seeder's DNS answer alone.
 12. **Teardown**: collect every container's logs, upload them as a CI artifact, then
     `docker compose down` -- runs unconditionally (`if: always()`).
 13. **Slack report**: pass/fail summary, run metadata, both aggpubkeys, and (on failure)
-    the implicated container's tail log, sent unconditionally *(not yet scripted -- see
-    `doc/project-plan.md`'s Outstanding work)*.
+    the tail of any container log matching an error/panic pattern, sent unconditionally
+    (`scripts/send_slack_report.py`) -- skips gracefully (not a failure) if
+    `SLACK_WEBHOOK_URL` isn't provisioned.
 
 The entire scenario above (steps 1-10) has run successfully end-to-end in real GitHub
 Actions CI, not just locally -- see `doc/work-done.md`'s "Full real-CI end-to-end
@@ -111,6 +114,7 @@ input; the rest fall back straight to their `env:` literal on every trigger,
 | `round_duration_seconds` | `30` | `tapyrus-signerd` round-duration (block interval) -- verified clean, see `doc/work-done.md`'s Lessons learnt (`10` is confirmed to hit transient `InvalidBlock` errors) |
 | `network_id` | `1905960821` | Tapyrus network id (prod mode, see `doc/work-done.md`), used by every core-* node's rendered `tapyrus.conf` and the `genesis.<id>` file `tapyrusd` looks for |
 | `slack_log_tail_lines` | `100` | Lines of the implicated container's log inlined in the Slack failure report |
+| `slack_webhook_url` | see `SLACK_WEBHOOK_URL` repo secret | Slack incoming webhook to post the pass/fail report to -- the only variable here whose default is a real GitHub secret, not a literal, since `secrets.*` (unlike `inputs.*`) is readable on every trigger including `schedule`/`pull_request`/`push` |
 | `docker_build_platform` | *(empty, runner-native)* | Docker `--platform` for image builds -- local verification only ever used `linux/arm64` |
 
 `FEDERATION_CHANGE_HEIGHT` is always `REORG_LENGTH` (computed by the "Derive

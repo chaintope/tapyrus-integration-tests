@@ -189,9 +189,9 @@ just string formatting and a file write, nothing to overlap.
   production-node defaults for a small, short-lived, closed-topology test chain (7
   fixed peers, a handful of blocks, a run measured in hours not weeks).
 - **Known limitation**: not wired into the `seeder` service's `-i`/`-s` flags (still
-  hardcoded to `1905960821` in `docker/docker-compose.yml`) -- deliberately, since the
-  seeder isn't brought up by any `docker compose up` invocation yet at all (see
-  `project-plan.md` Milestone 4).
+  hardcoded to `1905960821` in `docker/docker-compose.yml`) -- the seeder is brought
+  up and verified now (`scripts/verify_seeder.py`), this specific value just hasn't
+  been made configurable yet.
 
 ## `scripts/assemble_signer_configs.py`
 
@@ -463,10 +463,69 @@ Implemented as `MaxBlockSizeChangeSimulator`, reusing `simulate_federation_chang
 - **Active in the workflow** as "Max block size change" -- uncommented after a
   confirmed real run.
 
+## `scripts/verify_seeder.py`
+
+Brings up the `seeder` service and verifies it end-to-end: not just that `dig`
+resolves something, but that it only ever reports genuinely-listening nodes, and
+that a brand-new node can actually auto-bootstrap onto the network through it.
+Implemented as `SeederVerifier`. See `doc/work-done.md`'s Lessons learnt for the
+full investigation behind why this needed a custom Docker subnet, a reduced crawler
+thread count, and a two-part check rather than a single `dig` call.
+
+- **Usage**: `./scripts/verify_seeder.py` (no arguments -- reads `CORE_RPC_USER` /
+  `CORE_RPC_PASS` from the environment).
+- Requires the 7-node topology and signer-set-a already up and converged (same
+  precondition as `generate_traffic.py`).
+- **Check 1 -- only listening nodes served**: polls the seeder's DNS
+  (`seed.tapyrus-integration-tests.local`, port 5390) until the returned address set
+  stabilizes on exactly the 6 nodes that listen in this topology
+  (`core-1a`/`1b`/`2a`/`2b`/`3a`/`3b`) -- `core-7` is seeded too, deliberately, as a
+  real negative case (it never listens, see `docker-compose.yml`'s "CONNECT/LISTEN
+  DESIGN" note), and can legitimately appear in the response transiently before the
+  seeder's reliability-vetted "good" set stabilizes, but never once it has.
+- **Check 2 -- a new node auto-bootstraps for real**: brings up `seeder-test-node`
+  (`docker-compose.yml`) -- an 8th `tapyrus-core` node with no `-connect` at all,
+  configured only with `-addseeder=<seed-hostname>` and its container DNS resolver
+  pointed at the seeder itself (`SEEDER_IP`, resolved via `docker inspect`). Polls
+  its own `getpeerinfo` until it shows a peer, then confirms that peer is one of the
+  6 listening nodes.
+- **Output**: none written to disk -- verification results are logged; a mismatch
+  at either check raises `SeederVerificationError` (non-zero exit).
+- **Active in the workflow** as "Bring up tapyrus-seeder and verify it".
+
+## `scripts/send_slack_report.py`
+
+Sends a pass/fail summary of the run to Slack via an incoming webhook, called
+unconditionally (`if: always()`) as the very last workflow step. Plain synchronous
+script (a single HTTP POST -- nothing to overlap, same reasoning as
+`assemble_signer_configs.py`'s own non-`asyncio` design).
+
+- **Usage**: `./scripts/send_slack_report.py <pass|fail>` -- the workflow passes
+  `${{ job.status }}` mapped to `pass`/`fail`.
+- **`SLACK_WEBHOOK_URL` env var** -- if unset or blank, logs a warning and exits 0
+  rather than failing the job just because the webhook hasn't been provisioned yet.
+  See `doc/work-done.md`'s Developer notes for how to obtain and configure one.
+- **Message contents**: pass/fail, trigger (`GITHUB_EVENT_NAME`), run duration (via
+  `RUN_STARTED_AT`, set by an early workflow step), repo refs, both aggpubkeys (if
+  present), and on failure the tail (`SLACK_LOG_TAIL_LINES`) of any container log
+  under `logs/*.log` containing a case-insensitive "error"/"panic" match -- not a
+  precise per-step fault attribution (this is one sequential job, not one step per
+  container), just a real, honest heuristic over what the "Collect logs" step
+  already wrote.
+- **Known limitation**: a failed Slack POST is logged, not raised -- deliberately,
+  since this is the very last step and a notification failure shouldn't retroactively
+  fail an otherwise-passing run.
+- **Verified structurally**, not against a real Slack channel (none available) --
+  against a local mock HTTP listener: both message formats, the implicated-container
+  detection, and the graceful no-webhook skip all confirmed live.
+
 ## `docker/docker-compose.yml`
 
 Not a script, but the other piece every scenario run depends on -- the 7-core-node +
 `redis` + 3-signer + `seeder` stack described in `weekly-integration-test-plan.md`
-section 4b. Brought up in two stages (core nodes first, to mint coinbase addresses;
-signers second, once `assemble_signer_configs.py` has consumed those addresses) -- see
-the root `README.md`'s CI step 5.
+section 4b, on a custom subnet (`51.51.51.0/24`, not Docker's own default bridge
+range -- see `doc/work-done.md`'s Lessons learnt for why that's required at all).
+Brought up in two stages (core nodes first, to mint coinbase addresses; signers
+second, once `assemble_signer_configs.py` has consumed those addresses) -- see the
+root `README.md`'s CI step 5. Also defines `seeder-test-node`, a throwaway 8th node
+brought up only by `scripts/verify_seeder.py`, not part of the normal scenario.

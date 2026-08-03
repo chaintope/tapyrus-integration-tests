@@ -31,23 +31,7 @@ tested), and [`scripts.md`](scripts.md) for what each script does.
   7-node topology in `docker-compose.yml` is wired 1:1 to exactly 3 signers; changing
   the count means redesigning the topology, not just passing a different number.
 - **Scenario mechanics not yet built** (see `project-plan.md`'s Outstanding work for
-  the tracked list): per-node lifecycle orchestrator, Slack report, `tapyrus-seeder`
-  actually brought up as a running service.
-- **`tapyrus-setup`'s offline `--xfield sign`/`computesig` rejected a fresh, otherwise
-  valid signature with `InvalidSig` roughly half the time** -- confirmed via repeated
-  isolated trials (2/6 accepted, all 3 verifying nodes always agreeing, so it was the
-  signature itself, not a per-node view difference). Root cause: `Sign::format_signature`
-  (`sign.rs`) encoded a signature's `v` point as only its x-coordinate, discarding the
-  y-parity entirely, before it was re-parsed back into a point on the
-  `federation_watcher.rs` verification side (`multi_party_signature_from_hex`) --
-  whichever y the reconstruction assumed only matched the original half the time. (An
-  earlier theory -- that the positive/negative Schnorr share selection in
-  `crypto/vss.rs` is re-derived inconsistently across the separate `sign`/`computesig`
-  process invocations -- was tested and ruled out: 60/60 fresh ceremony rounds against
-  the real `tapyrus-setup` binary verified correctly, and that selection is a pure
-  function of public VSS commitment data, identical across every process by
-  construction.) This was a `tapyrus-signer` bug, not this repo's scripts; fixed
-  upstream.
+  the tracked list): per-node lifecycle orchestrator.
 - **Planned runner-matrix expansion**: once CI is stable on a single `ubuntu-latest`
   runner, add macOS (native arm64) and x86_64 nodes to the runner mix, so each
   platform builds natively instead of relying on `DOCKER_BUILD_PLATFORM`-forced QEMU
@@ -195,9 +179,6 @@ tested), and [`scripts.md`](scripts.md) for what each script does.
   tapyrus-core's `"duplicate"` string response doesn't match what the Rust client's
   JSON deserializer expects (`invalid type: string "duplicate", expected unit`).
   Harmless -- the block was already accepted through the other path.
-- **`round-duration=60` avoids transient `InvalidBlock`/"candidate block is not set"
-  errors around round boundaries** that a shorter duration (e.g. 10) hits.
-  `round-duration=30` also verified clean (zero `InvalidBlock` errors, real local run).
 - **`createnodevss`/`createblockvss` output ordering**: output lines
   (`<receiver_pubkey>:<vss_hex>`) are sorted by receiver pubkey (BTreeMap iteration in
   the Rust source), NOT by `--public-key` argument order -- extracting by line
@@ -263,12 +244,143 @@ tested), and [`scripts.md`](scripts.md) for what each script does.
   flat Docker network (not segmented per edge), so a planned future adversary-node
   extension (connecting P2P to two first-layer nodes) remains buildable without
   rework.
-- **`tapyrus-seeder` is included** for its own integration coverage even though
-  nothing in the v1 scenario actually depends on it for peer discovery (container DNS
-  already handles that).
+- **`tapyrus-seeder` genuinely bootstraps a new node in this scenario now**
+  (`scripts/verify_seeder.py`) -- container DNS handles peer discovery for the fixed
+  7-node topology itself (nothing there depends on the seeder), but the seeder is no
+  longer just included for its own standalone coverage: a brand-new 8th node with no
+  hardcoded topology knowledge discovers and connects to the network entirely through
+  it.
 - **Secrets scope**: this repo only ever generates local dev secrets
   (`generate_dev_secrets.py`); it never provisions real GitHub secrets. The only
   actual CI secret needed is the Slack webhook URL.
+
+## Lessons learnt
+
+- **`tapyrus-setup`'s offline `--xfield sign`/`computesig` rejected a fresh, otherwise
+  valid signature with `InvalidSig` roughly half the time** -- confirmed via repeated
+  isolated trials (2/6 accepted, all 3 verifying nodes always agreeing, so it was the
+  signature itself, not a per-node view difference). Root cause: `Sign::format_signature`
+  (`sign.rs`) encoded a signature's `v` point as only its x-coordinate, discarding the
+  y-parity entirely, before it was re-parsed back into a point on the
+  `federation_watcher.rs` verification side (`multi_party_signature_from_hex`) --
+  whichever y the reconstruction assumed only matched the original half the time. (An
+  earlier theory -- that the positive/negative Schnorr share selection in
+  `crypto/vss.rs` is re-derived inconsistently across the separate `sign`/`computesig`
+  process invocations -- was tested and ruled out: 60/60 fresh ceremony rounds against
+  the real `tapyrus-setup` binary verified correctly, and that selection is a pure
+  function of public VSS commitment data, identical across every process by
+  construction.) This was a `tapyrus-signer` bug, not this repo's scripts; fixed
+  upstream.
+- **`round-duration=60` avoids transient `InvalidBlock`/"candidate block is not set"
+  errors around round boundaries** that a shorter duration (e.g. 10) hits.
+  `round-duration=30` also verified clean (zero `InvalidBlock` errors, real local run).
+
+- **How `tapyrus-seeder` actually discovers nodes, and why it took several real,
+  live-tested wrong turns to get a working setup** (`docker-compose.yml`'s `seeder`
+  service, `scripts/verify_seeder.py`):
+
+  1. **DNS-seed crawling isn't peer-to-peer gossip -- it's a direct, per-address
+     liveness test.** `tapyrusseed`'s `-s <networkid>:<host>:<port>` flags (repeatable
+     -- `main.cpp`'s parsing just appends each to a vector, confirmed from source) seed
+     an initial candidate list. A pool of crawler threads (`-t`, default 96) each pull
+     candidates from that list (`db.cpp`'s `CAddrDb::Get_`/`GetMany`) and directly
+     TCP-connect + VERSION/VERACK handshake + `getaddr` each one (`tapyrus.cpp`'s
+     `CNode::Run`/`TestNode`) -- a real connection attempt per address, not a
+     lightweight ping.
+  2. **Crawling from just one node (`core-1a`) doesn't work in this topology.**
+     Confirmed live: `core-1a` completes a real handshake with the seeder and answers
+     every other message, but never sends an `addr` response to its `getaddr`.
+     Root cause, from `tapyrus-core`'s `net_processing.cpp`: the `GETADDR` handler
+     replies from `connman->GetAddresses()` -- i.e. the responding node's OWN addrman
+     -- and `core-1a`'s addrman is empty. Nodes in this fixed `-connect` topology never
+     auto-add an inbound peer's source address, and with every node's own addrman
+     similarly empty, there's nothing for the normal ADDR-relay gossip to ever
+     propagate in the first place. Fixed by seeding the crawler directly from every
+     node's own address (`-s` once per node) instead of relying on gossip/discovery
+     to find the rest from one entry point.
+  3. **A single successful test isn't enough to be servable via DNS.** `tapyrus-seeder`
+     only serves addresses from its small, reliability-vetted "good" set once one
+     exists per address -- `db.cpp`'s `CAddrInfo::IsGood()` requires 3+ successful
+     tests, each at least `MIN_RETRY` (60s) apart. Before that threshold is reached for
+     any address, `GetIPs_` falls back to handing out exactly one arbitrary address
+     from `ourId` (which tracks every address ever ATTEMPTED, good or bad, not just
+     successes) -- so a node that's expected to always fail (`core-7`, seeded
+     deliberately as a real negative case -- it never listens in this topology, see
+     `docker-compose.yml`'s "CONNECT/LISTEN DESIGN" note) can legitimately be that one
+     arbitrary answer for a while, before the good set stabilizes. Confirmed via a
+     debug-instrumented build of the real `tapyrus-seeder` binary (its own existing
+     `// printf` diagnostics, just commented out -- uncommented, rebuilt, and watched a
+     real GOOD/BAD/RECV trace for every seeded address).
+  4. **The default thread count (96) actively fights small test networks.** With only
+     6-7 addresses total, 96 crawler threads spend almost all their time idle, and
+     `main.cpp`'s idle-retry backoff scales with thread count
+     (`rand() % (500 * nThreads)`) -- at 96 threads that's up to ~48 real seconds of
+     random sleep before a thread even looks for new work again, on top of `db.cpp`'s
+     own 60s `MIN_RETRY` per address. Confirmed live this meant addresses sat idle far
+     longer than necessary between retest attempts. Turned down to `-t 2` -- still far
+     more concurrency than 6-7 addresses need, but with a idle-backoff ceiling of a few
+     seconds instead of most of a minute.
+  5. **Neither `tapyrus-seeder` nor `tapyrus-core` will ever treat a private/internal
+     address as usable, full stop -- not slowly, not eventually, never.** Every
+     container in this stack gets a Docker-bridge IP, and both binaries independently
+     gate real behavior on `CNetAddr::IsRoutable()`: `tapyrus-seeder`'s own `IsGood()`
+     requires it (so no address could ever leave the single-arbitrary-address fallback
+     above and reach the real "good" set, confirmed live via the same debug build: all
+     6 real nodes tested GOOD repeatedly, `goodId` stayed empty regardless of how many
+     times or how long), and -- discovered only after fixing the above and still seeing
+     zero results -- `tapyrus-core`'s own `CAddrMan::Add_` (`addrman.cpp`)
+     unconditionally rejects non-routable addresses too, so even a brand-new node that
+     successfully learned an address via `-addseeder` could never actually add it to
+     its own addrman to connect to it (confirmed live: "N addresses found from DNS
+     seeds" in that node's own log, yet zero peers, ever, no matter how long it
+     waited). First attempted fix was `docker-compose.yml`'s default network subnet on
+     `203.0.113.0/24` (RFC 5737 TEST-NET-3 -- the "obviously safe, this is what
+     documentation/test examples use" range) -- confirmed live this does NOT work
+     either: `tapyrus-core`'s `IsRoutable()` (`netaddress.cpp`) explicitly excludes
+     `IsRFC5737()` too (an exclusion tapyrus-seeder's own, older/simpler `IsRoutable()`
+     doesn't have, which is why step 3 above worked on that subnet while this step
+     didn't). Reading every `Is*()` function `IsRoutable()` actually calls (RFC1918,
+     RFC2544, RFC6598, link-local, loopback, RFC5737) confirmed there is no IANA
+     special-purpose block left that both looks like a real address and passes this
+     check -- so `docker-compose.yml`'s custom subnet (`51.51.51.0/24`) is simply an
+     arbitrary, clearly-deliberate choice outside all of them, not an "official" test
+     range. Safe regardless: this network is a fully isolated Docker bridge, NAT'd
+     outbound and never actually reachable from or routed to the real internet.
+
+  End state, all confirmed live on the `51.51.51.0/24` subnet: the seeder correctly
+  converges on exactly the 6 genuinely-listening nodes (never `core-7`), and a
+  brand-new 8th node configured with no `-connect` at all -- only `-addseeder` --
+  genuinely discovers and connects to the live network through the seeder's DNS
+  answer alone, confirmed via that new node's own `getpeerinfo`.
+
+## Developer notes
+
+- **Configuring the Slack webhook** (`scripts/send_slack_report.py`,
+  `SLACK_WEBHOOK_URL`): Slack webhooks are per-app, not per-workspace, so this needs
+  a one-time setup, not just a repo secret:
+  1. Go to <https://api.slack.com/apps?new_app=1>, choose "From scratch", name the
+     app (e.g. "tapyrus-integration-tests"), pick the workspace to install it into.
+  2. In the app's settings sidebar: **Features -> Incoming Webhooks**, toggle
+     **Activate Incoming Webhooks** on.
+  3. **Add New Webhook to Workspace**, pick the channel it should post to, authorize.
+  4. Copy the resulting URL from **Webhook URLs for Your Workspace**
+     (`https://hooks.slack.com/services/…`) -- treat it as a secret, it lets anyone
+     post to that channel.
+  5. In this repo on GitHub: **Settings -> Secrets and variables -> Actions -> New
+     repository secret**, name it `SLACK_WEBHOOK_URL`, paste the value. The workflow
+     already reads it (`inputs.slack_webhook_url || secrets.SLACK_WEBHOOK_URL`) --
+     no further code changes needed once the secret exists.
+- **Why `docker-compose.yml`'s network uses `51.51.51.0/24`, specifically**: because
+  it needs to pass `tapyrus-core`'s `CNetAddr::IsRoutable()` check (required for both
+  the seeder to ever call an address "good" and for any node to ever add a
+  DNS-seed-discovered address to its own addrman) -- and, somewhat counterintuitively,
+  none of the ranges most people would reach for first (RFC1918 private ranges, or
+  RFC 5737's "documentation/test" TEST-NET ranges) actually qualify, since
+  `IsRoutable()` excludes all of them deliberately. `51.51.51.0/24` is just an
+  arbitrary block confirmed to fall outside every exclusion -- see this file's
+  Lessons learnt above for the full investigation and the complete exclusion list, if
+  this ever needs to change (e.g. if `51.0.0.0/8` is ever needed for something else,
+  pick a different octet and re-check it against that list, don't just guess).
 
 ## Full local end-to-end verification (Tier 3 test)
 

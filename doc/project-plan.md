@@ -128,6 +128,26 @@ Each of these corresponds to a step in `.github/workflows/weekly-integration-tes
   (`_confirm_rotation_via_rpc`: `getblockchaininfo`'s `aggregatePubkeys` array on all
   7 core nodes must show the new pubkey at the scheduled height), rather than a
   separate step.
+- [x] `tapyrus-seeder` service actually brought up and verified --
+  `scripts/verify_seeder.py` (see `scripts.md`). Confirms both that the seeder
+  reports only genuinely-listening nodes (never `core-7`, deliberately seeded as a
+  real negative case) and that a brand-new node with no hardcoded topology
+  knowledge -- only `-addseeder` -- genuinely auto-bootstraps through it. See
+  `work-done.md`'s Lessons learnt for the underlying investigation (ADDR gossip,
+  DNS-seed reliability thresholds, and why the compose network needs a specific
+  custom subnet).
+- [x] Slack report step -- `scripts/send_slack_report.py`, sent unconditionally
+  (`if: always()`) at the end of the workflow: pass/fail, trigger/repo-ref/duration
+  metadata, both aggpubkeys, and on failure the tail of any container log matching
+  an error/panic pattern. `slack_webhook_url` is a `workflow_dispatch` input,
+  falling back to the `SLACK_WEBHOOK_URL` repository secret (the only variable in
+  this workflow whose default is a real secret, not a literal, since `secrets.*` is
+  readable on every trigger including `schedule`/`pull_request`/`push`). Skips
+  gracefully (not a failure) if that secret isn't provisioned yet. Verified
+  structurally against a local mock webhook listener (no real Slack channel
+  available to send to) -- both the pass and fail message formats, the
+  implicated-container detection, and the graceful no-webhook skip all confirmed
+  live.
 
 ## Outstanding work
 
@@ -144,11 +164,6 @@ Everything not yet implemented or not yet testable, in one place:
   an orphaned colored-coin issuance (`issuetoken`) that returns to the mempool keeps
   its original color id correctly, or whether that identity can drift on
   reconfirmation.
-- **Slack report step** (pass/fail, run metadata, both aggpubkeys, failure log tail)
-  -- needs a Slack webhook secret provisioned first (see below).
-- **`tapyrus-seeder` service never actually brought up** -- `docker compose up` today
-  only starts `redis`/`core-*`/`signer-*`; the image is built and validated but the
-  service itself is never started -- plus a `dig`-based pass/fail check against it.
 - **`docker/docker-compose.yml` has no compose-level healthchecks** /
   `depends_on: condition: service_healthy` -- `scripts/wait_for_topology.py` is a
   confirmed-working CI-level equivalent (see Milestone 4), but the compose-file

@@ -170,16 +170,28 @@ services:
       - redis
       - core-3a
 
-  # --- tapyrus-seeder: Crawls the network starting from core-1a and serves the resulting
-  # address list over DNS. -i/-s hardcode 1905960821 (not wired to NETWORK_ID -- the
-  # seeder service is never actually brought up yet, see the workflow's "Bring up
-  # tapyrus-seeder" TODO step; wire it in once that lands). -s's port is 2357, prod
-  # mode's default P2P port (confirmed against a real container's "Bound to
-  # 0.0.0.0:2357" log line) -- NOT core-*'s rpcport (12381/83/85). See
-  # render_tapyrus_conf.py and doc/work-done.md for why core-* has no explicit `port=`
-  # override: -connect=<service-name> (no port suffix) resolves against the chain's
-  # default P2P port too, so both sides have to agree on that same default, not a
-  # value pinned here or in the conf.
+  # --- tapyrus-seeder: seeds directly from all 7 core-* nodes (one -s each, all
+  # supported -- main.cpp's -s parsing just appends each to a vector) rather than
+  # just core-1a left to crawl/discover the rest via P2P gossip -- this fixed
+  # -connect topology never organically propagates ADDR gossip at all, so crawling
+  # from a single node would never find the other 6. See doc/work-done.md's Lessons
+  # learnt for the full investigation (also covers why the `default:` network below
+  # needs a custom subnet at all).
+  #
+  # core-7 is seeded too, and expected to always test BAD: it's the one node whose
+  # command: sets -connect without an offsetting -listen=1 (see "CONNECT/LISTEN
+  # DESIGN" above), so tapyrus-core auto-disables its listening entirely -- nothing
+  # (seeder included) can ever open an inbound connection to it. Deliberate: a real
+  # demonstration that the seeder only ever calls a node "good" once it's genuinely
+  # reachable, not just "a container that exists" -- see scripts/verify_seeder.py.
+  # -i/-s hardcode 1905960821 (not wired to NETWORK_ID -- deferred, see
+  # render_tapyrus_conf.py's own note on why the seeder isn't wired to it yet either).
+  # -s's port is 2357, prod mode's default P2P port (confirmed against a real
+  # container's "Bound to 0.0.0.0:2357" log line) -- NOT core-*'s rpcport
+  # (12381/83/85). See render_tapyrus_conf.py and doc/work-done.md for why core-* has
+  # no explicit `port=` override: -connect=<service-name> (no port suffix) resolves
+  # against the chain's default P2P port too, so both sides have to agree on that
+  # same default, not a value pinned here or in the conf.
   # entrypoint is fully overridden below rather than appended to,
   # since this image's ENTRYPOINT is a plain JSON-array exec form (no bash -c wrapper
   # like tapyrusd's, so no COMMAND OVERRIDE gotcha here). -h/-n/-m are placeholder
@@ -188,10 +200,29 @@ services:
     image: tapyrus-seeder:integration-test
     entrypoint:
       - tapyrusseed
+      - -t
+      # Default (96) is tuned for crawling the entire real Bitcoin/Tapyrus network --
+      # 7 addresses total here, so 2 crawler threads is already more than enough
+      # concurrency; a lower thread count also keeps main.cpp's idle-retry backoff
+      # (`rand() % (500 * nThreads)`) small, so an idle crawler doesn't sit out an
+      # oversized random wait before its next poll.
+      - '2'
       - -i
       - '1905960821'
       - -s
       - '1905960821:core-1a:2357'
+      - -s
+      - '1905960821:core-1b:2357'
+      - -s
+      - '1905960821:core-2a:2357'
+      - -s
+      - '1905960821:core-2b:2357'
+      - -s
+      - '1905960821:core-3a:2357'
+      - -s
+      - '1905960821:core-3b:2357'
+      - -s
+      - '1905960821:core-7:2357'
       - -h
       - seed.tapyrus-integration-tests.local
       - -n
@@ -203,3 +234,53 @@ services:
       - '5390:53/tcp'
     depends_on:
       - core-1a
+      - core-1b
+      - core-2a
+      - core-2b
+      - core-3a
+      - core-3b
+      - core-7
+
+  # --- seeder-test-node: NOT part of the normal 7-node scenario, brought up only by
+  # scripts/verify_seeder.py -- a fresh 8th tapyrus-core node with no -connect at
+  # all, relying purely on tapyrus-core's own DNS-seed client (-addseeder,
+  # federationparams.cpp) against the real seeder, to prove a brand-new node can
+  # genuinely auto-bootstrap onto the network -- not just that dig resolves
+  # something. Only works given the `default:` network's custom subnet below (see
+  # doc/work-done.md's Lessons learnt for why). SEEDER_IP (the seeder container's
+  # actual IP, resolved by the verify script itself via `docker inspect` -- compose's
+  # dns: field takes a literal, not a service name) overrides this node's resolver
+  # so its -addseeder lookup actually reaches our seeder rather than Docker's own
+  # embedded DNS, which has no idea what "seed.tapyrus-integration-tests.local" is.
+  seeder-test-node:
+    image: tapyrus/tapyrusd:master-local
+    environment:
+      GENESIS_BLOCK_WITH_SIG: ${GENESIS_BLOCK_WITH_SIG}
+    volumes:
+      - ./generated/tapyrus.conf:/etc/tapyrus/tapyrus.conf
+    dns:
+      - ${SEEDER_IP}
+    command: tapyrusd -datadir=$${DATA_DIR} -conf=$${CONF_DIR}/tapyrus.conf -addseeder=seed.tapyrus-integration-tests.local
+    ports:
+      - '12388:12381'
+    depends_on:
+      - seeder
+
+# Custom subnet, not Docker's own default bridge range: both tapyrus-core
+# (CAddrMan::Add_) and tapyrus-seeder (its own, separate IsGood()) unconditionally
+# refuse any address failing CNetAddr::IsRoutable() (netaddress.cpp), which excludes
+# every RFC1918 private range AND every "officially reserved for testing" range
+# (RFC 5737 TEST-NET, RFC2544, RFC6598, link-local, loopback) -- there is no IANA
+# special-purpose block that both looks like a real address and passes this check.
+# 51.51.51.0/24 is simply outside all of the above (confirmed by reading every
+# Is*() function IsRoutable() calls, not guessed) -- an arbitrary, clearly-deliberate
+# choice (repeated octet), not a real allocation; safe regardless, since this
+# network is a fully isolated Docker bridge, NAT'd outbound and never actually
+# reachable from or routed to the real internet. See doc/work-done.md's Lessons
+# learnt for the full investigation, including why RFC 5737 was tried first and
+# didn't work.
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 51.51.51.0/24
