@@ -40,7 +40,7 @@ colors over a long run, which is expected, not a bug.
 
 See doc/work-done.md for the tapyrus-core RPC facts this script is built on (colored
 address round-trip requirement, coinbase maturity, issuetoken/transfertoken semantics)
-and which parts are still unverified against a live stack.
+-- verified against a real 7-node stack, and since via real GitHub Actions CI too.
 """
 import argparse
 import asyncio

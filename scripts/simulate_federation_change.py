@@ -85,7 +85,7 @@ from scripts.generate_dev_secrets import AggpubkeyCeremony, default_tapyrus_setu
 from scripts.lib.ceremony import CeremonyError, TapyrusSetupCeremony, extract_vss_for, require_executable  # noqa: E402
 from scripts.lib.compose import ComposeError, bring_up  # noqa: E402
 from scripts.lib.log import log  # noqa: E402
-from scripts.lib.rpc import CoreRpcClient, RpcUnreachable  # noqa: E402
+from scripts.lib.rpc import CoreRpcClient, RpcError, RpcUnreachable  # noqa: E402
 
 RPC_HOST = "127.0.0.1"
 SIGNER_SET_A = "signer-set-a"
@@ -564,6 +564,6 @@ async def main():
 if __name__ == "__main__":
     try:
         asyncio.run(main())
-    except (CeremonyError, TimeoutError, ComposeError) as exc:
+    except (CeremonyError, TimeoutError, ComposeError, RpcError, RpcUnreachable) as exc:
         log.error(str(exc))
         sys.exit(1)

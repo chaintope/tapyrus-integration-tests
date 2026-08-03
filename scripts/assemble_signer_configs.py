@@ -22,11 +22,12 @@ correspond to the signer's own key.
 
 ROUND_DURATION env var (default 10) sets [general] round-duration in the generated
 tapyrus-signer.toml -- the block-pacing interval. The CI workflow always passes
-ROUND_DURATION=60 (from the round_duration_seconds workflow input); use 60 locally too
-for anything beyond quick iteration: a short duration leaves too little slack in
-round_limit_timer = round-duration + round-limit for a round's signing communication
-to finish before the next round's messages arrive, producing transient InvalidBlock /
-"candidate block is not set" errors (see doc/work-done.md).
+ROUND_DURATION (from the round_duration_seconds workflow input, default 30); use 30
+locally too for anything beyond quick iteration: a short duration leaves too little
+slack in round_limit_timer = round-duration + round-limit for a round's signing
+communication to finish before the next round's messages arrive, producing transient
+InvalidBlock / "candidate block is not set" errors (see doc/work-done.md -- round
+durations of both 30 and 60 have been verified clean).
 """
 import argparse
 import os
@@ -46,9 +47,10 @@ DEFAULT_ROUND_LIMIT = "15"
 class SignerConfigAssembler:
     """Builds federations.toml + tapyrus-signer.toml for every node in a signer set.
 
-    Only ever writes a single [[federation]] entry -- a rotation (scenario step 6)
-    needs a second entry appended with a signature field from the --xfield handoff;
-    that's separate, not-yet-built work (see doc/project-plan.md Milestone 3).
+    Only ever writes a single, always-block-height-0, always-member [[federation]]
+    entry -- a rotation needs a second entry appended with a signature field from the
+    --xfield handoff. That's handled by a subclass instead of extending this class
+    directly: simulate_federation_change.py's RotationSignerConfigAssembler.
     """
 
     def __init__(self, set_dir, threshold, aggpubkey, core_rpc, redis, round_duration):

@@ -50,7 +50,7 @@ sys.path.insert(0, str(REPO_ROOT))
 from scripts.generate_dev_secrets import default_tapyrus_setup_bin  # noqa: E402
 from scripts.lib.ceremony import CeremonyError, extract_vss_for, require_executable  # noqa: E402
 from scripts.lib.log import log  # noqa: E402
-from scripts.lib.rpc import CoreRpcClient, RpcUnreachable  # noqa: E402
+from scripts.lib.rpc import CoreRpcClient, RpcError, RpcUnreachable  # noqa: E402
 from scripts.simulate_federation_change import (  # noqa: E402
     REUSE_NODE_INDEX,
     SIGNER_COUNT,
@@ -272,6 +272,6 @@ async def main():
 if __name__ == "__main__":
     try:
         asyncio.run(main())
-    except (CeremonyError, TimeoutError) as exc:
+    except (CeremonyError, TimeoutError, RpcError, RpcUnreachable) as exc:
         log.error(str(exc))
         sys.exit(1)

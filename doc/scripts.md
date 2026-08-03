@@ -33,14 +33,14 @@ Shared code the scripts below import rather than duplicate:
   and `require_executable()`. `_run_setup` is `async def`, via
   `asyncio.create_subprocess_exec`.
 - `lib/rpc.py` -- `CoreRpcClient`, a minimal Tapyrus Core JSON-RPC client (stdlib
-  `urllib`, no `requests` dependency) used by `collect_coinbase_addresses.py` and
-  `wait_for_topology.py` today, and intended for the per-node tx/lifecycle orchestrator
-  and rotation-confirmation step once those are built. `call()` is `async def`; since
-  stdlib has no async HTTP client, it wraps the blocking `urllib` call in
-  `asyncio.to_thread` so multiple
-  calls can still run concurrently. Raises `RpcUnreachable` (connection refused,
-  timeout -- treat as "not ready yet") separately from `RpcError` (the node answered
-  with a JSON-RPC error).
+  `urllib`, no `requests` dependency) used by `collect_coinbase_addresses.py`,
+  `wait_for_topology.py`, `generate_traffic.py`, `simulate_reorg.py`,
+  `simulate_federation_change.py`, and `simulate_maxblocksize_change.py`. The
+  per-node lifecycle orchestrator (not yet built) will be another consumer once it
+  exists. `call()` is `async def`; since stdlib has no async HTTP client, it wraps the
+  blocking `urllib` call in `asyncio.to_thread` so multiple calls can still run
+  concurrently. Raises `RpcUnreachable` (connection refused, timeout -- treat as "not
+  ready yet") separately from `RpcError` (the node answered with a JSON-RPC error).
 - `lib/compose.py` -- `start_nodes()`/`stop_nodes()`/`bring_up()`/`recreate_fresh()`,
   thin wrappers around `docker compose <subcommand> <service names>` (run from
   `docker/`), used by `simulate_reorg.py` and `simulate_federation_change.py`. Every
@@ -223,19 +223,20 @@ file reads/writes, no subprocess or network I/O to run concurrently.
 - `[output-dir]` defaults to `./runtime/signers` -- writes
   `node-<i>/{federations.toml,tapyrus-signer.toml}`.
 - **`ROUND_DURATION` env var** (default `10`) sets `[general] round-duration` in the
-  generated `tapyrus-signer.toml` -- the block-pacing interval. Use `60` (the CI
+  generated `tapyrus-signer.toml` -- the block-pacing interval. Use `30` (the CI
   default, `ROUND_DURATION`/`round_duration_seconds`) for anything beyond quick local
   iteration: a short duration leaves too little slack in
   `round_limit_timer = round-duration + round-limit` for a round's signing
   communication to finish before the next round's messages arrive, producing transient
-  `InvalidBlock` / "candidate block is not set" errors (see `work-done.md`).
+  `InvalidBlock` / "candidate block is not set" errors (see `work-done.md` -- both 30
+  and 60 have been verified clean).
 - **Output**: `federations.toml` (one `[[federation]]` entry, genesis-height,
   `aggregated-public-key`, this node's view of all N `node-vss` values) and
   `tapyrus-signer.toml` (`[general]`, `[signer]`, `[rpc]`, `[redis]` sections) per node.
-- **Known limitation**: only ever writes a single `[[federation]]` entry -- a rotation
-  (scenario step 6) needs a second entry appended with a `signature` field from the
-  `--xfield` handoff, which this script doesn't yet support (tracked in
-  `doc/project-plan.md` Milestone 3).
+- **`SignerConfigAssembler` itself only ever writes a single `[[federation]]` entry**
+  -- a rotation needs a second entry appended with a `signature` field from the
+  `--xfield` handoff. Handled by a subclass rather than editing this class directly:
+  see `simulate_federation_change.py`'s `RotationSignerConfigAssembler` below.
 
 ## `scripts/collect_coinbase_addresses.py`
 
@@ -319,10 +320,6 @@ assignment, and the balance-shortfall top-up mechanic). Implemented as `TrafficN
   the settle-height assertion (logged, not asserted) -- they receive ongoing coinbase
   income whenever they propose a block, at a rate this script can't predict in advance.
   Their colored balances stay fully asserted.
-- **Known limitation**: the settle-height assertion has no hard floor on how much
-  activity actually succeeded (see the `fallbackfee` point above) -- worth adding one
-  (e.g. assert at least N sends/mints happened this run) so a fully-broken run fails
-  loudly instead of exiting 0.
 
 ## `scripts/simulate_reorg.py`
 
@@ -350,8 +347,10 @@ via `scripts/lib/compose.py`'s shared helpers.
   B's, since it never saw group B's blocks or round-state) -- reconnect group B
   alongside group A (a real tie: same height, different tips) and confirm the tie
   alone doesn't cause a reorg -- repoint signers to group B one more time and extend
-  its chain by exactly 1 block, waiting for **all 7 nodes** (not just group B) to
-  reach that height, since group A can only satisfy that by actually reorging --
+  its chain by 2 blocks, not 1 (`core-3a` produced group A's original tip itself, so
+  it needs a second block to reclassify that tip as `valid-fork` instead of
+  `valid-headers`), waiting for **all 7 nodes** (not just group B) to reach that
+  height, since group A can only satisfy that by actually reorging --
   confirm convergence via `getchaintips` on all 7 nodes -- verify the canary
   survived.
 - **`CHAIN_HEIGHT_BEFORE_REORG` is a floor, not an assumed starting point**: the
@@ -428,8 +427,9 @@ the shared node-0 identity, live-reload mechanics, the shared-redis open questio
   anything the script or a signer log merely claims happened.
 - **Output**: none written to disk -- verification results are logged; a mismatch
   raises `CeremonyError` (non-zero exit).
-- **Not yet uncommented in the workflow** -- needs a confirmed real run first, same
-  bar `simulate_reorg.py` cleared before it was wired in.
+- **Active in the workflow** as "Federation change (aggpubkey rotation)" -- uncommented
+  after a confirmed real run, same bar `simulate_reorg.py` cleared before it was wired
+  in.
 
 ## `scripts/simulate_maxblocksize_change.py`
 
@@ -460,7 +460,8 @@ Implemented as `MaxBlockSizeChangeSimulator`, reusing `simulate_federation_chang
   `maxBlockSizes` array on all 7 core nodes for the new value at the scheduled height
   -- note the key is a decimal string (`XFieldMaxBlockSize::ToString()` =
   `std::to_string(data)`), not hex like `aggregatePubkeys`.
-- **Not yet uncommented in the workflow** -- needs a confirmed real run first.
+- **Active in the workflow** as "Max block size change" -- uncommented after a
+  confirmed real run.
 
 ## `docker/docker-compose.yml`
 

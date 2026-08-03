@@ -36,13 +36,13 @@ A single `integration-test` job runs these steps in order:
 1. **Checkout this repo**, then checkout `tapyrus-core` + `tapyrus-signer` +
    `tapyrus-seeder` (`scripts/checkout_repos.py`) -- each repo's ref is independently
    configurable, see below.
-2. **Build Docker images** for `tapyrus-core` and `tapyrus-signer` from the checkouts;
-   build the `tapyrus-seeder` image *(not yet scripted)*.
+2. **Build Docker images** for `tapyrus-core`, `tapyrus-signer`, and `tapyrus-seeder`
+   from the checkouts.
 3. **Offline ceremony for signer-set-a**: build the `tapyrus-setup` binary, then run
    `scripts/generate_dev_secrets.py` to produce the aggregated public key (no containers
    involved yet).
-4. **Genesis signing**: build the unsigned genesis via `tapyrus-genesis` *(not yet
-   scripted)*, then sign it with `scripts/sign_genesis.py`.
+4. **Genesis signing**: build the unsigned genesis via `tapyrus-genesis`, then sign it
+   with `scripts/sign_genesis.py`.
 5. **Bring the network up**: `docker compose up` redis + the 7 core nodes, then wait
    for the P2P topology to converge (`scripts/wait_for_topology.py`, polling
    `getconnectioncount` against the expected 1/2/1/2/1/2/3 pattern), then collect a
@@ -51,27 +51,32 @@ A single `integration-test` job runs these steps in order:
 6. **Bring up signers**: assemble each signer's config with
    `scripts/assemble_signer_configs.py`, bring up the 3 signer-set-a containers.
 7. **Per-node activity**: round-robin TPC + colored-coin traffic across all 7 nodes
-   with balances confirmed after each block (`scripts/generate_traffic.py`); RPC
-   health/height/mempool queries and stop/restart/resync for every node, plus the
-   max-block-size (xfield) change, remain *(not yet scripted -- see
-   `doc/project-plan.md` Milestone 3/4)*.
+   with balances confirmed after each block (`scripts/generate_traffic.py`). RPC
+   health/height/mempool queries and stop/restart/resync for every node remain
+   *(not yet scripted -- see `doc/project-plan.md`'s Outstanding work)*.
 8. **Reorg**: split the network into two groups, let each build its own real
    threshold-signed fork, reconnect, and confirm convergence via `getchaintips`
    (`scripts/simulate_reorg.py`).
 9. **Aggpubkey rotation**: run the offline ceremony again for signer-set-b, then the
    `--xfield` sign/computesig handoff and a `federations.toml` with both entries
-   *(not yet scripted)*.
-10. **Confirm the rotation** took effect at the scheduled height *(not yet scripted)*.
+   (`scripts/simulate_federation_change.py`).
+10. **Max block size change**: signer-set-b signs off on a new max-block-size via the
+    same `--xfield` flow, confirmed in effect via RPC at the scheduled height
+    (`scripts/simulate_maxblocksize_change.py`).
 11. **Bring up tapyrus-seeder** and confirm it resolves a real peer via `dig`
-    *(image is built, but the service itself is never started -- not yet scripted)*.
+    *(image is built, but the service itself is never started -- see
+    `doc/project-plan.md`'s Outstanding work)*.
 12. **Teardown**: collect every container's logs, upload them as a CI artifact, then
     `docker compose down` -- runs unconditionally (`if: always()`).
 13. **Slack report**: pass/fail summary, run metadata, both aggpubkeys, and (on failure)
-    the implicated container's tail log, sent unconditionally *(not yet scripted)*.
+    the implicated container's tail log, sent unconditionally *(not yet scripted -- see
+    `doc/project-plan.md`'s Outstanding work)*.
 
-Steps marked "not yet scripted" currently just `echo` a TODO pointing at the relevant
-design-doc section -- see [`doc/project-plan.md`](doc/project-plan.md) for the tracked
-list of what's left.
+The entire scenario above (steps 1-10) has run successfully end-to-end in real GitHub
+Actions CI, not just locally -- see `doc/work-done.md`'s "Full real-CI end-to-end
+verification". Steps still marked "not yet scripted" just `echo` a TODO pointing at
+the relevant design-doc section -- see [`doc/project-plan.md`](doc/project-plan.md)'s
+Outstanding work for the full tracked list.
 
 ## Variables available to change during a run
 
@@ -102,16 +107,19 @@ input; the rest fall back straight to their `env:` literal on every trigger,
 | `signer_repo_ref` | see `config/repos.py` | `tapyrus-signer` branch/tag/sha to check out |
 | `seeder_repo_ref` | see `config/repos.py` | `tapyrus-seeder` branch/tag/sha to check out |
 | `tx_round_count` | `60` (`10` on pull_request/push) | Round-robin send/check/settle cycles `scripts/generate_traffic.py` runs -- each is 3 block-heights and 14 transactions (7 nodes x {TPC send, colored send-or-mint}), so this alone determines the tx/block/height totals for that step. Also determines the reorg's baseline height -- see below. Sized against the CI timing budget, see `doc/work-done.md` |
-| `reorg_length` | `30` (`5` on pull_request/push) | Blocks each isolated group builds past the baseline, alone, before reconnecting at the tie (`scripts/simulate_reorg.py`: group B builds first while group A is stopped entirely, then group A builds its own, genuinely different set while group B is stopped). Group B is then always extended by exactly 1 more block to win -- not configurable, and not probed for -- see `doc/scripts.md` |
+| `reorg_length` | `30` (`5` on pull_request/push) | Blocks each isolated group builds past the baseline, alone, before reconnecting at the tie (`scripts/simulate_reorg.py`: group B builds first while group A is stopped entirely, then group A builds its own, genuinely different set while group B is stopped). Group B is then always extended by exactly 2 more blocks to win (not 1 -- `core-3a` produced group A's original tip itself, so it needs a second block to reclassify that tip as `valid-fork` instead of `valid-headers`) -- not configurable, and not probed for -- see `doc/scripts.md` |
 | `round_duration_seconds` | `30` | `tapyrus-signerd` round-duration (block interval) -- verified clean, see `doc/work-done.md`'s Lessons learnt (`10` is confirmed to hit transient `InvalidBlock` errors) |
 | `network_id` | `1905960821` | Tapyrus network id (prod mode, see `doc/work-done.md`), used by every core-* node's rendered `tapyrus.conf` and the `genesis.<id>` file `tapyrusd` looks for |
 | `slack_log_tail_lines` | `100` | Lines of the implicated container's log inlined in the Slack failure report |
 | `docker_build_platform` | *(empty, runner-native)* | Docker `--platform` for image builds -- local verification only ever used `linux/arm64` |
 
-Not yet real inputs (env-literal only, no per-run override -- see above):
-`federation_change_height` (`800`, `60` on pull_request/push), `max_block_size_new`
-(`2000000`). Both feed steps that are still commented-out/TODO (Milestone 3/4).
-Reintroduce as real inputs once a step lands for real.
+`FEDERATION_CHANGE_HEIGHT` is always `REORG_LENGTH` (computed by the "Derive
+FEDERATION_CHANGE_HEIGHT from REORG_LENGTH" workflow step), and `MAX_BLOCK_SIZE_HEIGHT`
+is always `FEDERATION_CHANGE_HEIGHT` in turn -- `scripts/simulate_federation_change.py`
+and `scripts/simulate_maxblocksize_change.py` each schedule their change that many
+blocks past whatever height the chain is at when they run, not a fixed literal.
+`max_block_size_new` (`2000000`) is env-literal only, no per-run `workflow_dispatch`
+override yet.
 
 **No input at all, and no env-literal fallback either** (not just not-yet-wired --
 gone entirely): `tx_total_count`, `tx_tpc_percent`, `tx_interval_seconds`. Earlier

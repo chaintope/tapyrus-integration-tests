@@ -77,7 +77,6 @@ env:
   TX_ROUND_COUNT: ${{ inputs.tx_round_count || ((github.event_name == 'pull_request' || github.event_name == 'push') && '10' || '60') }}
   ROUND_DURATION: ${{ inputs.round_duration_seconds || '30' }}
   REORG_LENGTH: ${{ inputs.reorg_length || ((github.event_name == 'pull_request' || github.event_name == 'push') && '5' || '30') }}
-  FEDERATION_CHANGE_HEIGHT: ${{ inputs.federation_change_height || ((github.event_name == 'pull_request' || github.event_name == 'push') && '60' || '800') }}
   MAX_BLOCK_SIZE_NEW: ${{ inputs.max_block_size_new || '2000000' }}
   SLACK_LOG_TAIL_LINES: ${{ inputs.slack_log_tail_lines || '100' }}
 

@@ -8,7 +8,8 @@ looks non-obvious.
 
 See [`weekly-integration-test-plan.md`](weekly-integration-test-plan.md) for the
 original scenario design, [`project-plan.md`](project-plan.md) for tracked
-done-vs-outstanding progress, and [`scripts.md`](scripts.md) for what each script does.
+done-vs-outstanding progress (including the full list of what's not yet built or
+tested), and [`scripts.md`](scripts.md) for what each script does.
 
 ## Known issues (open)
 
@@ -23,13 +24,15 @@ done-vs-outstanding progress, and [`scripts.md`](scripts.md) for what each scrip
 - **`docker/docker-compose.yml` has no compose-level healthchecks** /
   `depends_on: condition: service_healthy` yet (plan doc section 3 step 6 guidance).
   `scripts/wait_for_topology.py` is a CI-level equivalent -- arguably stronger, since
-  it confirms real P2P peer counts rather than just RPC reachability -- but the
-  compose-file enhancement itself is separate, unstarted work.
+  it confirms real P2P peer counts rather than just RPC reachability, and its own
+  mismatch/timeout-reporting logic is now confirmed working (see `project-plan.md`) --
+  but the compose-file enhancement itself is separate, unstarted work.
 - **Signer count (3) / threshold (2) is hardcoded**, not a per-run variable -- the
   7-node topology in `docker-compose.yml` is wired 1:1 to exactly 3 signers; changing
   the count means redesigning the topology, not just passing a different number.
-- **Scenario mechanics not yet built** (see `project-plan.md` Milestone 3/4 for the
-  tracked list): lifecycle orchestrator, Slack report.
+- **Scenario mechanics not yet built** (see `project-plan.md`'s Outstanding work for
+  the tracked list): per-node lifecycle orchestrator, Slack report, `tapyrus-seeder`
+  actually brought up as a running service.
 - **`tapyrus-setup`'s offline `--xfield sign`/`computesig` rejected a fresh, otherwise
   valid signature with `InvalidSig` roughly half the time** -- confirmed via repeated
   isolated trials (2/6 accepted, all 3 verifying nodes always agreeing, so it was the
@@ -53,12 +56,6 @@ done-vs-outstanding progress, and [`scripts.md`](scripts.md) for what each scrip
   `FUNDING_AMOUNT_TPC`/`TOKEN_ISSUE_AMOUNT`/etc. were picked conservatively and work
   fine at small round counts, but haven't been stress-tested at a larger round count
   where the balance-shortfall top-up mechanic would trigger much more often.
-- **Settle-height ledger assertion can't distinguish "real activity, correctly
-  tracked" from "total failure, trivially consistent"** -- a never-funded node's
-  ledger entry and its actual RPC balance both stay at exactly `0.0`, so a green run
-  isn't by itself evidence traffic was generated. Worth a hard floor (e.g. assert at
-  least N successful sends/mints happened this run) so a fully-broken run fails
-  loudly instead of exiting 0.
 
 ## Design decisions
 
@@ -94,7 +91,7 @@ done-vs-outstanding progress, and [`scripts.md`](scripts.md) for what each scrip
   `tapyrus-genesis` call either -- prod is simply what you get by omitting `-dev`)
   with `networkid=$NETWORK_ID`, mounted into all 7 core-* services. Not wired into the
   seeder -- it isn't brought up by any `docker compose up` invocation yet at all (see
-  Known issues/Milestone 4).
+  `project-plan.md`'s Outstanding work).
 - **P2P topology relies on the chain's default port, not an explicit `port=`**:
   `docker/docker-compose.yml`'s `-connect=<service-name>` targets have no explicit
   port, and `tapyrus-core` resolves a portless `-connect` against the *chain's own
@@ -116,31 +113,41 @@ done-vs-outstanding progress, and [`scripts.md`](scripts.md) for what each scrip
   a long-running production node, not a several-hour CI job).
 - **`generate_traffic.py`'s round-count-only design**: everything (block-height
   budget, transaction count) derives from one number, `tx_round_count`, rather than
-  independent knobs for total tx count and send interval -- with exactly one send per
-  node per round, there's nothing left for an interval to pace, and the total is just
-  `round_count * 14` (7 nodes x {TPC, colored}) by construction.
+  independent knobs for total tx count and send interval. Earlier drafts had a
+  separate `tx_interval_seconds` (pacing between sends from the same node) and
+  `tx_total_count` -- both dropped once the design settled on exactly one send per
+  node per round: with no sequence of same-node sends within a round, there's nothing
+  left for an interval to pace, and the total is just `round_count * 14` (7 nodes x
+  {TPC, colored}) by construction, so a separate total would only ever have to agree
+  with that derived number or drift from it.
 - **Colored-coin balance shortfall mints instead of skipping**: rather than issue
-  every node's full lifetime token supply once at the start, each node only ever
-  holds a small working balance (`TOKEN_ISSUE_AMOUNT`/`TOKEN_TOPUP_AMOUNT`). A round
-  where the sender doesn't have enough issues/reissues more instead of transferring --
-  still exactly one transaction for that node, so total tx count per round stays
-  fixed at 14 regardless of how many nodes hit a shortfall that round. NFT nodes
-  (forced to `value=1`) end up minting a fresh NFT color on almost every other round
-  as a result -- expected, not a bug: they transfer their one unit away, then have
-  zero until the next mint.
-- **Top-up needs no cross-round lookahead**: `issuetoken`'s NON_REISSUABLE/NFT path
-  selects its input UTXO explicitly (`coin_control.Select(out)`) and only checks
-  `IsMine(...) == ISMINE_SPENDABLE` -- no confirmation-depth check -- so spending a
-  same-round unconfirmed self-send works. A shortfall just substitutes a mint for
-  that round's transfer, with no phase held back a round to accommodate it.
+  every node's full lifetime token supply once at the start (all colored-coin
+  activity then front-loaded into one phase, nothing but transfers for the rest of
+  the run), each node only ever holds a small working balance
+  (`TOKEN_ISSUE_AMOUNT`/`TOKEN_TOPUP_AMOUNT` = 3). A round where the sender doesn't
+  have enough issues/reissues more instead of transferring -- still exactly one
+  transaction for that node, so total tx count per round stays fixed at 14 regardless
+  of how many nodes hit a shortfall that round. This is also why NFT nodes (forced to
+  `value=1`) end up minting a fresh NFT color on almost every other round -- expected,
+  not a bug: they transfer their one unit away, then have zero until the next mint.
+- **Top-up timing needs no cross-round lookahead**: an earlier draft of this design
+  considered checking one round ahead (during round K's settle phase, top up for
+  round K+1's send) specifically to avoid a same-round top-up-then-spend needing to
+  chain onto its own unconfirmed output. Dropped once the source read showed
+  `issuetoken`'s NON_REISSUABLE/NFT path selects its input UTXO explicitly
+  (`coin_control.Select(out)`) and only checks `IsMine(...) == ISMINE_SPENDABLE` -- no
+  confirmation-depth check -- so spending a same-round unconfirmed self-send is
+  expected to work, confirmed live in the local E2E run. A shortfall now just
+  substitutes a mint for that round's transfer, with no phase held back a round to
+  accommodate it.
 - **Per-transaction fee tracked via `gettransaction`, not predicted**: the ledger's
   TPC bookkeeping reads each transaction's actual fee back from `gettransaction`
-  right after broadcasting it, rather than predicting it from a fee rate and an
-  assumed tx size -- `gettransaction`'s fee is not a top-level field, and has two
-  different shapes depending on transaction type: a plain TPC send nests `"fee"`
-  inside its own `category="send"` detail entry; a transaction that also moves a
-  colored output puts the fee in a *separate* detail entry tagged `category="fee"`
-  instead.
+  right after broadcasting it, rather than trying to predict it from a fee rate and
+  an assumed tx size. Fee-rate-based prediction would have needed tx vsize to be
+  near-constant across every transaction shape this script produces (plain TPC send,
+  colored transfer, REISSUABLE's 2-tx issuance, NON_REISSUABLE/NFT's single-tx
+  issuance) to stay accurate -- reading the real fee sidesteps needing that
+  assumption to hold at all.
 - **`generate_traffic.py` seeds its ledger from each node's real on-chain balance**
   at startup (`getbalance`), rather than assuming every node starts at `0.0` -- the
   workflow runs this script multiple times in the same job (before and after the
@@ -200,7 +207,8 @@ done-vs-outstanding progress, and [`scripts.md`](scripts.md) for what each scrip
   shot**: a container reported "running" only means the process started, not that
   `tapyrusd`'s RPC server has finished initializing. `scripts/collect_coinbase_addresses.py`
   retries each node via `lib/rpc.py`'s `RpcUnreachable` until it answers (or times out
-  loudly) and raises on an empty address instead of writing one.
+  loudly) and raises on an empty address instead of writing one. All of the real,
+  exercisable retry paths are now confirmed live -- see `project-plan.md`.
 - **`RPC_IN_WARMUP` (-28) is a real, common state to retry through, not just
   connection-refused/timeout**: `tapyrusd` serves `-28` as HTTP 500 with a JSON-RPC
   error body, which is exactly the readiness window right after `docker compose up`.
@@ -210,25 +218,33 @@ done-vs-outstanding progress, and [`scripts.md`](scripts.md) for what each scrip
   error. A bad-credentials 401 has no response body at all
   (`HTTPReq_JSONRPC`'s auth-failure path calls `WriteReply` with no body argument) --
   doesn't crash the JSON parse.
-- **`workflow_dispatch` inputs have no `default:`**: `workflow_dispatch.inputs.*.default`
-  can't hold an expression, and `schedule`/`pull_request`/`push` runs have no
-  `inputs` context at all, so every default lives in the `env:` block's
-  `inputs.x || 'literal'` fallback instead -- the one place each default is written --
-  and every input's `description:` states its default in words. A manual dispatch run
-  left blank resolves to the exact same value `schedule` uses.
-- **`pull_request`/`push` smoke trigger, scoped to this repo's own changes**: a change
-  to `scripts/**`, `docker/**`, `config/**`, or the workflow itself is validated
-  before merge, not just discovered on the following Sunday's scheduled run. This is
-  a different concern from `weekly-integration-test-plan.md` section 6's "not on
-  every PR" non-goal: that non-goal is about running the full-scale scenario against
-  every PR opened on `tapyrus-core`/`tapyrus-signer` (cost/runtime prohibitive), not
-  about validating this repo's own, rarely-changing PRs. The smoke trigger runs the
-  identical job at reduced scale (`reorg_length`, `tx_round_count` drop to smaller
-  fallbacks, keyed off `github.event_name` since `pull_request`/`push` runs have no
-  `inputs` context -- neither `chain_height_before_reorg` nor
-  `federation_change_height` is in that list; both are always derived from another
-  variable, so they shrink along with it automatically) and a shorter
-  `timeout-minutes` (60 vs. 360).
+- **`workflow_dispatch` inputs have no `default:`**: every default used to be written
+  twice -- once as the input's `default:`, once as the `env:` block's `|| 'literal'`
+  fallback -- a real drift risk if one got updated without the other (flagged in PR
+  review). `workflow_dispatch.inputs.*.default` can't hold an expression, and
+  `schedule`/`pull_request`/`push` runs have no `inputs` context at all, so there was
+  no way to make `env:` read the input's declared default programmatically -- the
+  literal had to live somewhere outside the input either way. Chose to remove it from
+  the input side rather than the env side: `env:` keeps `inputs.x || 'literal'` as the
+  one place each default is written, and every input's `description:` now states its
+  default in words instead. A manual dispatch run left blank resolves to the exact
+  same value `schedule` uses -- the only visible change is the dispatch form showing
+  blank fields instead of pre-filled ones.
+- **`pull_request`/`push` smoke trigger, scoped to this repo's own changes**: added so
+  a change to `scripts/**`, `docker/**`, `config/**`, or the workflow itself is
+  validated before merge, not just discovered on the following Sunday's scheduled
+  run. This is deliberately read as a different concern from
+  `weekly-integration-test-plan.md` section 6's "not on every PR" non-goal: that
+  non-goal is about running the full-scale scenario against every PR opened on
+  `tapyrus-core`/`tapyrus-signer` (cost/runtime prohibitive), not about validating
+  this repo's own, rarely-changing PRs. The smoke trigger runs the identical job at
+  reduced scale (`reorg_length`, `tx_round_count` drop to smaller fallbacks, keyed off
+  `github.event_name` since `pull_request`/`push` runs have no `inputs` context --
+  neither `chain_height_before_reorg` nor `federation_change_height` is in that list;
+  both are always derived from another variable, so they shrink along with it
+  automatically) and a shorter `timeout-minutes` (180 vs. 360). Confirmed working on a
+  real `pull_request`-triggered run, not just locally-simulated env vars -- see
+  `project-plan.md`.
 - **`CHAIN_HEIGHT_BEFORE_REORG`/`FEDERATION_CHANGE_HEIGHT` are floors/offsets, not
   literal targets**: `CHAIN_HEIGHT_BEFORE_REORG` is always `TX_ROUND_COUNT + 2`, and
   `simulate_reorg.py`'s `_build_baseline` waits until the chain reaches at least that
@@ -253,74 +269,6 @@ done-vs-outstanding progress, and [`scripts.md`](scripts.md) for what each scrip
 - **Secrets scope**: this repo only ever generates local dev secrets
   (`generate_dev_secrets.py`); it never provisions real GitHub secrets. The only
   actual CI secret needed is the Slack webhook URL.
-- **`pull_request`/`push` smoke trigger, scoped to this repo's own changes**: added so
-  a change to `scripts/**`, `docker/**`, `config/**`, or the workflow itself is
-  validated before merge, not just discovered on the following Sunday's scheduled run.
-  This is deliberately read as a different concern from `weekly-integration-test-plan.md`
-  section 6's "not on every PR" non-goal: that non-goal is about running the full-scale
-  scenario against every PR opened on `tapyrus-core`/`tapyrus-signer` (cost/runtime
-  prohibitive), not about validating this repo's own, rarely-changing PRs. The smoke
-  trigger runs the identical job at reduced scale (`reorg_length`, `tx_round_count`,
-  `federation_change_height` all drop to smaller fallbacks, keyed off
-  `github.event_name` since `pull_request`/`push` runs
-  have no `inputs` context -- `chain_height_before_reorg` isn't in that list anymore;
-  it's always derived from `tx_round_count`, so it shrinks along with it automatically
-  rather than needing its own fallback) and a shorter
-  `timeout-minutes` (180 vs. 360). `tx_round_count` is the one of these already wired to
-  a real step (`generate_traffic.py`); the reorg/rotation variables still aren't
-  consumed by anything -- wired in now so the smoke run is already fast once Milestone
-  3/4 finishes landing them, rather than needing a second pass then. Not yet verified against
-  a real GitHub Actions run (this repo's local testing can't exercise `on:` trigger
-  behavior) -- worth confirming `inputs.<name> || (...)` evaluates as expected on a
-  `pull_request` event on the first real PR.
-- **`workflow_dispatch` inputs have no `default:`**: every default used to be written
-  twice -- once as the input's `default:`, once as the `env:` block's `|| 'literal'`
-  fallback -- a real drift risk if one got updated without the other (flagged in PR
-  review). `workflow_dispatch.inputs.*.default` can't hold an expression, and
-  `schedule`/`pull_request`/`push` runs have no `inputs` context at all, so there was no
-  way to make `env:` read the input's declared default programmatically -- the literal
-  had to live somewhere outside the input either way. Chose to remove it from the input
-  side rather than the env side: `env:` keeps `inputs.x || 'literal'` as the one place
-  each default is written, and every input's `description:` now states its default in
-  words instead. A manual dispatch run left blank resolves to the exact same value
-  `schedule` uses -- the only visible change is the dispatch form showing blank fields
-  instead of pre-filled ones.
-- **`generate_traffic.py`'s round-count-only design**: everything (block-height budget,
-  transaction count) derives from one number, `tx_round_count`, rather than independent
-  knobs for total tx count and send interval. Earlier drafts had a separate
-  `tx_interval_seconds` (pacing between sends from the same node) and `tx_total_count`
-  -- both dropped once the design settled on exactly one send per node per round: with
-  no sequence of same-node sends within a round, there's nothing left for an interval to
-  pace, and the total is just `round_count * 14` (7 nodes x {TPC, colored}) by
-  construction, so a separate total would only ever have to agree with that derived
-  number or drift from it.
-- **Colored-coin balance shortfall mints instead of skipping**: rather than issue every
-  node's full lifetime token supply once at the start (all colored-coin activity then
-  front-loaded into one phase, nothing but transfers for the rest of the run), each node
-  only ever holds a small working balance (`TOKEN_ISSUE_AMOUNT`/`TOKEN_TOPUP_AMOUNT` =
-  3). A round where the sender doesn't have enough issues/reissues more instead of
-  transferring -- still exactly one transaction for that node, so total tx count per
-  round stays fixed at 14 regardless of how many nodes hit a shortfall that round. This
-  is also why NFT nodes (forced to `value=1`) end up minting a fresh NFT color on almost
-  every other round -- expected, not a bug: they transfer their one unit away, then have
-  zero until the next mint.
-- **Top-up timing needs no cross-round lookahead**: an earlier draft of this design
-  considered checking one round ahead (during round K's settle phase, top up for round
-  K+1's send) specifically to avoid a same-round top-up-then-spend needing to chain onto
-  its own unconfirmed output. Dropped once the source read showed `issuetoken`'s
-  NON_REISSUABLE/NFT path selects its input UTXO explicitly
-  (`coin_control.Select(out)`) and only checks `IsMine(...) == ISMINE_SPENDABLE` --  no
-  confirmation-depth check -- so spending a same-round unconfirmed self-send is expected
-  to work, confirmed live in the local E2E run (see Lessons learnt above). A shortfall
-  now just substitutes a mint for that round's transfer, with no phase held back a round
-  to accommodate it.
-- **Per-transaction fee tracked via `gettransaction`, not predicted**: the ledger's TPC
-  bookkeeping reads each transaction's actual fee back from `gettransaction` right after
-  broadcasting it, rather than trying to predict it from a fee rate and an assumed tx
-  size. Fee-rate-based prediction would have needed tx vsize to be near-constant across
-  every transaction shape this script produces (plain TPC send, colored transfer,
-  REISSUABLE's 2-tx issuance, NON_REISSUABLE/NFT's single-tx issuance) to stay accurate
-  -- reading the real fee sidesteps needing that assumption to hold at all.
 
 ## Full local end-to-end verification (Tier 3 test)
 
@@ -344,3 +292,15 @@ builds, and real containers (not simulated):
 - Real round-robin TPC + colored-coin traffic via `scripts/generate_traffic.py`,
   balances confirmed against the tracked ledger
 - Log collection and teardown steps both verified
+
+## Full real-CI end-to-end verification
+
+Beyond the local Tier 3 test above, the entire scenario has also run successfully in
+real GitHub Actions CI (not simulated, not local) -- a `pull_request`-triggered smoke
+run went through ceremony, 7-node bring-up, traffic generation, reorg, federation
+change, max-block-size change, and traffic generation again afterward, all
+successfully:
+[run](https://github.com/chaintope/tapyrus-integration-tests/actions/runs/30790964795/job/91614204236).
+This also confirms the smoke trigger's `inputs.<name> || (...)` fallback expressions
+evaluate correctly on a real `pull_request` event, closing the one open question
+local testing couldn't exercise (`on:` trigger behavior).
