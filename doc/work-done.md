@@ -140,7 +140,33 @@ does.
   one flat Docker network.
 - **`tapyrus-seeder` genuinely bootstraps a new node** (`scripts/verify_seeder.py`).
   A brand-new 8th node with no hardcoded topology knowledge discovers and connects to
-  the network entirely through it.
+  the network entirely through it. That node (`seeder-test-node`) is torn down right
+  after this confirms, not left running -- confirmed live that a lingering connection
+  from it otherwise shows up as an unexplained extra peer to `wait_for_topology.py`,
+  which has no way to know about this probe-only container.
+- **Phase 1's addseeder-mode check looks for one real (non-seeder) peer, not a peer
+  count.** The original design captured each node's peer count right after the
+  post-restart `_wait_for_all_rpc_ready` returned, then waited for it to exceed
+  that snapshot -- but P2P connections start forming the moment each process
+  restarts, independent of when its own RPC server finishes initializing, so some
+  nodes were already 2-3 peers in by the time the "baseline" was captured, leaving
+  no observable room to grow within the timeout even though discovery had
+  genuinely worked. Tried requiring an absolute floor of 2+ peers instead (sidesteps
+  that race), but that failed too, for a deeper reason confirmed by reading
+  `tapyrus-core`'s own `net.cpp` (`ThreadOpenConnections`, "Only connect out to one
+  peer per network group"): every core-* node here sits on the same `/24`
+  (`51.51.51.0/24`), so they're all one netgroup, and tapyrus-core's own
+  outbound-connection diversity logic caps each node's OWN dialing at ~1 real peer
+  *permanently* -- a node not also lucky enough to be picked as someone else's
+  inbound target legitimately never exceeds 1 real peer, no matter how long you
+  wait. Confirmed live: a node stuck at 1 only ever reached "2" again once the
+  seeder's own periodic `-s` crawl cycled back around and re-probed it (a second,
+  transient connection) 15+ minutes later -- not new organic discovery, just the
+  seeder's own crawl cadence. The seeder's crawl connection is transient anyway
+  (see Lessons learnt below), so it can't be relied on to pad a count either way.
+  The right, achievable signal is simply: is there a peer whose `subver` isn't the
+  seeder's own (`SEEDER_SUBVER`)? One real peer is enough proof, as long as it's
+  the right one.
 - **Secrets scope**: this repo only generates local dev secrets
   (`generate_dev_secrets.py`); it never provisions real GitHub secrets. The Slack
   webhook URL is the only actual CI secret needed.

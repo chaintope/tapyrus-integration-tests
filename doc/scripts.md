@@ -212,9 +212,16 @@ design rather than a single `dig` call.
   for the seeder's own `-s`-driven crawl to converge (independent of the core nodes'
   own config), then restarts the 7 nodes so their one-shot DNS-seed lookup
   (`tapyrus-core` only runs this once, at process startup) runs again with real
-  answers available, then polls `getpeerinfo` on all 7 until each one's peer count
-  has grown above its own baseline -- proof the seeder can bootstrap a node's peer
-  set from nothing, organically, not just that `dig` resolves something.
+  answers available, then polls `getpeerinfo` on all 7 until each has a peer whose
+  `subver` isn't the seeder's own (`SEEDER_SUBVER`). Not a raw peer count, and not
+  "grew from a captured baseline" either (two designs tried and rejected in the same
+  investigation, see `work-done.md`) -- every core-* node here sits on the same /24,
+  so tapyrus-core's own netgroup-diversity outbound logic caps each node's OWN
+  dialing at ~1 real peer permanently, regardless of how many addresses `-addseeder`
+  handed it; a node not also lucky enough to be picked as someone else's inbound
+  target legitimately never exceeds 1. The seeder's own crawl connection is
+  transient too, so it can't be relied on to pad a count either. A single real
+  (non-seeder) peer is both the right signal and the achievable one.
 - **Phase 2 -- connect mode, the fixed topology**: stops and removes the 7 core-*
   nodes and the seeder (a fresh seeder avoids phase 1's now-stale "good" set, keyed
   on IPs that no longer exist once the nodes are recreated), then brings both back up

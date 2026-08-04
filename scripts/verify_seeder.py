@@ -82,8 +82,23 @@ DIG_TIMEOUT_SECONDS = 480
 RPC_READY_TIMEOUT_SECONDS = 120
 RPC_READY_POLL_INTERVAL_SECONDS = 3
 BOOTSTRAP_TIMEOUT_SECONDS = 120
-PEER_GROWTH_POLL_INTERVAL_SECONDS = 5
-PEER_GROWTH_TIMEOUT_SECONDS = 90
+PEER_DISCOVERY_POLL_INTERVAL_SECONDS = 5
+PEER_DISCOVERY_TIMEOUT_SECONDS = 90
+# Every core-* node in this test network sits on the same /24 (51.51.51.0/24,
+# see work-done.md's Lessons learnt), so they're all one netgroup --
+# tapyrus-core's own outbound-connection diversity logic (ThreadOpenConnections,
+# net.cpp: "Only connect out to one peer per network group") caps each node's
+# OWN outbound dials at ~1 real peer, permanently, no matter how many addresses
+# -addseeder handed it. A node not lucky enough to also be picked as someone
+# else's inbound target legitimately never exceeds 1 real peer -- confirmed
+# live: requiring 2+ total peers only passed for a stuck node once the seeder's
+# own periodic crawl cycled back around and re-probed it (a second, transient
+# connection), 15+ minutes later, not because of any new organic discovery.
+# The seeder's own crawl connection is transient anyway (see the same Lessons
+# learnt), so it can't be relied on to reliably contribute to a peer count at
+# all. The real, achievable signal is a peer that ISN'T the seeder -- 1 is
+# enough, as long as it's the right one.
+SEEDER_SUBVER = "/tapyrus-seeder:0.01/"
 
 
 class SeederVerificationError(Exception):
@@ -153,7 +168,7 @@ class SeederVerifier:
         await compose("restart", *CORE_NODES)
         await self._wait_for_all_rpc_ready(CORE_NODES)
 
-        await self._verify_peer_counts_grow()
+        await self._verify_peer_discovery()
 
     async def _run_connect_phase(self):
         log.step("phase 2 (connect mode): tearing down the 7 core nodes and the seeder, restoring the fixed topology")
@@ -176,32 +191,32 @@ class SeederVerifier:
         log.info(f"resolved container IPs: {ips}")
         return ips
 
-    async def _verify_peer_counts_grow(self):
-        log.step("polling peer counts on all 7 nodes until each shows real growth over its own baseline")
+    async def _verify_peer_discovery(self):
+        log.step("polling all 7 nodes until each has a real peer (not just the seeder's own probe)")
         clients = {n: CoreRpcClient(RPC_HOST, CORE_RPC_PORTS[n], self._rpc_user, self._rpc_pass) for n in CORE_NODES}
-        baseline = {n: len(await clients[n].call("getpeerinfo")) for n in CORE_NODES}
-        log.info(f"baseline peer counts: {baseline}")
 
-        grown = set()
-        deadline = time.monotonic() + PEER_GROWTH_TIMEOUT_SECONDS
-        while len(grown) < len(CORE_NODES):
+        discovered = set()
+        deadline = time.monotonic() + PEER_DISCOVERY_TIMEOUT_SECONDS
+        while len(discovered) < len(CORE_NODES):
+            counts = {}
             for n in CORE_NODES:
-                if n in grown:
+                if n in discovered:
                     continue
-                count = len(await clients[n].call("getpeerinfo"))
-                if count > baseline[n]:
-                    grown.add(n)
-                    log.info(f"{n}: peer count grew {baseline[n]} -> {count}")
-            if len(grown) >= len(CORE_NODES):
+                peers = await clients[n].call("getpeerinfo")
+                counts[n] = len(peers)
+                if any(p.get("subver") != SEEDER_SUBVER for p in peers):
+                    discovered.add(n)
+                    log.info(f"{n}: confirmed a real core-node peer (not the seeder) came from -addseeder")
+            if len(discovered) >= len(CORE_NODES):
                 break
             if time.monotonic() >= deadline:
-                missing = set(CORE_NODES) - grown
+                missing = set(CORE_NODES) - discovered
                 raise SeederVerificationError(
-                    f"these nodes never grew their peer count above baseline within "
-                    f"{PEER_GROWTH_TIMEOUT_SECONDS}s: {missing} (baseline: {baseline})"
+                    f"these nodes never got a real (non-seeder) peer within "
+                    f"{PEER_DISCOVERY_TIMEOUT_SECONDS}s: {missing} (last peer counts: {counts})"
                 )
-            await asyncio.sleep(PEER_GROWTH_POLL_INTERVAL_SECONDS)
-        log.info("confirmed: every core node's peer count grew organically via -addseeder")
+            await asyncio.sleep(PEER_DISCOVERY_POLL_INTERVAL_SECONDS)
+        log.info("confirmed: every core node discovered at least one real peer organically via -addseeder")
 
     async def _wait_for_seeder_convergence_all_7(self, node_ips):
         # addseeder mode: core-7 has no -connect at all here, so it listens like the
