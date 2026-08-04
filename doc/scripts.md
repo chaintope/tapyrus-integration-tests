@@ -233,6 +233,16 @@ design rather than a single `dig` call.
   at all, only `-addseeder`, its container DNS resolver pointed at the seeder via
   `SEEDER_IP`) and confirms it auto-bootstraps onto one of the 6 listening nodes
   through the seeder alone.
+- **Both `seeder-test-node` and `seeder` itself are stopped and removed once `run()`
+  finishes, in a `finally` (guaranteed on failure too, not just success).** Left
+  running, `seeder-test-node`'s persistent connection into whichever listener it
+  discovered permanently mismatches `wait_for_topology.py`'s exact
+  `getconnectioncount` check on that node, and during `simulate_reorg.py`'s
+  isolated-build phases gives the supposedly-isolated group a real path to learn
+  the other group's blocks via header relay -- silently defeating the
+  strict-alternation the whole reorg recipe depends on. The seeder's own crawler
+  adds flakiness on top even where `seeder-test-node` never attached (see
+  `work-done.md`'s Lessons learnt on its held-open probe connections).
 - **Output**: none written to disk -- verification results are logged; a mismatch
   at any check raises `SeederVerificationError` (non-zero exit).
 - **Active in the workflow** as "Bring up tapyrus-seeder and verify it".

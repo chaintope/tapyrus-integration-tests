@@ -140,10 +140,20 @@ does.
   one flat Docker network.
 - **`tapyrus-seeder` genuinely bootstraps a new node** (`scripts/verify_seeder.py`).
   A brand-new 8th node with no hardcoded topology knowledge discovers and connects to
-  the network entirely through it. That node (`seeder-test-node`) is torn down right
-  after this confirms, not left running -- confirmed live that a lingering connection
-  from it otherwise shows up as an unexplained extra peer to `wait_for_topology.py`,
-  which has no way to know about this probe-only container.
+  the network entirely through it. Both that node (`seeder-test-node`) and `seeder`
+  itself are stopped and removed once `run()` finishes, in a `finally` (guaranteed on
+  failure too) -- neither is part of the fixed topology every later step (reorg,
+  federation change) runs against. Left running, `seeder-test-node`'s persistent
+  connection into whichever listener it discovered permanently mismatches
+  `wait_for_topology.py`'s exact `getconnectioncount` check on that node, and during
+  `simulate_reorg.py`'s isolated-build phases (one group's core nodes entirely
+  stopped while the other builds alone) gives the supposedly-isolated group a real
+  P2P path to learn the *other* group's blocks via header relay before it's supposed
+  to see them at all -- silently defeating the strict-alternation the whole reorg
+  recipe depends on. The seeder's own crawler adds flakiness on top even where
+  `seeder-test-node` never attached: it re-tests every address on its own ~60s cycle
+  with real TCP connections held open waiting for a reply that never comes (see
+  Lessons learnt below), which can transiently perturb any node's exact-count poll.
 - **Phase 1's addseeder-mode check looks for one real (non-seeder) peer, not a peer
   count.** The original design captured each node's peer count right after the
   post-restart `_wait_for_all_rpc_ready` returned, then waited for it to exceed

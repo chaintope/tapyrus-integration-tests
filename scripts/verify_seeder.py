@@ -33,6 +33,7 @@ the workflow already sets.
 """
 import asyncio
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -105,6 +106,17 @@ class SeederVerificationError(Exception):
     """The seeder didn't behave as expected -- see the message for which check."""
 
 
+def _require_dig():
+    # Without this, a missing `dig` surfaces as a raw FileNotFoundError traceback
+    # from subprocess.run below -- it's raised before main()'s own except tuple can
+    # catch anything meaningful. GitHub's ubuntu runners ship it; this only ever
+    # bites a local run without bind-utils/dnsutils installed.
+    if shutil.which("dig") is None:
+        log.error("'dig' not found on PATH -- required for this script's DNS checks")
+        log.error("install it first (e.g. `apt install dnsutils` or `brew install bind`)")
+        sys.exit(1)
+
+
 def _container_ip(container_name):
     result = subprocess.run(
         ["docker", "inspect", container_name, "--format", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}"],
@@ -137,13 +149,32 @@ class SeederVerifier:
         # GENESIS_BLOCK_WITH_SIG substitution), same as the workflow's old "Bring up
         # redis + 7 core nodes" step used to set inline.
         os.environ["GENESIS_BLOCK_WITH_SIG"] = (REPO_ROOT / "secrets" / "signer-set-a" / "genesis.hex").read_text().strip()
-        await self._bring_up_seeder()
-        await self._run_addseeder_phase()
-        await self._run_connect_phase()
-        node_ips = self._resolve_node_ips()
-        await self._wait_for_seeder_convergence_connect_mode(node_ips)
-        await self._verify_new_node_bootstraps_via_seeder(node_ips)
-        log.info("done. seeder grows peer counts organically via -addseeder, correctly reports only listening nodes in connect mode, and a brand-new node auto-bootstrapped through it for real.")
+        try:
+            await self._bring_up_seeder()
+            await self._run_addseeder_phase()
+            await self._run_connect_phase()
+            node_ips = self._resolve_node_ips()
+            await self._wait_for_seeder_convergence_connect_mode(node_ips)
+            await self._verify_new_node_bootstraps_via_seeder(node_ips)
+            log.info("done. seeder grows peer counts organically via -addseeder, correctly reports only listening nodes in connect mode, and a brand-new node auto-bootstrapped through it for real.")
+        finally:
+            # Guaranteed even on failure, not just success: this script's own job is
+            # done once run() returns either way, but seeder/seeder-test-node aren't
+            # part of the fixed topology every later step (reorg, federation change)
+            # runs against -- left running, seeder-test-node holds a persistent P2P
+            # connection into whichever listener it discovered, permanently throwing
+            # off wait_for_topology.py's exact getconnectioncount match on that node
+            # (and, during simulate_reorg.py's isolated-build phases, gives the
+            # supposedly-isolated group a real path to learn the OTHER group's
+            # blocks via header relay -- silently defeating the strict-alternation
+            # isolation the whole reorg recipe depends on). The seeder's own crawler
+            # adds flakiness on top even where seeder-test-node never attached: it
+            # re-tests every address on its own cycle with real TCP connections held
+            # open waiting for a reply that never comes (see work-done.md's Lessons
+            # learnt), which can transiently perturb any node's exact-count poll.
+            log.step("tearing down seeder-test-node and seeder (verification complete)")
+            await compose("stop", "seeder-test-node", "seeder")
+            await compose("rm", "-f", "seeder-test-node", "seeder")
 
     async def _bring_up_seeder(self):
         log.step("bringing up tapyrus-seeder, seeded directly from all 7 core nodes")
@@ -323,6 +354,7 @@ class SeederVerifier:
 
 
 async def main():
+    _require_dig()
     rpc_user = os.environ.get("CORE_RPC_USER", "rpcuser")
     rpc_pass = os.environ.get("CORE_RPC_PASS", "rpcpassword")
 
