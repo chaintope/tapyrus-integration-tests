@@ -101,9 +101,7 @@ jobs:
           python-version: '3.11'
 
       - name: Record run start time
-        # For the Slack report's run-duration figure -- that step can run hours after
-        # this one, so it needs a fixed start point read back from $GITHUB_ENV, not
-        # anything computed at that point.
+        # For the Slack report's run-duration figure
         run: echo "RUN_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
 
       - name: Derive CHAIN_HEIGHT_BEFORE_REORG from TX_ROUND_COUNT
@@ -147,19 +145,16 @@ jobs:
 
       - name: Render tapyrus.conf
         run: ./scripts/render_tapyrus_conf.py
-      - name: Bring up redis + 7 core nodes
-        run: |
-          cd docker
-          GENESIS_BLOCK_WITH_SIG=$(cat ../secrets/signer-set-a/genesis.hex) \
-            docker compose up -d redis core-1a core-1b core-2a core-2b core-3a core-3b core-7
+      - name: Bring up redis
+        run: cd docker && docker compose up -d redis
+      - name: Bring up tapyrus-seeder and verify it
+        run: ./scripts/verify_seeder.py
       - name: Wait for topology to converge
         run: ./scripts/wait_for_topology.py
       - name: Collect coinbase addresses from each first-layer node
         run: |
           ./scripts/collect_coinbase_addresses.py 12381 12383 12385 --output /tmp/addrs.txt
           printf 'core-1a\ncore-2a\ncore-3a\n' > /tmp/core-rpc-hosts.txt
-      - name: Bring up tapyrus-seeder and verify it
-        run: ./scripts/verify_seeder.py
       - name: Assemble signer configs
         run: |
           ROUND_DURATION="$ROUND_DURATION" ./scripts/assemble_signer_configs.py signer-set-a 2 \

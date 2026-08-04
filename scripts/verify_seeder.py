@@ -1,33 +1,21 @@
 #!/usr/bin/env python3
-"""Verify tapyrus-seeder end-to-end: it correctly reports only genuinely-listening
-nodes, and a brand-new node can actually auto-bootstrap onto the network through it --
-not just that a container exists and answers pings.
+"""Verify tapyrus-seeder end-to-end, in both bring-up modes docker-compose.yml
+supports for the 7 core-* nodes:
 
-Two checks, both against the already-running 7-node stack (docker/docker-compose.yml
-section 4b) plus the `seeder` service this script brings up itself:
+1. **addseeder mode**: all 7 nodes come up with only `-addseeder=<seed-hostname>`,
+   no `-connect` at all. Proves the seeder can grow every node's peer count from
+   nothing, organically, via real DNS-seed discovery -- not just that `dig` resolves
+   something. See doc/work-done.md's Lessons learnt for why this needs its own
+   phase: a node with no `-connect` of its own uses whatever `-addseeder` hands it to
+   open real outbound connections, which is the point here but silently destabilizes
+   the fixed topology if left on permanently.
+2. **connect mode**: the fixed topology every other script in this repo (traffic
+   generation, reorg, federation change) actually runs against. Re-verifies the
+   seeder correctly reports only genuinely-listening nodes (`core-7` never listens
+   here, seeded anyway as a deliberate negative case), and that a brand-new node with
+   no topology knowledge of its own can auto-bootstrap through the seeder alone.
 
-1. **The seeder only reports genuinely-listening nodes.** `core-7` never listens in
-   this topology (see docker-compose.yml's "CONNECT/LISTEN DESIGN" note) but is
-   seeded anyway, deliberately, as a real negative case. Polls `dig` against the
-   seeder's DNS port until the returned address set stabilizes on exactly the 6
-   nodes that DO listen (`core-1a`/`1b`/`2a`/`2b`/`3a`/`3b`) -- `core-7` can
-   legitimately appear transiently before that (see doc/work-done.md's Lessons
-   learnt for why), so it's only asserted against once the response has stabilized
-   on the full expected set, or times out.
-
-2. **A brand-new node can auto-bootstrap through it for real.** Brings up
-   `seeder-test-node` (docker-compose.yml) -- an 8th tapyrus-core node with NO
-   `-connect` at all, configured only with `-addseeder=<seed-hostname>`
-   (tapyrus-core's own DNS-seed client) and its container DNS resolver pointed at
-   the seeder itself (compose's `dns:` field, substituted from `SEEDER_IP` -- the
-   seeder's real container IP, resolved via `docker inspect` since compose's own
-   YAML can't reference another service's dynamic IP). Polls its `getpeerinfo` RPC
-   until it shows at least one peer, then confirms that peer is one of the 6
-   legitimately-listening nodes -- proof the new node discovered and connected to
-   the real network through the seeder's DNS answer alone, with no hardcoded
-   topology knowledge of its own.
-
-Both checks depend on docker-compose.yml's `default:` network using a custom,
+Both modes depend on docker-compose.yml's `default:` network using a custom,
 non-default subnet -- see that file's own comment and doc/work-done.md's Lessons
 learnt for why (short version: tapyrus-core and tapyrus-seeder both refuse to ever
 treat a non-routable address as usable, and Docker's default bridge range -- and
@@ -36,9 +24,12 @@ every "officially reserved for testing" range -- counts as non-routable).
 Usage:
     ./scripts/verify_seeder.py
 
-Requires the 7-node topology and signer-set-a already up and converged (same
-precondition as scripts/generate_traffic.py). Reads CORE_RPC_USER / CORE_RPC_PASS
-from the environment, same job-level env vars the workflow already sets.
+Requires only redis already up (`docker compose up -d redis`) -- this script brings
+the 7 core-* nodes up itself, in both modes above, tearing down and recreating them
+between the two. Run it before wait_for_topology.py and anything else that depends
+on the fixed topology being stable (traffic generation, reorg, etc.), not after.
+Reads CORE_RPC_USER / CORE_RPC_PASS from the environment, same job-level env vars
+the workflow already sets.
 """
 import asyncio
 import os
@@ -50,7 +41,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.lib.compose import ComposeError, bring_up  # noqa: E402
+from scripts.lib.compose import ComposeError, bring_up, compose  # noqa: E402
 from scripts.lib.log import log  # noqa: E402
 from scripts.lib.rpc import CoreRpcClient, RpcError, RpcUnreachable  # noqa: E402
 
@@ -60,15 +51,39 @@ SEEDER_DNS_PORT = 5390
 SEED_HOSTNAME = "seed.tapyrus-integration-tests.local"
 
 LISTENING_NODES = ("core-1a", "core-1b", "core-2a", "core-2b", "core-3a", "core-3b")
-ALL_SEEDED_NODES = LISTENING_NODES + ("core-7",)
+CORE_NODES = LISTENING_NODES + ("core-7",)
+
+CORE_RPC_PORTS = {
+    "core-1a": 12381, "core-1b": 12382, "core-2a": 12383,
+    "core-2b": 12384, "core-3a": 12385, "core-3b": 12386, "core-7": 12387,
+}
+
+# The fixed topology every other script in this repo runs against (docker-compose.yml
+# section 4b) -- see that file's own "CONNECT/LISTEN DESIGN" comment.
+CONNECT_MODE_ARGS = {
+    "core-1a": "",
+    "core-1b": "-connect=core-1a -listen=1",
+    "core-2a": "",
+    "core-2b": "-connect=core-2a -listen=1",
+    "core-3a": "",
+    "core-3b": "-connect=core-3a -listen=1",
+    "core-7": "-connect=core-1b -connect=core-2b -connect=core-3b",
+}
 
 DIG_POLL_INTERVAL_SECONDS = 10
-# db.cpp's MIN_RETRY (60s) x2 (need 3 successful tests, 60s+ apart, per address)
-# plus handshake/test overhead and margin.
-DIG_TIMEOUT_SECONDS = 300
+# db.cpp's MIN_RETRY (60s) x2 (need 3 successful tests, 60s+ apart, per address) plus
+# handshake/test overhead and margin -- plus, unlike a seeder started against
+# already-existing core nodes, ThreadSeeder's -s hostname resolution here always
+# misses on its first attempt (the core nodes come up at nearly the same moment as
+# the seeder itself, in both phases below), so it eats a full extra 3-minute wait for
+# its own periodic re-resolution before any testing can even begin. Confirmed live:
+# a 300s timeout was too tight for this design, cutting it off mid-convergence.
+DIG_TIMEOUT_SECONDS = 480
 RPC_READY_TIMEOUT_SECONDS = 120
 RPC_READY_POLL_INTERVAL_SECONDS = 3
 BOOTSTRAP_TIMEOUT_SECONDS = 120
+PEER_GROWTH_POLL_INTERVAL_SECONDS = 5
+PEER_GROWTH_TIMEOUT_SECONDS = 90
 
 
 class SeederVerificationError(Exception):
@@ -91,28 +106,125 @@ def _dig_a_records(dns_ip, dns_port, hostname):
     return {line.strip() for line in result.stdout.splitlines() if line.strip()}
 
 
+def _args_env_var(node_name):
+    # core-1a -> CORE_1A_ARGS -- matches docker-compose.yml's ${CORE_1A_ARGS:-} etc.
+    return f"CORE_{node_name[len('core-'):].upper()}_ARGS"
+
+
 class SeederVerifier:
     def __init__(self, rpc_user, rpc_pass):
         self._rpc_user = rpc_user
         self._rpc_pass = rpc_pass
 
     async def run(self):
+        # Same signed genesis every core-* node loads -- needed in this process's own
+        # environment for both bring-up phases below (docker-compose.yml's
+        # GENESIS_BLOCK_WITH_SIG substitution), same as the workflow's old "Bring up
+        # redis + 7 core nodes" step used to set inline.
+        os.environ["GENESIS_BLOCK_WITH_SIG"] = (REPO_ROOT / "secrets" / "signer-set-a" / "genesis.hex").read_text().strip()
         await self._bring_up_seeder()
+        await self._run_addseeder_phase()
+        await self._run_connect_phase()
         node_ips = self._resolve_node_ips()
-        await self._verify_only_listening_nodes_served(node_ips)
+        await self._wait_for_seeder_convergence_connect_mode(node_ips)
         await self._verify_new_node_bootstraps_via_seeder(node_ips)
-        log.info("done. seeder correctly reports only listening nodes, and a brand-new node auto-bootstrapped through it for real.")
+        log.info("done. seeder grows peer counts organically via -addseeder, correctly reports only listening nodes in connect mode, and a brand-new node auto-bootstrapped through it for real.")
 
     async def _bring_up_seeder(self):
         log.step("bringing up tapyrus-seeder, seeded directly from all 7 core nodes")
         await bring_up("seeder")
+        os.environ["SEEDER_IP"] = _container_ip("docker-seeder-1")
+
+    async def _run_addseeder_phase(self):
+        log.step("phase 1 (addseeder mode): bringing up all 7 core nodes with only -addseeder, no -connect")
+        for node in CORE_NODES:
+            os.environ[_args_env_var(node)] = f"-addseeder={SEED_HOSTNAME}"
+        await bring_up(*CORE_NODES)
+        await self._wait_for_all_rpc_ready(CORE_NODES)
+
+        log.step("waiting for the seeder's own -s crawl to converge -- it doesn't need the core nodes' -addseeder to work")
+        await self._wait_for_seeder_convergence_all_7(self._resolve_node_ips())
+
+        # ThreadDNSAddressSeed (tapyrus-core's -addseeder consumer) runs exactly once
+        # at process startup, before the seeder above had converged -- confirmed live,
+        # it logged "0 addresses found from DNS seeds" the first time. Restarting now
+        # re-runs it against a seeder that actually has answers.
+        log.step("restarting the 7 core nodes so their one-shot -addseeder lookup runs again, now that the seeder has real answers")
+        await compose("restart", *CORE_NODES)
+        await self._wait_for_all_rpc_ready(CORE_NODES)
+
+        await self._verify_peer_counts_grow()
+
+    async def _run_connect_phase(self):
+        log.step("phase 2 (connect mode): tearing down the 7 core nodes and the seeder, restoring the fixed topology")
+        # Also recreating the seeder, not just the core nodes: container recreation
+        # gives every node a new IP, and the seeder's phase-1 "good" set is keyed on
+        # the old ones -- reusing it would mean waiting out stale entries instead of
+        # converging cleanly.
+        await compose("stop", *CORE_NODES, "seeder")
+        await compose("rm", "-f", *CORE_NODES, "seeder")
+
+        for node, args in CONNECT_MODE_ARGS.items():
+            os.environ[_args_env_var(node)] = args
+
+        await self._bring_up_seeder()
+        await bring_up(*CORE_NODES)
+        await self._wait_for_all_rpc_ready(CORE_NODES)
 
     def _resolve_node_ips(self):
-        ips = {name: _container_ip(f"docker-{name}-1") for name in ALL_SEEDED_NODES}
+        ips = {name: _container_ip(f"docker-{name}-1") for name in CORE_NODES}
         log.info(f"resolved container IPs: {ips}")
         return ips
 
-    async def _verify_only_listening_nodes_served(self, node_ips):
+    async def _verify_peer_counts_grow(self):
+        log.step("polling peer counts on all 7 nodes until each shows real growth over its own baseline")
+        clients = {n: CoreRpcClient(RPC_HOST, CORE_RPC_PORTS[n], self._rpc_user, self._rpc_pass) for n in CORE_NODES}
+        baseline = {n: len(await clients[n].call("getpeerinfo")) for n in CORE_NODES}
+        log.info(f"baseline peer counts: {baseline}")
+
+        grown = set()
+        deadline = time.monotonic() + PEER_GROWTH_TIMEOUT_SECONDS
+        while len(grown) < len(CORE_NODES):
+            for n in CORE_NODES:
+                if n in grown:
+                    continue
+                count = len(await clients[n].call("getpeerinfo"))
+                if count > baseline[n]:
+                    grown.add(n)
+                    log.info(f"{n}: peer count grew {baseline[n]} -> {count}")
+            if len(grown) >= len(CORE_NODES):
+                break
+            if time.monotonic() >= deadline:
+                missing = set(CORE_NODES) - grown
+                raise SeederVerificationError(
+                    f"these nodes never grew their peer count above baseline within "
+                    f"{PEER_GROWTH_TIMEOUT_SECONDS}s: {missing} (baseline: {baseline})"
+                )
+            await asyncio.sleep(PEER_GROWTH_POLL_INTERVAL_SECONDS)
+        log.info("confirmed: every core node's peer count grew organically via -addseeder")
+
+    async def _wait_for_seeder_convergence_all_7(self, node_ips):
+        # addseeder mode: core-7 has no -connect at all here, so it listens like the
+        # other 6 and legitimately becomes good too -- confirmed live (dig returned
+        # all 7). No exclusion check, unlike connect mode below.
+        expected_ips = set(node_ips.values())
+
+        log.step(f"polling the seeder's DNS ({SEED_HOSTNAME}) until it reports all 7 nodes as good")
+        deadline = time.monotonic() + DIG_TIMEOUT_SECONDS
+        while True:
+            returned_ips = _dig_a_records(RPC_HOST, SEEDER_DNS_PORT, SEED_HOSTNAME)
+            log.info(f"dig returned {len(returned_ips)}/7 expected address(es): {returned_ips or '(none yet)'}")
+            if returned_ips == expected_ips:
+                log.info("confirmed: seeder reports all 7 nodes as good")
+                return
+            if time.monotonic() >= deadline:
+                raise SeederVerificationError(
+                    f"seeder never converged on all 7 nodes within {DIG_TIMEOUT_SECONDS}s -- "
+                    f"last response: {returned_ips}, expected: {expected_ips}"
+                )
+            await asyncio.sleep(DIG_POLL_INTERVAL_SECONDS)
+
+    async def _wait_for_seeder_convergence_connect_mode(self, node_ips):
         expected_ips = {node_ips[name] for name in LISTENING_NODES}
         excluded_ip = node_ips["core-7"]
 
@@ -122,10 +234,14 @@ class SeederVerifier:
         )
         deadline = time.monotonic() + DIG_TIMEOUT_SECONDS
         while True:
-            # This script runs on the host, not in a container -- dig against the
-            # host-published port, not the seeder's internal docker-network IP
-            # (that's only reachable from other containers, which is exactly why
-            # seeder-test-node's SEEDER_IP below uses _container_ip instead).
+            # This script itself runs on the host, not as a container on the compose
+            # network, so it must go through the seeder's host-published port
+            # (127.0.0.1:5390) -- the host has no route to the seeder's actual
+            # container IP under Docker Desktop, only to ports it published. A
+            # container-to-container caller doesn't have that problem and can use
+            # the real container IP directly; that's why seeder-test-node below
+            # points its dns: at SEEDER_IP (via _container_ip) instead of this same
+            # host-published port.
             returned_ips = _dig_a_records(RPC_HOST, SEEDER_DNS_PORT, SEED_HOSTNAME)
             log.info(f"dig returned {len(returned_ips)}/{len(LISTENING_NODES)} expected address(es): {returned_ips or '(none yet)'}")
             if returned_ips == expected_ips:
@@ -146,12 +262,6 @@ class SeederVerifier:
     async def _verify_new_node_bootstraps_via_seeder(self, node_ips):
         seeder_ip = _container_ip("docker-seeder-1")
         os.environ["SEEDER_IP"] = seeder_ip
-        # Same signed genesis every core-* node loads -- docker-compose.yml's
-        # GENESIS_BLOCK_WITH_SIG substitution needs this set in this process's own
-        # environment, same as the workflow's "Bring up redis + 7 core nodes" step
-        # does inline; without it, this node loads no genesis at all and crashes
-        # ("bad-features, Incorrect Block features" at height 0).
-        os.environ["GENESIS_BLOCK_WITH_SIG"] = (REPO_ROOT / "secrets" / "signer-set-a" / "genesis.hex").read_text().strip()
         expected_ips = {node_ips[name] for name in LISTENING_NODES}
 
         log.step(f"bringing up seeder-test-node (no -connect, -addseeder only) via seeder at {seeder_ip}")
@@ -181,6 +291,10 @@ class SeederVerifier:
                 )
             await asyncio.sleep(DIG_POLL_INTERVAL_SECONDS)
 
+    async def _wait_for_all_rpc_ready(self, nodes):
+        clients = [CoreRpcClient(RPC_HOST, CORE_RPC_PORTS[n], self._rpc_user, self._rpc_pass) for n in nodes]
+        await asyncio.gather(*(self._wait_for_rpc_ready(c) for c in clients))
+
     async def _wait_for_rpc_ready(self, client):
         deadline = time.monotonic() + RPC_READY_TIMEOUT_SECONDS
         while True:
@@ -189,7 +303,7 @@ class SeederVerifier:
                 return
             except RpcUnreachable as exc:
                 if time.monotonic() >= deadline:
-                    raise TimeoutError(f"seeder-test-node's RPC never became reachable within {RPC_READY_TIMEOUT_SECONDS}s: {exc}")
+                    raise TimeoutError(f"a node's RPC never became reachable within {RPC_READY_TIMEOUT_SECONDS}s: {exc}")
                 await asyncio.sleep(RPC_READY_POLL_INTERVAL_SECONDS)
 
 
@@ -197,7 +311,7 @@ async def main():
     rpc_user = os.environ.get("CORE_RPC_USER", "rpcuser")
     rpc_pass = os.environ.get("CORE_RPC_PASS", "rpcpassword")
 
-    log.step("verifying tapyrus-seeder: only listening nodes served, and a new node auto-bootstraps through it")
+    log.step("verifying tapyrus-seeder in both bring-up modes: addseeder-driven peer growth, then the fixed connect topology")
     verifier = SeederVerifier(rpc_user, rpc_pass)
     await verifier.run()
 

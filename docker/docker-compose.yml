@@ -21,8 +21,21 @@
 #                 confirmed with the team, not an oversight.
 #
 # All 7 nodes stay on this one flat compose network (not segmented into separate
-# Docker networks per edge) -- deliberately, per the plan doc, so a future adversary
-# node (connecting P2P to two first-layer nodes) remains buildable without rework.
+# Docker networks per edge).
+#
+# TWO BRING-UP MODES, same 7 services: each core-* node's extra P2P flags come from
+# its own CORE_<NAME>_ARGS env var (empty string if unset), not a fixed command: --
+# scripts/verify_seeder.py sets these to bring the 7 nodes up twice in the same run:
+#   1. addseeder mode: every node gets only `-addseeder=<seed-hostname>`, no -connect
+#      at all -- proves the seeder can genuinely grow every node's peer count from
+#      nothing, organically, via DNS-seed discovery alone.
+#   2. connect mode: the fixed topology described above (CORE_1B_ARGS=
+#      "-connect=core-1a -listen=1", etc.) -- what every other script in this repo
+#      (traffic generation, reorg, federation change) actually runs against.
+# See doc/work-done.md's Lessons learnt for why mode 1 needed its own phase instead
+# of just adding -addseeder alongside -connect (short version: nodes with no
+# -connect of their own start dialing out to whatever -addseeder hands them, which
+# is the point in mode 1 but silently destabilizes the fixed topology in mode 2).
 #
 # NETWORK/CONF: each core-* node mounts ./generated/tapyrus.conf (gitignored, rendered
 # by scripts/render_tapyrus_conf.py before `docker compose up` -- see the workflow)
@@ -33,15 +46,18 @@ services:
     image: redis:5.0-alpine
     command: redis-server
 
-  # --- first layer: one per signer, each an RPC target. No -connect needed --
-  # (see "CONNECT/LISTEN DESIGN" above) -- these just accept their -b sibling's
-  # inbound connection via plain default listen=1.
+  # --- first layer: one per signer, each an RPC target. In connect mode, no
+  # -connect needed here at all (see "CONNECT/LISTEN DESIGN" above) -- these just
+  # accept their -b sibling's inbound connection via plain default listen=1.
   core-1a:
     image: tapyrus/tapyrusd:master-local
     environment:
       GENESIS_BLOCK_WITH_SIG: ${GENESIS_BLOCK_WITH_SIG}
     volumes:
       - ./generated/tapyrus.conf:/etc/tapyrus/tapyrus.conf
+    dns:
+      - ${SEEDER_IP}
+    command: tapyrusd -datadir=$${DATA_DIR} -conf=$${CONF_DIR}/tapyrus.conf ${CORE_1A_ARGS:-}
     ports:
       - '12381:12381'
 
@@ -51,6 +67,9 @@ services:
       GENESIS_BLOCK_WITH_SIG: ${GENESIS_BLOCK_WITH_SIG}
     volumes:
       - ./generated/tapyrus.conf:/etc/tapyrus/tapyrus.conf
+    dns:
+      - ${SEEDER_IP}
+    command: tapyrusd -datadir=$${DATA_DIR} -conf=$${CONF_DIR}/tapyrus.conf ${CORE_2A_ARGS:-}
     ports:
       - '12383:12381'
 
@@ -60,18 +79,23 @@ services:
       GENESIS_BLOCK_WITH_SIG: ${GENESIS_BLOCK_WITH_SIG}
     volumes:
       - ./generated/tapyrus.conf:/etc/tapyrus/tapyrus.conf
+    dns:
+      - ${SEEDER_IP}
+    command: tapyrusd -datadir=$${DATA_DIR} -conf=$${CONF_DIR}/tapyrus.conf ${CORE_3A_ARGS:-}
     ports:
       - '12385:12381'
 
-  # --- second layer: dials its first-layer parent, and re-enables listen=1 --
-  # so core-7 can also dial in to it.
+  # --- second layer: in connect mode, dials its first-layer parent and
+  # re-enables listen=1 so core-7 can also dial in to it.
   core-1b:
     image: tapyrus/tapyrusd:master-local
     environment:
       GENESIS_BLOCK_WITH_SIG: ${GENESIS_BLOCK_WITH_SIG}
     volumes:
       - ./generated/tapyrus.conf:/etc/tapyrus/tapyrus.conf
-    command: tapyrusd -datadir=$${DATA_DIR} -conf=$${CONF_DIR}/tapyrus.conf -connect=core-1a -listen=1
+    dns:
+      - ${SEEDER_IP}
+    command: tapyrusd -datadir=$${DATA_DIR} -conf=$${CONF_DIR}/tapyrus.conf ${CORE_1B_ARGS:-}
     ports:
       - '12382:12381'
 
@@ -81,7 +105,9 @@ services:
       GENESIS_BLOCK_WITH_SIG: ${GENESIS_BLOCK_WITH_SIG}
     volumes:
       - ./generated/tapyrus.conf:/etc/tapyrus/tapyrus.conf
-    command: tapyrusd -datadir=$${DATA_DIR} -conf=$${CONF_DIR}/tapyrus.conf -connect=core-2a -listen=1
+    dns:
+      - ${SEEDER_IP}
+    command: tapyrusd -datadir=$${DATA_DIR} -conf=$${CONF_DIR}/tapyrus.conf ${CORE_2B_ARGS:-}
     ports:
       - '12384:12381'
 
@@ -91,21 +117,23 @@ services:
       GENESIS_BLOCK_WITH_SIG: ${GENESIS_BLOCK_WITH_SIG}
     volumes:
       - ./generated/tapyrus.conf:/etc/tapyrus/tapyrus.conf
-    command: tapyrusd -datadir=$${DATA_DIR} -conf=$${CONF_DIR}/tapyrus.conf -connect=core-3a -listen=1
+    dns:
+      - ${SEEDER_IP}
+    command: tapyrusd -datadir=$${DATA_DIR} -conf=$${CONF_DIR}/tapyrus.conf ${CORE_3B_ARGS:-}
     ports:
       - '12386:12381'
 
-  # --- node 7: dials all three second-layer nodes; nothing dials into it, so
-  # no -listen=1 override needed here.
+  # --- node 7: in connect mode, dials all three second-layer nodes; nothing
+  # dials into it, so no -listen=1 override needed there.
   core-7:
     image: tapyrus/tapyrusd:master-local
     environment:
       GENESIS_BLOCK_WITH_SIG: ${GENESIS_BLOCK_WITH_SIG}
     volumes:
       - ./generated/tapyrus.conf:/etc/tapyrus/tapyrus.conf
-    command: >-
-      tapyrusd -datadir=$${DATA_DIR} -conf=$${CONF_DIR}/tapyrus.conf
-      -connect=core-1b -connect=core-2b -connect=core-3b
+    dns:
+      - ${SEEDER_IP}
+    command: tapyrusd -datadir=$${DATA_DIR} -conf=$${CONF_DIR}/tapyrus.conf ${CORE_7_ARGS:-}
     ports:
       - '12387:12381'
 
@@ -171,19 +199,18 @@ services:
       - core-3a
 
   # --- tapyrus-seeder: seeds directly from all 7 core-* nodes (one -s each, all
-  # supported -- main.cpp's -s parsing just appends each to a vector) rather than
-  # just core-1a left to crawl/discover the rest via P2P gossip -- this fixed
-  # -connect topology never organically propagates ADDR gossip at all, so crawling
-  # from a single node would never find the other 6. See doc/work-done.md's Lessons
-  # learnt for the full investigation (also covers why the `default:` network below
-  # needs a custom subnet at all).
+  # supported -- main.cpp's -s parsing just appends each to a vector), needed in
+  # both bring-up modes above: in connect mode this is the only way the seeder
+  # learns about all 7 (this fixed -connect topology never organically propagates
+  # ADDR gossip). See doc/work-done.md's Lessons learnt for the full investigation
+  # (also covers why the `default:` network below needs a custom subnet at all).
   #
-  # core-7 is seeded too, and expected to always test BAD: it's the one node whose
-  # command: sets -connect without an offsetting -listen=1 (see "CONNECT/LISTEN
-  # DESIGN" above), so tapyrus-core auto-disables its listening entirely -- nothing
-  # (seeder included) can ever open an inbound connection to it. Deliberate: a real
-  # demonstration that the seeder only ever calls a node "good" once it's genuinely
-  # reachable, not just "a container that exists" -- see scripts/verify_seeder.py.
+  # core-7 only tests BAD in connect mode: that's the only mode where its command:
+  # sets -connect without an offsetting -listen=1 (see "CONNECT/LISTEN DESIGN"
+  # above), so tapyrus-core auto-disables its listening entirely -- nothing (seeder
+  # included) can open an inbound connection to it there. In addseeder mode core-7
+  # has no -connect at all, so it listens normally like the other 6.
+  # scripts/verify_seeder.py exercises both.
   # -i/-s hardcode 1905960821 (not wired to NETWORK_ID -- deferred, see
   # render_tapyrus_conf.py's own note on why the seeder isn't wired to it yet either).
   # -s's port is 2357, prod mode's default P2P port (confirmed against a real

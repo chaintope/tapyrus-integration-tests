@@ -43,42 +43,49 @@ A single `integration-test` job runs these steps in order:
    involved yet).
 4. **Genesis signing**: build the unsigned genesis via `tapyrus-genesis`, then sign it
    with `scripts/sign_genesis.py`.
-5. **Bring the network up**: `docker compose up` redis + the 7 core nodes, then wait
-   for the P2P topology to converge (`scripts/wait_for_topology.py`, polling
-   `getconnectioncount` against the expected 1/2/1/2/1/2/3 pattern), then collect a
-   coinbase address from each first-layer node (`scripts/collect_coinbase_addresses.py`,
-   retries until each node's RPC is actually up).
-6. **Bring up signers**: assemble each signer's config with
+5. **Render `tapyrus.conf`, bring up `redis`.**
+6. **Bring up `tapyrus-seeder` and verify it** (`scripts/verify_seeder.py`) -- also
+   brings up the 7 core-* nodes itself, in two bring-up modes in sequence: first
+   addseeder-only (no `-connect` at all), confirming every node's peer count grows
+   organically from nothing via the seeder's DNS-seed answers alone; then the fixed
+   `-connect` topology every later step below depends on, confirming the seeder
+   reports only genuinely-listening nodes (never `core-7`, the one node that doesn't
+   listen in that mode) and that a brand-new 8th node with no topology knowledge of
+   its own genuinely auto-bootstraps through the seeder's DNS answer alone.
+7. **Wait for the P2P topology to converge** (`scripts/wait_for_topology.py`, polling
+   `getconnectioncount` against the expected 1/2/1/2/1/2/3 pattern) against the
+   now-finalized fixed topology, then collect a coinbase address from each
+   first-layer node (`scripts/collect_coinbase_addresses.py`, retries until each
+   node's RPC is actually up).
+8. **Bring up signers**: assemble each signer's config with
    `scripts/assemble_signer_configs.py`, bring up the 3 signer-set-a containers.
-7. **Per-node activity**: round-robin TPC + colored-coin traffic across all 7 nodes
-   with balances confirmed after each block (`scripts/generate_traffic.py`). RPC
-   health/height/mempool queries and stop/restart/resync for every node remain
+9. **Per-node activity**: round-robin TPC + colored-coin traffic across all 7 nodes
+   with balances confirmed after each block (`scripts/generate_traffic.py`),
+   including the 3 first-layer nodes' coinbase income -- calibrated from 3 real,
+   consecutive height observations early in the run (see `doc/work-done.md`), not
+   just excluded from the assertion. RPC health/height/mempool queries and
+   stop/restart/resync for every node remain
    *(not yet scripted -- see `doc/project-plan.md`'s Outstanding work)*.
-8. **Reorg**: split the network into two groups, let each build its own real
-   threshold-signed fork, reconnect, and confirm convergence via `getchaintips`
-   (`scripts/simulate_reorg.py`).
-9. **Aggpubkey rotation**: run the offline ceremony again for signer-set-b, then the
-   `--xfield` sign/computesig handoff and a `federations.toml` with both entries
-   (`scripts/simulate_federation_change.py`).
-10. **Max block size change**: signer-set-b signs off on a new max-block-size via the
+10. **Reorg**: split the network into two groups, let each build its own real
+    threshold-signed fork, reconnect, and confirm convergence via `getchaintips`
+    (`scripts/simulate_reorg.py`).
+11. **Aggpubkey rotation**: run the offline ceremony again for signer-set-b, then the
+    `--xfield` sign/computesig handoff and a `federations.toml` with both entries
+    (`scripts/simulate_federation_change.py`).
+12. **Max block size change**: signer-set-b signs off on a new max-block-size via the
     same `--xfield` flow, confirmed in effect via RPC at the scheduled height
     (`scripts/simulate_maxblocksize_change.py`).
-11. **Bring up tapyrus-seeder** and verify it end-to-end (`scripts/verify_seeder.py`):
-    confirms it reports only genuinely-listening nodes (never `core-7`, the one node
-    that doesn't listen in this topology), then brings up a brand-new 8th node with
-    no `-connect` at all and confirms it genuinely auto-bootstraps onto the network
-    through the seeder's DNS answer alone.
-12. **Teardown**: collect every container's logs, upload them as a CI artifact, then
+13. **Teardown**: collect every container's logs, upload them as a CI artifact, then
     `docker compose down` -- runs unconditionally (`if: always()`).
-13. **Slack report**: pass/fail summary, run metadata, both aggpubkeys, and (on failure)
+14. **Slack report**: pass/fail summary, run metadata, both aggpubkeys, and (on failure)
     the tail of any container log matching an error/panic pattern, sent unconditionally
     (`scripts/send_slack_report.py`) -- skips gracefully (not a failure) if
     `SLACK_WEBHOOK_URL` isn't provisioned.
 
-The entire scenario above (steps 1-10) has run successfully end-to-end in real GitHub
-Actions CI, not just locally -- see `doc/work-done.md`'s "Full real-CI end-to-end
-verification". Steps still marked "not yet scripted" just `echo` a TODO pointing at
-the relevant design-doc section -- see [`doc/project-plan.md`](doc/project-plan.md)'s
+The entire scenario above has run successfully end-to-end in real GitHub Actions CI,
+not just locally -- see `doc/work-done.md`'s "Full real-CI end-to-end verification".
+The one step still marked "not yet scripted" just `echo`s a TODO pointing at the
+relevant design-doc section -- see [`doc/project-plan.md`](doc/project-plan.md)'s
 Outstanding work for the full tracked list.
 
 ## Variables available to change during a run
@@ -201,6 +208,15 @@ rest -- see [`doc/scripts.md`](doc/scripts.md) for what each script actually doe
   CI to install before running these scripts. Worth reconsidering only if a future
   script (e.g. tx generation, the Slack report) genuinely needs something stdlib can't
   do reasonably.
+- **Configuring the Slack webhook** (`scripts/send_slack_report.py`,
+  `SLACK_WEBHOOK_URL`): webhooks are per-app, so this needs one-time setup:
+  1. Go to <https://api.slack.com/apps?new_app=1>, create an app from scratch, pick
+     the workspace.
+  2. **Features -> Incoming Webhooks**, turn it on.
+  3. **Add New Webhook to Workspace**, pick the channel.
+  4. Copy the URL (`https://hooks.slack.com/services/…`) -- treat it as a secret.
+  5. In this repo: **Settings -> Secrets and variables -> Actions -> New repository
+     secret**, name it `SLACK_WEBHOOK_URL`. The workflow already reads it.
 
 ## Where to look next
 

@@ -41,7 +41,7 @@ See [`work-done.md`](work-done.md) for known issues and design decisions.
 
 ## Milestone 3 -- Scenario mechanics
 
-- [x] Per-node transaction generation -- `scripts/generate_traffic.py` (`TrafficNode` + `TrafficGenerator`). Round-robin TPC + colored-coin (REISSUABLE/NON_REISSUABLE/NFT mix, one type per node) sends across all 7 nodes, everything derived from a single round count (`tx_round_count`); balance verified against a tracked ledger after every block. Wired into the workflow (`Generate traffic (before reorg)` step). Verified end-to-end: zero send/issuance failures across 2 full rounds, real balance changes throughout, settled correctly. Also guards against a fully-broken run trivially passing: `MIN_SUCCESSFUL_ACTION_FRACTION` asserts at least half the expected send/mint actions actually succeeded, not just that tracked-vs-actual balances agree (a never-funded node's ledger and real balance would otherwise both sit at `0.0` and look "consistent").
+- [x] Per-node transaction generation -- `scripts/generate_traffic.py` (`TrafficNode` + `TrafficGenerator`). Round-robin TPC + colored-coin (REISSUABLE/NON_REISSUABLE/NFT mix, one type per node) sends across all 7 nodes, everything derived from a single round count (`tx_round_count`); balance verified against a tracked ledger after every block, including the 3 coinbase-earning nodes' TPC (calibrated rotation + real per-block reward reads, not excluded -- see `work-done.md`). Wired into the workflow (`Generate traffic (before reorg)` step). Verified end-to-end: zero send/issuance failures and zero balance mismatches across 3 full rounds, real balance changes throughout (including coinbase), settled correctly. Also guards against a fully-broken run trivially passing: `MIN_SUCCESSFUL_ACTION_FRACTION` asserts at least half the expected send/mint actions actually succeeded, not just that tracked-vs-actual balances agree (a never-funded node's ledger and real balance would otherwise both sit at `0.0` and look "consistent").
 - [x] Max-block-size (xfield) change -- `scripts/simulate_maxblocksize_change.py`
   (`MaxBlockSizeChangeSimulator`). Signer-set-b (already active after the rotation
   above) signs off on a new max-block-size via a fresh `--xfield sign/computesig`
@@ -128,14 +128,16 @@ Each of these corresponds to a step in `.github/workflows/weekly-integration-tes
   (`_confirm_rotation_via_rpc`: `getblockchaininfo`'s `aggregatePubkeys` array on all
   7 core nodes must show the new pubkey at the scheduled height), rather than a
   separate step.
-- [x] `tapyrus-seeder` service actually brought up and verified --
-  `scripts/verify_seeder.py` (see `scripts.md`). Confirms both that the seeder
-  reports only genuinely-listening nodes (never `core-7`, deliberately seeded as a
-  real negative case) and that a brand-new node with no hardcoded topology
-  knowledge -- only `-addseeder` -- genuinely auto-bootstraps through it. See
-  `work-done.md`'s Lessons learnt for the underlying investigation (ADDR gossip,
-  DNS-seed reliability thresholds, and why the compose network needs a specific
-  custom subnet).
+- [x] `tapyrus-seeder` service actually brought up and verified, in both bring-up
+  modes docker-compose.yml supports for the 7 core-* nodes -- `scripts/verify_seeder.py`
+  (see `scripts.md`). Addseeder mode confirms every node's peer count grows
+  organically from nothing via `-addseeder` alone (no `-connect`); connect mode
+  confirms the seeder reports only genuinely-listening nodes (never `core-7`,
+  deliberately seeded as a real negative case there) and that a brand-new node with
+  no hardcoded topology knowledge auto-bootstraps through it. See `work-done.md`'s
+  Lessons learnt for the underlying investigation (ADDR gossip, DNS-seed reliability
+  thresholds, why `-connect` nodes never populate their own addrman, and why the
+  compose network needs a specific custom subnet).
 - [x] Slack report step -- `scripts/send_slack_report.py`, sent unconditionally
   (`if: always()`) at the end of the workflow: pass/fail, trigger/repo-ref/duration
   metadata, both aggpubkeys, and on failure the tail of any container log matching
