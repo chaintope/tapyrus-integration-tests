@@ -168,8 +168,10 @@ does.
   seeder's own (`SEEDER_SUBVER`)? One real peer is enough proof, as long as it's
   the right one.
 - **Secrets scope**: this repo only generates local dev secrets
-  (`generate_dev_secrets.py`); it never provisions real GitHub secrets. The Slack
-  webhook URL is the only actual CI secret needed.
+  (`generate_dev_secrets.py`); it never provisions real GitHub secrets. No CI
+  secret is currently needed at all -- Slack notification was deferred (see
+  Outstanding work in `project-plan.md`); GitHub's own built-in failure
+  notifications cover failure detection for now.
 - **Why the network uses `51.51.51.0/24`**: it needs to pass `IsRoutable()`, and
   neither RFC1918 private ranges nor RFC 5737 test ranges qualify -- `IsRoutable()`
   excludes both. `51.51.51.0/24` is an arbitrary block confirmed to fall outside

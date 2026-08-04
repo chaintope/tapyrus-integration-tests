@@ -77,10 +77,6 @@ A single `integration-test` job runs these steps in order:
     (`scripts/simulate_maxblocksize_change.py`).
 13. **Teardown**: collect every container's logs, upload them as a CI artifact, then
     `docker compose down` -- runs unconditionally (`if: always()`).
-14. **Slack report**: pass/fail summary, run metadata, both aggpubkeys, and (on failure)
-    the tail of any container log matching an error/panic pattern, sent unconditionally
-    (`scripts/send_slack_report.py`) -- skips gracefully (not a failure) if
-    `SLACK_WEBHOOK_URL` isn't provisioned.
 
 The entire scenario above has run successfully end-to-end in real GitHub Actions CI,
 not just locally -- see `doc/work-done.md`'s "Full real-CI end-to-end verification".
@@ -120,8 +116,6 @@ input; the rest fall back straight to their `env:` literal on every trigger,
 | `reorg_length` | `30` (`5` on pull_request/push) | Blocks each isolated group builds past the baseline, alone, before reconnecting at the tie (`scripts/simulate_reorg.py`: group B builds first while group A is stopped entirely, then group A builds its own, genuinely different set while group B is stopped). Group B is then always extended by exactly 2 more blocks to win (not 1 -- `core-3a` produced group A's original tip itself, so it needs a second block to reclassify that tip as `valid-fork` instead of `valid-headers`) -- not configurable, and not probed for -- see `doc/scripts.md` |
 | `round_duration_seconds` | `30` | `tapyrus-signerd` round-duration (block interval) -- verified clean, see `doc/work-done.md`'s Lessons learnt (`10` is confirmed to hit transient `InvalidBlock` errors) |
 | `network_id` | `1905960821` | Tapyrus network id (prod mode, see `doc/work-done.md`), used by every core-* node's rendered `tapyrus.conf` and the `genesis.<id>` file `tapyrusd` looks for |
-| `slack_log_tail_lines` | `100` | Lines of the implicated container's log inlined in the Slack failure report |
-| `slack_webhook_url` | see `SLACK_WEBHOOK_URL` repo secret | Slack incoming webhook to post the pass/fail report to -- the only variable here whose default is a real GitHub secret, not a literal, since `secrets.*` (unlike `inputs.*`) is readable on every trigger including `schedule`/`pull_request`/`push` |
 | `docker_build_platform` | *(empty, runner-native)* | Docker `--platform` for image builds -- local verification only ever used `linux/arm64` |
 
 `FEDERATION_CHANGE_HEIGHT` is always `REORG_LENGTH` (computed by the "Derive
@@ -206,17 +200,7 @@ rest -- see [`doc/scripts.md`](doc/scripts.md) for what each script actually doe
   has needed anything beyond the standard library (`asyncio`, `urllib`, `argparse`,
   `pathlib`, etc.) -- no `requirements.txt`, no virtualenv/package manager setup for
   CI to install before running these scripts. Worth reconsidering only if a future
-  script (e.g. tx generation, the Slack report) genuinely needs something stdlib can't
-  do reasonably.
-- **Configuring the Slack webhook** (`scripts/send_slack_report.py`,
-  `SLACK_WEBHOOK_URL`): webhooks are per-app, so this needs one-time setup:
-  1. Go to <https://api.slack.com/apps?new_app=1>, create an app from scratch, pick
-     the workspace.
-  2. **Features -> Incoming Webhooks**, turn it on.
-  3. **Add New Webhook to Workspace**, pick the channel.
-  4. Copy the URL (`https://hooks.slack.com/services/…`) -- treat it as a secret.
-  5. In this repo: **Settings -> Secrets and variables -> Actions -> New repository
-     secret**, name it `SLACK_WEBHOOK_URL`. The workflow already reads it.
+  script genuinely needs something stdlib can't do reasonably.
 
 ## Where to look next
 

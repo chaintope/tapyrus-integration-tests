@@ -36,10 +36,6 @@ on:
       # --- misc ---
       network_id:
         description: 'Tapyrus network id (prod mode -- see doc/work-done.md), used by every core-* node''s rendered tapyrus.conf and the genesis.<id> file tapyrusd looks for. Not yet wired into the seeder (deferred, see the "Bring up tapyrus-seeder and verify it" step). Leave blank for the default -- see README.md''s variable table.'
-      slack_log_tail_lines:
-        description: 'Lines of the implicated container''s log to inline in the Slack failure report. Leave blank for the default -- see README.md''s variable table.'
-      slack_webhook_url:
-        description: 'Slack incoming webhook URL to post the pass/fail report to. Leave blank to use the repo''s own SLACK_WEBHOOK_URL secret (the default for schedule/pull_request/push runs too, which have no inputs context to read this from at all).'
       docker_build_platform:
         description: 'Docker --platform for image builds; leave empty for the runner''s native platform'
 
@@ -80,11 +76,6 @@ env:
   ROUND_DURATION: ${{ inputs.round_duration_seconds || '30' }}
   REORG_LENGTH: ${{ inputs.reorg_length || ((github.event_name == 'pull_request' || github.event_name == 'push') && '5' || '30') }}
   MAX_BLOCK_SIZE_NEW: ${{ inputs.max_block_size_new || '2000000' }}
-  SLACK_LOG_TAIL_LINES: ${{ inputs.slack_log_tail_lines || '100' }}
-  # secrets.* (unlike inputs.*) is always readable regardless of trigger, including
-  # schedule/pull_request/push runs with no inputs context -- so this is the one
-  # default that lives in a real GitHub secret, not a literal here.
-  SLACK_WEBHOOK_URL: ${{ inputs.slack_webhook_url || secrets.SLACK_WEBHOOK_URL }}
 
 jobs:
   integration-test:
@@ -99,10 +90,6 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
-      - name: Record run start time
-        # For the Slack report's run-duration figure
-        run: echo "RUN_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
 
       - name: Derive CHAIN_HEIGHT_BEFORE_REORG from TX_ROUND_COUNT
         # env: expressions have no arithmetic -- ties the reorg baseline to TX_ROUND_COUNT.
@@ -203,10 +190,3 @@ jobs:
       - name: Teardown
         if: always()
         run: cd docker && docker compose down
-
-      - name: Send Slack report
-        if: always()
-        run: |
-          STATUS=fail
-          if [ "${{ job.status }}" = "success" ]; then STATUS=pass; fi
-          ./scripts/send_slack_report.py "$STATUS"

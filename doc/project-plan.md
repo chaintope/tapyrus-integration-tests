@@ -138,19 +138,6 @@ Each of these corresponds to a step in `.github/workflows/weekly-integration-tes
   Lessons learnt for the underlying investigation (ADDR gossip, DNS-seed reliability
   thresholds, why `-connect` nodes never populate their own addrman, and why the
   compose network needs a specific custom subnet).
-- [x] Slack report step -- `scripts/send_slack_report.py`, sent unconditionally
-  (`if: always()`) at the end of the workflow: pass/fail, trigger/repo-ref/duration
-  metadata, both aggpubkeys, and on failure the tail of any container log matching
-  an error/panic pattern. `slack_webhook_url` is a `workflow_dispatch` input,
-  falling back to the `SLACK_WEBHOOK_URL` repository secret (the only variable in
-  this workflow whose default is a real secret, not a literal, since `secrets.*` is
-  readable on every trigger including `schedule`/`pull_request`/`push`). Skips
-  gracefully (not a failure) if that secret isn't provisioned yet. Verified
-  structurally against a local mock webhook listener (no real Slack channel
-  available to send to) -- both the pass and fail message formats, the
-  implicated-container detection, and the graceful no-webhook skip all confirmed
-  live.
-
 ## Outstanding work
 
 Everything not yet implemented or not yet testable, in one place:
@@ -174,7 +161,15 @@ Everything not yet implemented or not yet testable, in one place:
   `TOKEN_ISSUE_AMOUNT`/etc.) haven't been stress-tested at a larger round count where
   the balance-shortfall top-up mechanic would trigger much more often.
 - **Team review/sign-off** on the design in `weekly-integration-test-plan.md`.
-- **Slack webhook URL** provisioned as a GitHub Actions secret.
+- **Slack pass/fail report**: deferred by team decision -- GitHub's own built-in
+  failure notifications cover failure detection for now, and the team isn't ready
+  to provision the webhook secret yet, so this shouldn't merge as a code path that
+  stays dormant behind a secret that doesn't exist. Was built and verified
+  (`scripts/send_slack_report.py`, structurally against a local mock webhook
+  listener -- both message formats, implicated-container detection, and the
+  graceful no-webhook skip all confirmed live) before being removed rather than
+  merged. Can come back as its own PR if the team later wants channel-wide
+  visibility or a weekly heartbeat report.
 - **Core-node RPC auth** is the static `rpcuser`/`rpcpassword` (hardcoded in
   `scripts/render_tapyrus_conf.py`, `CORE_RPC_USER`/`CORE_RPC_PASS` in the workflow's
   `env:` block, and every script that calls `CoreRpcClient`) -- switching to cookie

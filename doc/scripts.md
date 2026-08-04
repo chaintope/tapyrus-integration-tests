@@ -511,32 +511,6 @@ Implemented as `MaxBlockSizeChangeSimulator`, reusing `simulate_federation_chang
 - **Active in the workflow** as "Max block size change" -- uncommented after a
   confirmed real run.
 
-## `scripts/send_slack_report.py`
-
-Sends a pass/fail summary of the run to Slack via an incoming webhook, called
-unconditionally (`if: always()`) as the very last workflow step. Plain synchronous
-script (a single HTTP POST -- nothing to overlap, same reasoning as
-`assemble_signer_configs.py`'s own non-`asyncio` design).
-
-- **Usage**: `./scripts/send_slack_report.py <pass|fail>` -- the workflow passes
-  `${{ job.status }}` mapped to `pass`/`fail`.
-- **`SLACK_WEBHOOK_URL` env var** -- if unset or blank, logs a warning and exits 0
-  rather than failing the job just because the webhook hasn't been provisioned yet.
-  See `doc/work-done.md`'s Developer notes for how to obtain and configure one.
-- **Message contents**: pass/fail, trigger (`GITHUB_EVENT_NAME`), run duration (via
-  `RUN_STARTED_AT`, set by an early workflow step), repo refs, both aggpubkeys (if
-  present), and on failure the tail (`SLACK_LOG_TAIL_LINES`) of any container log
-  under `logs/*.log` containing a case-insensitive "error"/"panic" match -- not a
-  precise per-step fault attribution (this is one sequential job, not one step per
-  container), just a real, honest heuristic over what the "Collect logs" step
-  already wrote.
-- **Known limitation**: a failed Slack POST is logged, not raised -- deliberately,
-  since this is the very last step and a notification failure shouldn't retroactively
-  fail an otherwise-passing run.
-- **Verified structurally**, not against a real Slack channel (none available) --
-  against a local mock HTTP listener: both message formats, the implicated-container
-  detection, and the graceful no-webhook skip all confirmed live.
-
 ## `docker/docker-compose.yml`
 
 Not a script, but the other piece every scenario run depends on -- the 7-core-node +
