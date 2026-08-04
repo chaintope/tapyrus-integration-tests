@@ -108,6 +108,10 @@ jobs:
         run: |
           docker build ${DOCKER_BUILD_PLATFORM:+--platform "$DOCKER_BUILD_PLATFORM"} \
             -t tapyrus/tapyrusd:master-local -f workdir/tapyrus-core/Dockerfile workdir/tapyrus-core
+      - name: Build node-orchestrator image (tapyrus/tapyrusd:orchestrator)
+        run: |
+          docker build ${DOCKER_BUILD_PLATFORM:+--platform "$DOCKER_BUILD_PLATFORM"} \
+            -t tapyrus/tapyrusd:orchestrator -f docker/orchestrator.Dockerfile docker/
       - name: Build tapyrus-signer image (tapyrus-signer:integration-test)
         run: |
           docker build ${DOCKER_BUILD_PLATFORM:+--platform "$DOCKER_BUILD_PLATFORM"} \
@@ -136,6 +140,19 @@ jobs:
         run: cd docker && docker compose up -d redis
       - name: Bring up tapyrus-seeder and verify it
         run: ./scripts/verify_seeder.py
+      - name: Start node orchestrator
+        # Recreates the 7 core-* nodes under scripts/container/node_orchestrator.py,
+        # which randomly stops/restarts/reindexes/invalidates each one for the rest
+        # of the job -- see doc/work-done.md. NODE_ORCHESTRATOR is persisted to
+        # $GITHUB_ENV (not just this step's own process) because signer-0/1/2 and
+        # signer-set-b's services all `depends_on` a core-1a/2a/3a node -- without
+        # this, any later `docker compose up` touching them (Bring up signers,
+        # Federation change) would resolve NODE_ORCHESTRATOR back to unset, and
+        # Compose would silently recreate that core node to match, reverting it to
+        # plain tapyrusd. Confirmed live: this exact drift happened mid-session.
+        run: |
+          ./scripts/start_node_orchestrator.py
+          echo "NODE_ORCHESTRATOR=1" >> "$GITHUB_ENV"
       - name: Wait for topology to converge
         run: ./scripts/wait_for_topology.py
       - name: Collect coinbase addresses from each first-layer node

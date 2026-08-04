@@ -35,12 +35,21 @@ Shared code the scripts below import rather than duplicate:
 - `lib/rpc.py` -- `CoreRpcClient`, a minimal Tapyrus Core JSON-RPC client (stdlib
   `urllib`, no `requests` dependency) used by `collect_coinbase_addresses.py`,
   `wait_for_topology.py`, `generate_traffic.py`, `simulate_reorg.py`,
-  `simulate_federation_change.py`, and `simulate_maxblocksize_change.py`. The
-  per-node lifecycle orchestrator (not yet built) will be another consumer once it
-  exists. `call()` is `async def`; since stdlib has no async HTTP client, it wraps the
+  `simulate_federation_change.py`, `simulate_maxblocksize_change.py`, and
+  `scripts/container/node_orchestrator.py` (bind-mounted into each core-* container
+  -- confirmed stdlib-only, so it runs there unchanged, see that section below).
+  `call()` is `async def`; since stdlib has no async HTTP client, it wraps the
   blocking `urllib` call in `asyncio.to_thread` so multiple calls can still run
   concurrently. Raises `RpcUnreachable` (connection refused, timeout -- treat as "not
   ready yet") separately from `RpcError` (the node answered with a JSON-RPC error).
+- `lib/orchestrator_control.py` -- `pause_node_orchestrators()`/
+  `resume_node_orchestrators()`, a shared pause file every core-* node's
+  `node_orchestrator.py` checks before any chaos action. Calls nest (a depth
+  counter, not a plain touch/unlink), so an inner pause/resume pair doesn't
+  prematurely resume chaos while an outer caller still needs it paused. Used by
+  `simulate_reorg.py`, `simulate_federation_change.py`, `simulate_maxblocksize_change.py`,
+  and `generate_traffic.py` to protect their own precise node up/down assumptions --
+  see `work-done.md`.
 - `lib/compose.py` -- `start_nodes()`/`stop_nodes()`/`bring_up()`/`recreate_fresh()`,
   thin wrappers around `docker compose <subcommand> <service names>` (run from
   `docker/`), used by `simulate_reorg.py` and `simulate_federation_change.py`. Every
@@ -247,6 +256,69 @@ design rather than a single `dig` call.
   at any check raises `SeederVerificationError` (non-zero exit).
 - **Active in the workflow** as "Bring up tapyrus-seeder and verify it".
 
+## `scripts/start_node_orchestrator.py`
+
+Switches the 7 core-* nodes `verify_seeder.py`'s connect-mode phase left running
+into "connect + orchestrator" mode: tears them down and recreates them with
+`NODE_ORCHESTRATOR` set, so each one's `entrypoint_wrapper.sh` hands off to
+`scripts/container/node_orchestrator.py` instead of running `tapyrusd` directly.
+From this point on, every core-* node randomly stops/restarts/reindexes/invalidates
+itself for the rest of the job -- see `doc/work-done.md` for the full design.
+
+- **Usage**: `./scripts/start_node_orchestrator.py` (no arguments -- reuses
+  `verify_seeder.py`'s own `CONNECT_MODE_ARGS`/`CORE_NODES`/`CORE_RPC_PORTS`
+  directly rather than duplicating them).
+- Only brings the chaos-supervised nodes up and confirms their RPC is reachable --
+  does not itself wait for chaos or assert recovery. The rest of the workflow's own
+  existing checks (`wait_for_topology.py`, every `generate_traffic.py` settle-height
+  assertion, `simulate_reorg.py`'s `getchaintips` checks) are what actually prove the
+  network keeps converging under chaos.
+- **Output**: none written to disk -- a node whose RPC never comes back up raises
+  `NodeOrchestratorStartupError` (non-zero exit).
+- **Active in the workflow** as "Start node orchestrator", right after "Bring up
+  tapyrus-seeder and verify it" -- that workflow step also appends
+  `NODE_ORCHESTRATOR=1` to `$GITHUB_ENV` after this script succeeds, since setting it
+  only within this script's own process isn't enough: `signer-0`/`signer-1`/
+  `signer-2` and signer-set-b's services all `depends_on` a core-1a/2a/3a node, so
+  any later `docker compose up` touching them needs to resolve the same value or
+  Compose recreates that core node to match, reverting it to plain `tapyrusd` (see
+  `work-done.md`).
+
+## `scripts/container/`
+
+Two files that run **inside** a core-* container, not on the CI host like
+everything else in `scripts/` -- bind-mounted read-only (`../scripts:/app/scripts:ro`,
+`docker/docker-compose.yml`) and only active once `start_node_orchestrator.py`
+switches a node into orchestrator mode.
+
+- **`entrypoint_wrapper.sh`**: every core-* service's `command:` now, in every
+  bring-up mode. Reads the `NODE_ORCHESTRATOR` env var: unset, `exec tapyrusd "$@"`
+  directly (identical to before this existed); set, hands off to
+  `node_orchestrator.py` instead. Keeps `docker-compose.yml`'s own command line
+  unchanged across modes instead of nesting a conditional inside the image's own
+  `bash -c "$*"` entrypoint.
+- **`node_orchestrator.py`**: launches `tapyrusd` as a child process and supervises
+  it -- crash recovery (relaunches plain if it ever exits unexpectedly) always
+  applies, for every node. core-1b/2b/3b/core-7 additionally run a randomized action
+  loop for as long as the container runs, after a 360s startup grace period (see
+  `work-done.md`). Every cycle shuffles and runs: a plain restart, a restart with
+  this node's assigned flavor (`-reindex`/`-reindex-chainstate`/`-reloadxfield`,
+  round-robin across all 7 nodes -- see `NODE_ORCHESTRATOR_FLAVOR` in
+  `docker-compose.yml`), and an invalidateblock-then-reconsiderblock pair on the
+  current tip -- guaranteeing every chaos node does at least one of each, in random
+  order, with random delays between. A restarted node stays down until the rest of
+  the network produces a couple more real blocks, bounded at 90s (`work-done.md`).
+  core-1a/2a/3a (the 3 signers' own RPC targets) never join this loop at all -- see
+  `work-done.md` for why. Every action also checks a shared pause file first
+  (`scripts/lib/orchestrator_control.py`) -- see `simulate_reorg.py`/
+  `simulate_federation_change.py`/`simulate_maxblocksize_change.py`/
+  `generate_traffic.py` for where and why they pause it. `PRNG_SEED_BASE`
+  (`github.run_id`) seeds each node's own RNG -- deterministic and reproducible per
+  run, previously defined but unconsumed anywhere.
+- Reuses `scripts/lib/rpc.py` and `scripts/lib/log.py` unchanged (both pure stdlib,
+  confirmed safe in a minimal container) -- not `scripts/lib/compose.py`, which needs
+  the `docker` CLI/socket and stays host-only.
+
 ## `scripts/wait_for_topology.py`
 
 Polls every core-* node's RPC port until the 7-node topology (plan doc section 4b)
@@ -367,9 +439,19 @@ assignment, and the balance-shortfall top-up mechanic). Implemented as `TrafficN
   throughout. See `doc/work-done.md`'s Lessons learnt for the full incident.
 - **Active in the workflow**, right after "Bring up signers" -- uncommented along
   with `simulate_reorg.py` (which runs right after it) and their shared prerequisite,
-  signer-set-a bring-up; the per-node lifecycle orchestrator is the one piece still
-  genuinely unbuilt (rotation and max-block-size change are both active too, see
+  signer-set-a bring-up (rotation and max-block-size change are both active too, see
   their own sections below).
+- **Every setup/verification RPC sequence is chaos-tolerant**, since this script runs
+  continuously against the node orchestrator's background chaos (`work-done.md`):
+  address collection, balance seeding, coinbase-rotation calibration, every block
+  wait, and every balance verification all pause chaos for their own span
+  (`scripts/lib/orchestrator_control.py`) *and* retry individual RPC calls on
+  `RpcUnreachable` (`_call_with_retry`) rather than treating one node's momentary
+  restart as a hard failure -- the pause file alone can't interrupt a restart already
+  in flight the instant it lands. Coinbase-rotation calibration additionally retries
+  the whole 3-height observation (up to 5 attempts) if a signer's turn gets skipped.
+  Verified live against a real chaos-supervised 7-node stack: multiple full runs,
+  every balance/color check across all 7 nodes matched the ledger, zero mismatches.
 - **`core-1a`/`2a`/`3a`'s coinbase income is fully asserted too**, not excluded --
   observed directly. `_credit_coinbase_for_height` reads each height's real
   coinbase transaction and credits whichever of the 3 wallets actually has it,

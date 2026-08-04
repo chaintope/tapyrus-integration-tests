@@ -52,37 +52,41 @@ A single `integration-test` job runs these steps in order:
    reports only genuinely-listening nodes (never `core-7`, the one node that doesn't
    listen in that mode) and that a brand-new 8th node with no topology knowledge of
    its own genuinely auto-bootstraps through the seeder's DNS answer alone.
-7. **Wait for the P2P topology to converge** (`scripts/wait_for_topology.py`, polling
+7. **Start the node orchestrator** (`scripts/start_node_orchestrator.py`) -- switches
+   the 7 core-* nodes into chaos-supervised mode. core-1b/2b/3b/core-7 randomly
+   stop/restart/reindex/invalidate themselves for the rest of the job;
+   core-1a/2a/3a (the signers' own RPC targets) get crash-recovery supervision but
+   never a deliberate chaos action, since disrupting them risks throwing off
+   `generate_traffic.py`'s coinbase-rotation tracking (see `doc/work-done.md`).
+8. **Wait for the P2P topology to converge** (`scripts/wait_for_topology.py`, polling
    `getconnectioncount` against the expected 1/2/1/2/1/2/3 pattern) against the
    now-finalized fixed topology, then collect a coinbase address from each
    first-layer node (`scripts/collect_coinbase_addresses.py`, retries until each
    node's RPC is actually up).
-8. **Bring up signers**: assemble each signer's config with
+9. **Bring up signers**: assemble each signer's config with
    `scripts/assemble_signer_configs.py`, bring up the 3 signer-set-a containers.
-9. **Per-node activity**: round-robin TPC + colored-coin traffic across all 7 nodes
-   with balances confirmed after each block (`scripts/generate_traffic.py`),
-   including the 3 first-layer nodes' coinbase income -- calibrated from 3 real,
-   consecutive height observations early in the run (see `doc/work-done.md`), not
-   just excluded from the assertion. RPC health/height/mempool queries and
-   stop/restart/resync for every node remain
-   *(not yet scripted -- see `doc/project-plan.md`'s Outstanding work)*.
-10. **Reorg**: split the network into two groups, let each build its own real
+10. **Per-node activity**: round-robin TPC + colored-coin traffic across all 7 nodes
+    with balances confirmed after each block (`scripts/generate_traffic.py`),
+    including the 3 first-layer nodes' coinbase income -- calibrated from 3 real,
+    consecutive height observations early in the run (see `doc/work-done.md`), not
+    just excluded from the assertion. Runs continuously against the node
+    orchestrator's background chaos from step 7 onward.
+11. **Reorg**: split the network into two groups, let each build its own real
     threshold-signed fork, reconnect, and confirm convergence via `getchaintips`
     (`scripts/simulate_reorg.py`).
-11. **Aggpubkey rotation**: run the offline ceremony again for signer-set-b, then the
+12. **Aggpubkey rotation**: run the offline ceremony again for signer-set-b, then the
     `--xfield` sign/computesig handoff and a `federations.toml` with both entries
     (`scripts/simulate_federation_change.py`).
-12. **Max block size change**: signer-set-b signs off on a new max-block-size via the
+13. **Max block size change**: signer-set-b signs off on a new max-block-size via the
     same `--xfield` flow, confirmed in effect via RPC at the scheduled height
     (`scripts/simulate_maxblocksize_change.py`).
-13. **Teardown**: collect every container's logs, upload them as a CI artifact, then
+14. **Teardown**: collect every container's logs, upload them as a CI artifact, then
     `docker compose down` -- runs unconditionally (`if: always()`).
 
 The entire scenario above has run successfully end-to-end in real GitHub Actions CI,
 not just locally -- see `doc/work-done.md`'s "Full real-CI end-to-end verification".
-The one step still marked "not yet scripted" just `echo`s a TODO pointing at the
-relevant design-doc section -- see [`doc/project-plan.md`](doc/project-plan.md)'s
-Outstanding work for the full tracked list.
+See [`doc/project-plan.md`](doc/project-plan.md)'s Outstanding work for what's still
+untested or unbuilt.
 
 ## Variables available to change during a run
 

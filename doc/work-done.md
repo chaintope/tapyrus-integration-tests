@@ -21,8 +21,6 @@ does.
 - **Signer count (3) and threshold (2) are hardcoded.** The 7-node topology is wired
   1:1 to exactly 3 signers, so changing the count means redesigning the topology, not
   just passing a new number.
-- **Per-node lifecycle orchestrator not built yet** -- see `project-plan.md`'s
-  Outstanding work.
 - **`generate_traffic.py`'s constants haven't been stress-tested at scale.**
   `FUNDING_AMOUNT_TPC`/`TOKEN_ISSUE_AMOUNT`/etc. work fine at small round counts, but
   a larger round count would trigger the balance-shortfall top-up mechanic much more
@@ -182,6 +180,74 @@ does.
   The right, achievable signal is simply: is there a peer whose `subver` isn't the
   seeder's own (`SEEDER_SUBVER`)? One real peer is enough proof, as long as it's
   the right one.
+- **The node orchestrator runs inside each core-* container, not as a host-driven
+  script** (`scripts/container/node_orchestrator.py`, `scripts/start_node_orchestrator.py`).
+  Every core-* node's `command:` (`docker-compose.yml`) is now
+  `entrypoint_wrapper.sh`, which hands off to `node_orchestrator.py` once
+  `NODE_ORCHESTRATOR` is set -- it launches `tapyrusd` as a child process and
+  supervises it directly, rather than being it, so it can genuinely stop/restart/
+  reindex/invalidate it via real RPC calls and still be the one to bring it back.
+  Continuous for the rest of the job (traffic generation, reorg, federation change,
+  max-block-size change all run against chaos-supervised nodes), not its own
+  isolated phase -- see the pause-file bullet below for how that's kept safe.
+- **core-1a/2a/3a never take a deliberate chaos action -- only core-1b/2b/3b/core-7
+  do** (`CHAOS_NODES` in `node_orchestrator.py`). core-1a/2a/3a are the 3 signers'
+  own RPC targets; live testing found that even one of them briefly catching up from
+  a chaos-triggered restart could make it miss its turn in `tapyrus-signer`'s
+  round-robin master selection, throwing off `generate_traffic.py`'s
+  coinbase-rotation tracking mid-calibration. They still get crash-recovery
+  supervision like every other node (`_supervise_crashes`), just never a deliberate
+  stop/restart/invalidate. `NODE_ORCHESTRATOR_FLAVOR` is still set for these 3 in
+  `docker-compose.yml` (matching the round-robin assignment below) but is unused
+  dead config for them specifically, since nothing ever reads it without the chaos
+  loop running.
+- **Restart flavor is a static, round-robin assignment per node, not re-randomized
+  per action.** `-reindex`/`-reindex-chainstate`/`-reloadxfield` cycle across the 7
+  nodes (`NODE_ORCHESTRATOR_FLAVOR` in `docker-compose.yml`), though only
+  core-1b/2b/3b/core-7's assignment is actually exercised (see above). Every chaos
+  node still does a plain restart, its one flavored restart, and an
+  invalidate/reconsider at least once per cycle (shuffled order, random delays).
+- **A restarted node stays down until the rest of the network has produced a couple
+  more real blocks**, polled from another node, not a timer -- restarting at the
+  very next block wouldn't give peers real time to notice and drop the now-stale
+  connection. Bounded at 90s (`DOWNTIME_TIMEOUT_SECONDS`): kept well under
+  `wait_for_topology.py`'s own 300s convergence budget, since that check runs before
+  any signer/traffic exists, so the block-count condition can never be satisfied
+  during it and every downtime would otherwise fall through to the timeout.
+- **Chaos waits out a 360s startup grace period before its first action**
+  (`STARTUP_GRACE_SECONDS`). With several nodes each independently churning every
+  30-180s, some node is essentially always mid-restart, which fights
+  `wait_for_topology.py`'s own purpose of confirming the mesh formed correctly right
+  after bring-up. Chaos still runs continuously for the rest of the job; this only
+  delays its first action past that check's own budget.
+- **A shared pause file protects the other scenario scripts' own precise node
+  up/down assumptions from the orchestrator's chaos** (`scripts/lib/orchestrator_control.py`).
+  `simulate_reorg.py`'s isolated-build phases hard-depend on exactly one group being
+  completely up and building alone; `simulate_federation_change.py`/
+  `simulate_maxblocksize_change.py` each have a single, non-retrying
+  `getblockchaininfo` confirmation check that a node mid-restart at the wrong moment
+  would fail spuriously; `generate_traffic.py` brackets every all-nodes-reachable
+  RPC sequence the same way (address collection, balance seeding, coinbase-rotation
+  calibration, every block wait, every balance verification). All touch the pause
+  file before their sensitive window and remove it in a `finally` (guaranteed even
+  on failure) -- every core node's orchestrator checks for it before any action, not
+  just restarts, so it also covers `invalidateblock` (which doesn't take RPC down).
+  Calls nest via a depth counter (`pause_node_orchestrators`/
+  `resume_node_orchestrators`), so an inner pause/resume pair (e.g.
+  `generate_traffic.py`'s own `_wait_for_next_block`, called from within its broader
+  calibration window) doesn't prematurely resume chaos while an outer caller still
+  needs it paused. The pause file only stops *new* actions -- it can't interrupt one
+  already in flight the instant it lands, so `generate_traffic.py`'s own RPC calls
+  additionally retry on `RpcUnreachable` (`_call_with_retry`) rather than treating a
+  momentary straggler as a hard failure.
+- **`NODE_ORCHESTRATOR` must be persisted to `$GITHUB_ENV`, not just set within
+  `start_node_orchestrator.py`'s own process.** `signer-0`/`signer-1`/`signer-2` and
+  signer-set-b's services all `depends_on` a core-1a/2a/3a node in
+  `docker-compose.yml`. Without persisting it job-wide, any later `docker compose
+  up` touching those dependents (Bring up signers, Federation change) would resolve
+  `NODE_ORCHESTRATOR` back to unset, and Compose would recreate that core node to
+  match its now-different resolved config -- silently reverting it to plain
+  `tapyrusd`. Confirmed live: this exact drift happened mid-session.
 - **Secrets scope**: this repo only generates local dev secrets
   (`generate_dev_secrets.py`); it never provisions real GitHub secrets. No CI
   secret is currently needed at all -- Slack notification was deferred (see

@@ -50,6 +50,7 @@ sys.path.insert(0, str(REPO_ROOT))
 from scripts.generate_dev_secrets import default_tapyrus_setup_bin  # noqa: E402
 from scripts.lib.ceremony import CeremonyError, extract_vss_for, require_executable  # noqa: E402
 from scripts.lib.log import log  # noqa: E402
+from scripts.lib.orchestrator_control import pause_node_orchestrators, resume_node_orchestrators  # noqa: E402
 from scripts.lib.rpc import CoreRpcClient, RpcError, RpcUnreachable  # noqa: E402
 from scripts.simulate_federation_change import (  # noqa: E402
     REUSE_NODE_INDEX,
@@ -128,9 +129,17 @@ class MaxBlockSizeChangeSimulator:
     async def run(self):
         await self._sign_off_change()
         await self._compute_scheduled_height()
-        self._write_configs()
-        await self._wait_for_change()
-        await self._confirm_change_via_rpc()
+        # Same reasoning as simulate_federation_change.py's own bracket: a core
+        # node mid-restart exactly when _confirm_change_via_rpc's single,
+        # non-retrying getblockchaininfo check runs would fail the whole step
+        # spuriously. See scripts/lib/orchestrator_control.py.
+        pause_node_orchestrators()
+        try:
+            self._write_configs()
+            await self._wait_for_change()
+            await self._confirm_change_via_rpc()
+        finally:
+            resume_node_orchestrators()
         log.info(
             f"done. max-block-size {self._new_max_block_size} took effect at height "
             f"{self._scheduled_height} (confirmed via getblockchaininfo on all 7 core nodes), signed off "

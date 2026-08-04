@@ -89,6 +89,7 @@ sys.path.insert(0, str(REPO_ROOT))
 from scripts.assemble_signer_configs import CoreRpc, Redis, SignerConfigAssembler  # noqa: E402
 from scripts.lib.compose import ComposeError, recreate_fresh, start_nodes, stop_nodes  # noqa: E402
 from scripts.lib.log import log  # noqa: E402
+from scripts.lib.orchestrator_control import pause_node_orchestrators, resume_node_orchestrators  # noqa: E402
 from scripts.lib.rpc import CoreRpcClient, RpcError, RpcUnreachable  # noqa: E402
 from scripts.wait_for_topology import TopologyWaiter  # noqa: E402
 
@@ -166,10 +167,20 @@ class ReorgSimulator:
 
     async def run(self):
         await self._build_baseline()
-        await self._build_group_b_fork()
-        await self._restore_group_a()
-        await self._inject_canary_transaction()
-        await self._build_group_a_fork()
+        # Paused for the whole span where exactly one group is ever up and
+        # building -- a concurrent orchestrator restart or invalidateblock could
+        # corrupt the fork being carefully built. try/finally, not just a resume
+        # call at the natural end of _build_group_a_fork, so a failure partway
+        # through still leaves node_orchestrator.py's chaos actions resumed
+        # afterward rather than silently disabled for the rest of the job.
+        pause_node_orchestrators()
+        try:
+            await self._build_group_b_fork()
+            await self._restore_group_a()
+            await self._inject_canary_transaction()
+            await self._build_group_a_fork()
+        finally:
+            resume_node_orchestrators()
         await self._reconnect_group_b()
         await self._confirm_tie_holds()
         await self._extend_group_b_by_two_blocks()

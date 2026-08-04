@@ -65,11 +65,14 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.lib.log import log  # noqa: E402
+from scripts.lib.orchestrator_control import pause_node_orchestrators, resume_node_orchestrators  # noqa: E402
 from scripts.lib.rpc import CoreRpcClient, RpcError, RpcUnreachable  # noqa: E402
 
 RPC_HOST = "127.0.0.1"
 HEIGHT_POLL_INTERVAL_SECONDS = 3
 HEIGHT_POLL_TIMEOUT_SECONDS = 180
+RPC_READY_TIMEOUT_SECONDS = 120
+RPC_READY_POLL_INTERVAL_SECONDS = 3
 
 # (node name, host-published RPC port) -- see docker/docker-compose.yml's port mappings.
 NODES = (
@@ -155,6 +158,13 @@ class TrafficGenerator:
         self._last_credited_height = None
 
     async def run(self):
+        # The node orchestrator's background chaos runs continuously, including
+        # right through this phase (by design -- see doc/work-done.md), so any of
+        # the 4 uncapped nodes may be mid-restart at the exact moment this starts.
+        # Round actions later on already tolerate that per-call (see
+        # MIN_SUCCESSFUL_ACTION_FRACTION above), but setup isn't a round action --
+        # it needs every node reachable at least once before it can proceed at all.
+        await self._wait_for_all_rpc_ready()
         await self._collect_addresses()
         # A prior step (e.g. simulate_reorg.py's canary) can leave a transaction
         # pending in some node's mempool -- getbalance only counts confirmed balance,
@@ -203,24 +213,55 @@ class TrafficGenerator:
 
     # -- setup: addresses, funding, issuance -----------------------------------
 
+    async def _call_with_retry(self, node, method, params=None):
+        """Retries on RpcUnreachable instead of failing on the first attempt.
+        Pausing chaos (see callers) stops NEW actions but can't interrupt one
+        already in flight the instant the pause landed, so a node can still be
+        briefly unreachable inside an otherwise-paused window -- a bare single
+        call would treat that straggler as a hard failure instead of riding it
+        out the same way _wait_for_next_block's own polling already does."""
+        deadline = time.monotonic() + RPC_READY_TIMEOUT_SECONDS
+        while True:
+            try:
+                return await node.rpc.call(method, params)
+            except RpcUnreachable as exc:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"{node.name}: {method} never became reachable within "
+                        f"{RPC_READY_TIMEOUT_SECONDS}s: {exc}"
+                    )
+                await asyncio.sleep(RPC_READY_POLL_INTERVAL_SECONDS)
+
+    async def _wait_for_all_rpc_ready(self):
+        log.step("waiting for all nodes' RPC to be reachable before setup")
+        await asyncio.gather(*(self._call_with_retry(node, "getblockcount") for node in self._nodes))
+
     async def _collect_addresses(self):
         log.step("collecting a receiving address from each node")
 
         async def collect(node):
-            node.address = await node.rpc.call("getnewaddress")
+            node.address = await self._call_with_retry(node, "getnewaddress")
 
-        await asyncio.gather(*(collect(node) for node in self._nodes))
+        pause_node_orchestrators()
+        try:
+            await asyncio.gather(*(collect(node) for node in self._nodes))
+        finally:
+            resume_node_orchestrators()
 
     async def _seed_ledger_with_current_balances(self):
         log.step("reading each node's current TPC balance to seed the ledger (not assuming a fresh 0.0 start)")
 
         async def seed(node):
-            balance = await node.rpc.call("getbalance", [False])
+            balance = await self._call_with_retry(node, "getbalance", [False])
             self._ledger[node.name][TPC] = balance
             if balance:
                 log.info(f"{node.name}: starting balance {balance} TPC (carried over from before this run)")
 
-        await asyncio.gather(*(seed(node) for node in self._nodes))
+        pause_node_orchestrators()
+        try:
+            await asyncio.gather(*(seed(node) for node in self._nodes))
+        finally:
+            resume_node_orchestrators()
 
     async def _fund_unfunded_nodes(self):
         log.step(f"funding the {len(FUNDING_PAIRS)} nodes with no coinbase income")
@@ -353,17 +394,22 @@ class TrafficGenerator:
     # -- height polling ------------------------------------------------------------
 
     async def _wait_for_empty_mempool(self):
-        deadline = time.monotonic() + HEIGHT_POLL_TIMEOUT_SECONDS
-        while True:
-            mempools = await asyncio.gather(*(self._node_mempool(node) for node in self._nodes))
-            if all(mempool == [] for mempool in mempools):
-                return
-            if time.monotonic() >= deadline:
-                raise TrafficGenerationError(
-                    f"mempool(s) still non-empty after {HEIGHT_POLL_TIMEOUT_SECONDS}s: "
-                    f"{ {node.name: mempool for node, mempool in zip(self._nodes, mempools)} }"
-                )
-            await asyncio.sleep(HEIGHT_POLL_INTERVAL_SECONDS)
+        # Same all-7-nodes-reachable shape as _wait_for_next_block, same fix.
+        pause_node_orchestrators()
+        try:
+            deadline = time.monotonic() + HEIGHT_POLL_TIMEOUT_SECONDS
+            while True:
+                mempools = await asyncio.gather(*(self._node_mempool(node) for node in self._nodes))
+                if all(mempool == [] for mempool in mempools):
+                    return
+                if time.monotonic() >= deadline:
+                    raise TrafficGenerationError(
+                        f"mempool(s) still non-empty after {HEIGHT_POLL_TIMEOUT_SECONDS}s: "
+                        f"{ {node.name: mempool for node, mempool in zip(self._nodes, mempools)} }"
+                    )
+                await asyncio.sleep(HEIGHT_POLL_INTERVAL_SECONDS)
+        finally:
+            resume_node_orchestrators()
 
     async def _node_mempool(self, node):
         try:
@@ -372,19 +418,37 @@ class TrafficGenerator:
             return None
 
     async def _current_height(self):
-        heights = await asyncio.gather(*(node.rpc.call("getblockcount") for node in self._nodes))
-        return min(heights)
+        # Pausing chaos (see callers) stops NEW actions but can't interrupt a
+        # node already mid-downtime from an earlier one -- so this needs the same
+        # per-node tolerance _node_height already has, not a bare gather.
+        heights = await asyncio.gather(*(self._node_height(node) for node in self._nodes))
+        reachable = [h for h in heights if h is not None]
+        if not reachable:
+            raise RpcUnreachable("no node was reachable to determine the current height")
+        return min(reachable)
 
     async def _wait_for_next_block(self):
-        target = await self._current_height() + 1
-        deadline = time.monotonic() + HEIGHT_POLL_TIMEOUT_SECONDS
-        while True:
-            heights = await asyncio.gather(*(self._node_height(node) for node in self._nodes))
-            if all(height is not None and height >= target for height in heights):
-                return target
-            if time.monotonic() >= deadline:
-                raise TimeoutError(f"not all nodes reached height {target} within {HEIGHT_POLL_TIMEOUT_SECONDS}s")
-            await asyncio.sleep(HEIGHT_POLL_INTERVAL_SECONDS)
+        # Requires literally all 7 nodes to catch up -- incompatible with chaos
+        # churning core-1b/2b/3b/core-7 mid-wait (they have no cap, by design), so
+        # background chaos is paused for the span of this one wait and resumed
+        # right after, rather than loosening this method's own all-7 requirement
+        # or pausing chaos for generate_traffic.py's entire run. A node already
+        # mid-downtime when the pause lands isn't interrupted -- it finishes that
+        # downtime on its own (bounded, see node_orchestrator.py) -- which is why
+        # this still needs its own timeout below, not just the pause file alone.
+        pause_node_orchestrators()
+        try:
+            target = await self._current_height() + 1
+            deadline = time.monotonic() + HEIGHT_POLL_TIMEOUT_SECONDS
+            while True:
+                heights = await asyncio.gather(*(self._node_height(node) for node in self._nodes))
+                if all(height is not None and height >= target for height in heights):
+                    return target
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"not all nodes reached height {target} within {HEIGHT_POLL_TIMEOUT_SECONDS}s")
+                await asyncio.sleep(HEIGHT_POLL_INTERVAL_SECONDS)
+        finally:
+            resume_node_orchestrators()
 
     async def _node_height(self, node):
         try:
@@ -437,23 +501,36 @@ class TrafficGenerator:
         return [node.color_id for node in self._nodes if node.color_id]
 
     async def _log_balances(self, height, label):
-        colors = await self._all_colors()
-        for node in self._nodes:
-            tpc = await node.rpc.call("getbalance", [False])
-            colored = {
-                color: await node.rpc.call("getbalance", [False, color]) for color in colors
-            }
-            log.info(f"height {height} ({label}): {node.name} TPC={tpc} {colored}")
+        # Same all-7-nodes-reachable shape as _wait_for_next_block, same fix --
+        # every node's getbalance is read here with no per-call error tolerance.
+        pause_node_orchestrators()
+        try:
+            colors = await self._all_colors()
+            for node in self._nodes:
+                tpc = await self._call_with_retry(node, "getbalance", [False])
+                colored = {
+                    color: await self._call_with_retry(node, "getbalance", [False, color]) for color in colors
+                }
+                log.info(f"height {height} ({label}): {node.name} TPC={tpc} {colored}")
+        finally:
+            resume_node_orchestrators()
 
     async def _verify_round(self, height):
-        colors = await self._all_colors()
-        for node in self._nodes:
-            actual_tpc = await node.rpc.call("getbalance", [False])
-            self._compare(height, node.name, TPC, self._ledger[node.name][TPC], actual_tpc)
-            for color in colors:
-                actual = await node.rpc.call("getbalance", [False, color])
-                expected = self._ledger[node.name].get(color, 0)
-                self._compare(height, node.name, color, expected, actual)
+        # This is the run's actual correctness check (ledger vs real balances) --
+        # same chaos-paused window, so an unreachable node can't be misread as a
+        # real balance mismatch or abort verification outright.
+        pause_node_orchestrators()
+        try:
+            colors = await self._all_colors()
+            for node in self._nodes:
+                actual_tpc = await self._call_with_retry(node, "getbalance", [False])
+                self._compare(height, node.name, TPC, self._ledger[node.name][TPC], actual_tpc)
+                for color in colors:
+                    actual = await self._call_with_retry(node, "getbalance", [False, color])
+                    expected = self._ledger[node.name].get(color, 0)
+                    self._compare(height, node.name, color, expected, actual)
+        finally:
+            resume_node_orchestrators()
 
     def _compare(self, height, node_name, asset, expected, actual):
         # Token balances are exact integers (no fee taken from token value itself);
