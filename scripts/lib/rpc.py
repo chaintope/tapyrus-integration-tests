@@ -1,8 +1,11 @@
 """Minimal Tapyrus Core JSON-RPC client (stdlib only, no third-party dependency).
 
 Shared by every script that talks to a core-* node's RPC port: the
-topology-convergence wait (wait_for_topology.py) today, and the per-node tx/lifecycle
-orchestrator and rotation-confirmation step once those are built.
+topology-convergence wait (wait_for_topology.py), coinbase-address collection
+(collect_coinbase_addresses.py), traffic generation (generate_traffic.py), the reorg
+(simulate_reorg.py), and the rotation/max-block-size change confirmation steps
+(simulate_federation_change.py/simulate_maxblocksize_change.py). The per-node
+lifecycle orchestrator (not yet built) will be another consumer once it exists.
 
 `call()` is async so a caller can poll multiple nodes concurrently (e.g. via
 asyncio.gather) instead of one at a time -- the underlying urllib call is blocking, so

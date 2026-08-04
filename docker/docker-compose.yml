@@ -134,6 +134,42 @@ services:
       - redis
       - core-3a
 
+  # --- signer-set-b: the rotation target (scripts/simulate_federation_change.py).
+  # Only 2 new containers, not 3 -- signer-0/node-0's identity is deliberately REUSED
+  # (not regenerated) as one of signer-set-b's 3 members too, so it stays a valid
+  # signer straight through the handoff (its federations.toml gains a second, full
+  # member entry rather than losing membership like signer-1/signer-2 do). signer-b-1
+  # and signer-b-2 are the two genuinely new identities, brought up alongside
+  # signer-set-a (not replacing it yet) -- a running tapyrus-signerd only finds its
+  # own signing material by matching its OWN public-key against federations.toml's
+  # node-vss, so a container with no matching entry in the CURRENTLY active
+  # federation can't contribute (see doc/work-done.md), which is why signer-b-1/
+  # signer-b-2 need to be up and idle before the scheduled height, not started at it.
+  # Same RPC targets as their signer-set-a counterparts (signer-b-1 -> core-2a, etc.)
+  # -- RPC access isn't exclusive to one client, and it avoids needing more core nodes
+  # / a topology change just for this.
+  # signer-0/signer-1/signer-2 themselves are NEVER stopped or restarted for this --
+  # their federations.toml is live-reloaded in place instead.
+  # Both signer sets share this same redis instance, and the tapyrus-signer
+  # round-coordination broadcast channel is global (not scoped per federation) --
+  # cross-talk between the two sets while both are up is a real risk worth watching
+  # for in a live run.
+  signer-b-1:
+    image: tapyrus-signer:integration-test
+    volumes:
+      - ../runtime/signers-b/node-1:/etc/tapyrus
+    depends_on:
+      - redis
+      - core-2a
+
+  signer-b-2:
+    image: tapyrus-signer:integration-test
+    volumes:
+      - ../runtime/signers-b/node-2:/etc/tapyrus
+    depends_on:
+      - redis
+      - core-3a
+
   # --- tapyrus-seeder: Crawls the network starting from core-1a and serves the resulting
   # address list over DNS. -i/-s hardcode 1905960821 (not wired to NETWORK_ID -- the
   # seeder service is never actually brought up yet, see the workflow's "Bring up

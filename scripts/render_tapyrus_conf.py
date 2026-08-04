@@ -2,16 +2,14 @@
 """Render the prod-mode tapyrus.conf shared by all 7 core-* nodes.
 
 tapyrus/tapyrusd's own entrypoint.sh only auto-generates a conf if none is mounted at
-${CONF_DIR}/tapyrus.conf -- and that auto-generated one hardcodes dev=1 / [dev] /
-networkid=1905960821, which is what silently made NETWORK_ID a dead input (see
-doc/work-done.md): nothing ever mounted a conf of our own, so every node always ran
-that fixed dev network regardless of what NETWORK_ID was set to.
+${CONF_DIR}/tapyrus.conf, and that auto-generated one hardcodes dev=1 / [dev] /
+networkid=1905960821 -- so a conf of our own needs to be mounted for NETWORK_ID to
+have any effect at all.
 
-Verified against a real tapyrusd container: dropping dev=1/[dev] (prod mode -- see
-"Build unsigned genesis", which no longer passes tapyrus-genesis -dev either) and
-setting networkid=<NETWORK_ID> at the top level is what the entrypoint script reads to
-decide which genesis.<network_id> file to load -- getblockchaininfo then reports
-"mode": "prod" and "chain": "<network_id>" as expected.
+Dropping dev=1/[dev] (prod mode) and setting networkid=<NETWORK_ID> at the top level
+is what the entrypoint script reads to decide which genesis.<network_id> file to
+load -- getblockchaininfo then reports "mode": "prod" and "chain": "<network_id>" as
+expected.
 
 Usage:
     ./scripts/render_tapyrus_conf.py [output-file]
@@ -70,10 +68,8 @@ class TapyrusConfRenderer:
             # example in --help -- on a brand-new chain (every run here starts one),
             # estimatesmartfee has no block history yet and sendtoaddress/issuetoken
             # fail outright with "Fee estimation failed" until fallbackfee is set.
-            # Confirmed live: scripts/generate_traffic.py's funding/send/issuance
-            # calls failed 100% of the time without this, for the whole run, on a
-            # throwaway dev chain there's no real fee market to estimate anyway. See
-            # doc/work-done.md.
+            # Safe to enable unconditionally here -- there's no real fee market on a
+            # throwaway dev chain to misjudge. See doc/work-done.md.
             "fallbackfee=0.0002\n"
             # Small test chain (a handful of blocks, a handful of UTXOs) -- the
             # 450MB default is pure overhead across 7 concurrent core-* containers.

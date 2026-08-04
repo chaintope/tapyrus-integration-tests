@@ -28,14 +28,6 @@ class ReposConfig:
     """Default checkout targets for all three repos this test spans."""
 
     def __init__(self):
-        # chaintope/tapyrus-signer#172 (the gmp-mpfr-sys c-no-tests build fix) merged
-        # -- confirmed directly against a fresh chaintope/master fetch, not just PR
-        # metadata: its new tip is literally that fix commit, with the feature present
-        # in Cargo.toml. master has the base ceremony (createkey/createnodevss/
-        # aggregate/genesis-sign) but not the federation-change/rotation ceremony
-        # (--xfield sign/computesig, multi-entry federations.toml) -- that only exists
-        # on the Naviabheeman fork's 163_federationChangeToml branch. Override
-        # SIGNER_REPO_URL/SIGNER_REPO_REF to that fork+branch when testing rotation.
         self.signer = RepoTarget(
             "tapyrus-signer", "SIGNER",
             "https://github.com/chaintope/tapyrus-signer.git",

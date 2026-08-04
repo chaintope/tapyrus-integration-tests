@@ -40,7 +40,7 @@ colors over a long run, which is expected, not a bug.
 
 See doc/work-done.md for the tapyrus-core RPC facts this script is built on (colored
 address round-trip requirement, coinbase maturity, issuetoken/transfertoken semantics)
-and which parts are still unverified against a live stack.
+-- verified against a real 7-node stack, and since via real GitHub Actions CI too.
 """
 import argparse
 import asyncio
@@ -128,13 +128,23 @@ class TrafficGenerator:
     def __init__(self, nodes, round_count):
         self._nodes = nodes
         self._round_count = round_count
-        # ledger[node_name][asset] -- asset is TPC or a color-id hex string.
-        self._ledger = {node.name: {TPC: 0.0} for node in nodes}
+        # ledger[node_name][asset] -- asset is TPC or a color-id hex string. TPC
+        # starts empty here, not at a hardcoded 0.0 -- seeded from each node's REAL
+        # current balance in _seed_ledger_with_current_balances() instead, since this
+        # script runs multiple times in the same job (before and after the
+        # reorg/rotation steps) against wallets that already carry a balance.
+        self._ledger = {node.name: {} for node in nodes}
         self._mismatches = []
         self._successful_round_actions = 0
 
     async def run(self):
         await self._collect_addresses()
+        # A prior step (e.g. simulate_reorg.py's canary) can leave a transaction
+        # pending in some node's mempool -- getbalance only counts confirmed balance,
+        # so seeding from it now and having that transaction confirm mid-run would
+        # silently offset the ledger by exactly its amount for the rest of the run.
+        await self._wait_for_empty_mempool()
+        await self._seed_ledger_with_current_balances()
         # Waiting for just one more block isn't enough: with 3 signers rotating as
         # block proposer, one new block only credits coinbase to whichever signer
         # proposed it, not all three -- core-1a/2a/3a need to each have proposed at
@@ -183,6 +193,17 @@ class TrafficGenerator:
             node.address = await node.rpc.call("getnewaddress")
 
         await asyncio.gather(*(collect(node) for node in self._nodes))
+
+    async def _seed_ledger_with_current_balances(self):
+        log.step("reading each node's current TPC balance to seed the ledger (not assuming a fresh 0.0 start)")
+
+        async def seed(node):
+            balance = await node.rpc.call("getbalance", [False])
+            self._ledger[node.name][TPC] = balance
+            if balance:
+                log.info(f"{node.name}: starting balance {balance} TPC (carried over from before this run)")
+
+        await asyncio.gather(*(seed(node) for node in self._nodes))
 
     async def _wait_for_funding_source_balances(self):
         log.step(f"waiting for each funding source to hold at least {FUNDING_AMOUNT_TPC} TPC")
@@ -337,6 +358,25 @@ class TrafficGenerator:
             log.info(f"{sender.name}: minted a fresh {TOKEN_TYPE_NAMES[sender.token_type]} color (old one exhausted)")
 
     # -- height polling ------------------------------------------------------------
+
+    async def _wait_for_empty_mempool(self):
+        deadline = time.monotonic() + HEIGHT_POLL_TIMEOUT_SECONDS
+        while True:
+            mempools = await asyncio.gather(*(self._node_mempool(node) for node in self._nodes))
+            if all(mempool == [] for mempool in mempools):
+                return
+            if time.monotonic() >= deadline:
+                raise TrafficGenerationError(
+                    f"mempool(s) still non-empty after {HEIGHT_POLL_TIMEOUT_SECONDS}s: "
+                    f"{ {node.name: mempool for node, mempool in zip(self._nodes, mempools)} }"
+                )
+            await asyncio.sleep(HEIGHT_POLL_INTERVAL_SECONDS)
+
+    async def _node_mempool(self, node):
+        try:
+            return await node.rpc.call("getrawmempool")
+        except RpcUnreachable:
+            return None
 
     async def _current_height(self):
         heights = await asyncio.gather(*(node.rpc.call("getblockcount") for node in self._nodes))

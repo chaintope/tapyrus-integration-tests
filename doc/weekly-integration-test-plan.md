@@ -162,22 +162,19 @@ v1 itself, but the topology is designed now so that extension doesn't require re
 - **Second layer** (3 nodes, `core-1b`/`core-2b`/`core-3b`): each is P2P-connected *only* to its
   corresponding first-layer node (`core-1a ↔ core-1b`, etc.) — no other P2P edges.
 - **Node 7** (`core-7`): P2P-connected to **all three** second-layer nodes (`core-7 ↔ core-1b`,
-  `core-7 ↔ core-2b`, `core-7 ↔ core-3b`). An earlier draft of this section only specified "any
-  two ... e.g. core-1b, core-2b", which would leave `core-3a`/`core-3b` an isolated pair with no
-  path to the other 5 nodes — confirmed with the team that full connectivity is required (the
-  sync/lifecycle/reorg scenario steps depend on all 7 nodes being able to reach each other), so
-  this is resolved as all three, not two.
+  `core-7 ↔ core-2b`, `core-7 ↔ core-3b`) — full connectivity is required since the
+  sync/lifecycle/reorg scenario steps depend on all 7 nodes being able to reach each other; any
+  fewer would leave a pair of nodes isolated with no path to the rest.
 - **(Future, not v1)**: an adversary core node connecting P2P to **two first-layer nodes**
   (`core-1a`, `core-2a`) — i.e. attaching itself closer to the signer-facing nodes than the
   legitimate topology would allow, to explore what that lets it observe/influence.
-- **Enforcement is one `-connect` per edge, not both ends** — a real, live-verified correction to
-  an earlier draft of this section, which called for `-connect` on both ends of every edge. That
-  turned out to be broken: tapyrus-core auto-disables listening the instant `-connect` is set at
-  all (`InitParameterInteraction: -connect set -> setting -listen=0`), so if both ends of an edge
-  set it, *neither* can ever accept the other's inbound connection. The working design instead has
-  exactly one side of each edge dial out via `-connect` (the "child" dials its "parent"), with an
-  explicit `-listen=1` added back wherever a node also needs to accept an inbound edge — see
-  `docker/docker-compose.yml`'s own comments for the full per-node breakdown.
+- **Enforcement is one `-connect` per edge, not both ends** — tapyrus-core auto-disables listening
+  the instant `-connect` is set at all (`InitParameterInteraction: -connect set -> setting
+  -listen=0`), so if both ends of an edge set it, *neither* can ever accept the other's inbound
+  connection. The design instead has exactly one side of each edge dial out via `-connect` (the
+  "child" dials its "parent"), with an explicit `-listen=1` added back wherever a node also needs
+  to accept an inbound edge — see `docker/docker-compose.yml`'s own comments for the full
+  per-node breakdown.
 
 **Enforcement mechanism**: this topology is controlled entirely at the tapyrus-core P2P layer via
 `-connect=<peer>` (which, used consistently, both restricts a node's own outbound dialing to just
