@@ -81,6 +81,15 @@ MAX_ACTION_INTERVAL_SECONDS = 180
 STARTUP_GRACE_SECONDS = 360
 INVALIDATE_RECONSIDER_MIN_DELAY_SECONDS = 5
 INVALIDATE_RECONSIDER_MAX_DELAY_SECONDS = 30
+# _wait_out_pause() is a shared gate across every chaos node -- while a host-side
+# script holds the pause file, any node whose own randomized timer expires during
+# that window queues up at the gate instead of firing on its own schedule. All
+# queued nodes then release in the same instant the file disappears, regardless of
+# how spread out their original timers were -- confirmed live: 3 nodes independently
+# invalidated the exact same shared tip in the exact same second this way. This
+# jitter destaggers a shared release without changing each node's own long-run
+# action frequency.
+POST_PAUSE_JITTER_MAX_SECONDS = 15
 
 # How long a stopped node stays down before a restart brings it back -- measured
 # in real blocks produced by the rest of the network (polled from another node,
@@ -285,8 +294,15 @@ class NodeOrchestrator:
         return actions
 
     async def _wait_out_pause(self):
+        waited = False
         while PAUSE_FILE.exists():
+            waited = True
             await asyncio.sleep(PAUSE_POLL_INTERVAL_SECONDS)
+        if waited:
+            # Only jitter if this node actually queued at the gate -- the common
+            # case (pause file absent) shouldn't pay this delay on every single
+            # action. See POST_PAUSE_JITTER_MAX_SECONDS.
+            await asyncio.sleep(self._rng.uniform(0, POST_PAUSE_JITTER_MAX_SECONDS))
 
     async def _plain_restart(self):
         await self._restart(reason="plain")

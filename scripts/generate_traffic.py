@@ -8,12 +8,27 @@ hops from any first-layer node, see docker/docker-compose.yml) never causes a ra
   - send height:   every node concurrently sends TPC to its round-robin target, and
                     either transfers its own colored type to the same target (enough
                     balance) or mints more of it (not enough) -- see "Colored-coin
-                    balance shortfall" below.
-  - check height:  balances are polled and logged, not asserted -- P2P propagation to
-                    all 7 nodes isn't guaranteed complete the instant the height ticks
+                    balance shortfall" below. Broadcasting doesn't touch the ledger yet
+                    -- see "Deferred ledger crediting" below.
+  - check height:  each send's ledger delta is applied once its txid actually confirms
+                    (still-pending ones get one more try at settle height); balances
+                    are then polled and logged, not asserted -- P2P propagation to all
+                    7 nodes isn't guaranteed complete the instant the height ticks
                     over, so asserting here would be a false-negative risk.
-  - settle height: balances are polled and asserted against the ledger this script has
-                    been keeping since the funding phase.
+  - settle height: any send still unconfirmed here is dropped, not credited -- and
+                    balances are polled and asserted against the ledger this script
+                    has been keeping since the funding phase.
+
+Deferred ledger crediting: a send/issuance whose RPC call succeeds can still be
+dropped from the mempool before it confirms -- e.g. a chaos node's own invalidateblock
+racing the broadcast (confirmed live: two chaos nodes coincidentally invalidated their
+shared tip in the same instant a round's sends were going out, and one of those sends
+never confirmed again). Crediting the ledger the instant broadcast succeeds would
+leave it permanently out of sync with reality in that case. So sends/issuances return
+a PendingChange instead of touching self._ledger directly; _resolve_pending_changes
+applies it only once every one of its txids has confirmed on-chain (checked at check
+and settle height, mirroring the round's own two-step), and drops it -- not counted as
+a successful round action either -- if it never does.
 
 Usage:
     ./scripts/generate_traffic.py <round-count>
@@ -117,7 +132,8 @@ TPC = "TPC"
 # balances, so _verify_round's ledger-vs-actual comparison matches trivially and the
 # run exits 0 despite doing nothing. This floor catches that: at least this fraction
 # of the round_count * 14 (7 nodes x {TPC send, colored send-or-mint}) actions must
-# actually succeed, or the run is treated as failed regardless of what the ledger
+# actually confirm on-chain (see PendingChange/_resolve_pending_changes -- broadcasting
+# alone doesn't count), or the run is treated as failed regardless of what the ledger
 # comparison says.
 MIN_SUCCESSFUL_ACTION_FRACTION = 0.5
 
@@ -137,6 +153,27 @@ class TrafficNode:
         self.address = None
         self.token_type = NODE_TOKEN_TYPES[index]
         self.color_id = None
+
+
+class PendingChange:
+    """A ledger mutation whose transaction(s) haven't been confirmed on-chain yet --
+    applied only once every one of them is (see _resolve_pending_changes), not the
+    instant broadcast succeeds. A send/issuance that broadcasts fine (no RpcError) can
+    still be dropped from the mempool by a coincidental chaos invalidateblock racing
+    the broadcast -- confirmed live. Crediting the ledger immediately on broadcast
+    would then leave it permanently out of sync with the real, on-chain outcome.
+
+    node: whose wallet owns every txid below (gettransaction is queried against it).
+    txids: all of them must confirm before deltas apply -- a multi-tx operation (e.g.
+        reissuetoken's several component txs) is all-or-nothing, not partial credit.
+    deltas: (node_name, asset, amount) tuples applied to self._ledger once confirmed.
+    """
+
+    def __init__(self, node, txids, deltas, description):
+        self.node = node
+        self.txids = list(txids)
+        self.deltas = deltas
+        self.description = description
 
 
 class TrafficGenerator:
@@ -178,18 +215,27 @@ class TrafficGenerator:
         # other 4 nodes from them, on a fresh chain where they start at 0.
         for _ in range(3):
             await self._next_block_with_coinbase()
-        await self._fund_unfunded_nodes()
-        await self._next_block_with_coinbase()
-        await self._issue_colors()
-        await self._next_block_with_coinbase()
+        funding_changes = await self._fund_unfunded_nodes()
+        height = await self._next_block_with_coinbase()
+        # final=True: setup gets exactly one block's grace to confirm, unlike the
+        # round loop's own check/settle two-step -- a dropped funding/issuance tx
+        # here just means that node stays unfunded, same as an outright RpcError
+        # would (both already tolerated by later steps, e.g. _send_or_topup_color's
+        # own None-color-id fallback).
+        await self._resolve_pending_changes(funding_changes, height, final=True, count_success=False)
+        issuance_changes = await self._issue_colors()
+        height = await self._next_block_with_coinbase()
+        await self._resolve_pending_changes(issuance_changes, height, final=True, count_success=False)
 
         for round_number in range(1, self._round_count + 1):
             log.step(f"round {round_number}/{self._round_count}")
             await self._next_block_with_coinbase()
-            await self._send_round(round_number)
+            pending = await self._send_round(round_number)
             check_height = await self._next_block_with_coinbase()
+            pending = await self._resolve_pending_changes(pending, check_height, final=False)
             await self._log_balances(check_height, "check")
             settle_height = await self._next_block_with_coinbase()
+            await self._resolve_pending_changes(pending, settle_height, final=True)
             await self._verify_round(settle_height)
 
         expected_actions = self._round_count * len(self._nodes) * 2
@@ -273,42 +319,51 @@ class TrafficGenerator:
                 txid = await funder.rpc.call("sendtoaddress", [recipient.address, FUNDING_AMOUNT_TPC])
             except (RpcError, RpcUnreachable) as exc:
                 log.warn(f"{funder_name}: funding {recipient_name} failed ({exc}) -- {recipient_name} stays unfunded")
-                return
-            await self._apply_fee(funder, txid)
-            self._ledger[funder.name][TPC] -= FUNDING_AMOUNT_TPC
-            self._ledger[recipient.name][TPC] += FUNDING_AMOUNT_TPC
+                return None
+            return PendingChange(
+                node=funder, txids=[txid],
+                deltas=[(funder.name, TPC, -FUNDING_AMOUNT_TPC), (recipient.name, TPC, FUNDING_AMOUNT_TPC)],
+                description=f"funding {recipient_name}",
+            )
 
-        await asyncio.gather(*(fund(f, r) for f, r in FUNDING_PAIRS))
+        results = await asyncio.gather(*(fund(f, r) for f, r in FUNDING_PAIRS))
+        return [r for r in results if r is not None]
 
     async def _issue_colors(self):
         log.step("each node issuing its own colored type")
 
         async def issue(node):
             try:
-                await self._issue_color(node)
+                return await self._issue_color(node)
             except (RpcError, RpcUnreachable) as exc:
                 log.warn(f"{node.name}: initial {TOKEN_TYPE_NAMES[node.token_type]} issuance failed ({exc})"
                          " -- this node sits out colored-coin activity until a later round mints one")
+                return None
 
-        await asyncio.gather(*(issue(node) for node in self._nodes))
+        results = await asyncio.gather(*(issue(node) for node in self._nodes))
+        return [r for r in results if r is not None]
 
     async def _issue_color(self, node):
         if node.token_type == REISSUABLE:
             script_pubkey = await self._own_script_pubkey(node)
             result = await node.rpc.call("issuetoken", [REISSUABLE, TOKEN_ISSUE_AMOUNT, script_pubkey])
-            for txid in result["txids"]:
-                await self._apply_fee(node, txid)
+            txids = result["txids"]
         else:
-            txid, vout = await self._seed_plain_utxo(node)
+            seed_txid, vout = await self._seed_plain_utxo(node)
             value = 1 if node.token_type == NFT else TOKEN_ISSUE_AMOUNT
-            result = await node.rpc.call("issuetoken", [node.token_type, value, txid, vout])
-            await self._apply_fee(node, result["txid"])
+            result = await node.rpc.call("issuetoken", [node.token_type, value, seed_txid, vout])
+            # Bundled with the issuance's own txid -- the seed self-send's fee is
+            # part of the same all-or-nothing change, not credited separately.
+            txids = [seed_txid, result["txid"]]
 
         node.color_id = result["color"]
-        self._ledger[node.name][node.color_id] = (
-            1 if node.token_type == NFT else float(TOKEN_ISSUE_AMOUNT)
+        amount = 1 if node.token_type == NFT else float(TOKEN_ISSUE_AMOUNT)
+        log.info(f"{node.name}: issuing {TOKEN_TYPE_NAMES[node.token_type]} color {node.color_id} (pending confirmation)")
+        return PendingChange(
+            node=node, txids=txids,
+            deltas=[(node.name, node.color_id, amount)],
+            description=f"{TOKEN_TYPE_NAMES[node.token_type]} issuance ({node.color_id[:12]}...)",
         )
-        log.info(f"{node.name}: issued {TOKEN_TYPE_NAMES[node.token_type]} color {node.color_id}")
 
     async def _own_script_pubkey(self, node):
         address = await node.rpc.call("getnewaddress")
@@ -322,7 +377,6 @@ class TrafficGenerator:
         exact (txid, vout) of."""
         address = await node.rpc.call("getnewaddress")
         txid = await node.rpc.call("sendtoaddress", [address, SEED_UTXO_AMOUNT_TPC])
-        await self._apply_fee(node, txid)
         tx = await node.rpc.call("gettransaction", [txid])
         for detail in tx["details"]:
             if detail.get("address") == address:
@@ -333,29 +387,34 @@ class TrafficGenerator:
 
     async def _send_round(self, round_number):
         offset = 1 + ((round_number - 1) % (len(self._nodes) - 1))
-        await asyncio.gather(*(
+        results = await asyncio.gather(*(
             self._send_node_round(sender, self._nodes[(sender.index + offset) % len(self._nodes)])
             for sender in self._nodes
         ))
+        return [change for pair in results for change in pair if change is not None]
 
     async def _send_node_round(self, sender, target):
+        tpc_change = None
+        color_change = None
         try:
-            await self._send_tpc(sender, target)
-            self._successful_round_actions += 1
+            tpc_change = await self._send_tpc(sender, target)
         except (RpcError, RpcUnreachable) as exc:
             log.warn(f"{sender.name}: round TPC send skipped ({exc})")
 
         try:
-            await self._send_or_topup_color(sender, target)
-            self._successful_round_actions += 1
+            color_change = await self._send_or_topup_color(sender, target)
         except (RpcError, RpcUnreachable) as exc:
             log.warn(f"{sender.name}: round colored action failed ({exc})")
 
+        return (tpc_change, color_change)
+
     async def _send_tpc(self, sender, target):
         txid = await sender.rpc.call("sendtoaddress", [target.address, ROUND_SEND_AMOUNT_TPC])
-        await self._apply_fee(sender, txid)
-        self._ledger[sender.name][TPC] -= ROUND_SEND_AMOUNT_TPC
-        self._ledger[target.name][TPC] += ROUND_SEND_AMOUNT_TPC
+        return PendingChange(
+            node=sender, txids=[txid],
+            deltas=[(sender.name, TPC, -ROUND_SEND_AMOUNT_TPC), (target.name, TPC, ROUND_SEND_AMOUNT_TPC)],
+            description=f"round TPC send to {target.name}",
+        )
 
     async def _send_or_topup_color(self, sender, target):
         if sender.color_id is None:
@@ -363,33 +422,37 @@ class TrafficGenerator:
             # getnewaddress silently treat a null color as "no color" instead of
             # raising, so this must be checked explicitly rather than falling through
             # to them, or it'd silently send plain TPC while believing it sent a token.
-            await self._issue_color(sender)
-            return
+            return await self._issue_color(sender)
 
         balance = await sender.rpc.call("getbalance", [False, sender.color_id])
         if balance >= ROUND_SEND_AMOUNT_TOKEN:
             colored_address = await target.rpc.call("getnewaddress", ["", sender.color_id])
             txid = await sender.rpc.call("transfertoken", [colored_address, ROUND_SEND_AMOUNT_TOKEN])
-            await self._apply_fee(sender, txid)
-            self._ledger[sender.name][sender.color_id] -= ROUND_SEND_AMOUNT_TOKEN
-            self._ledger[target.name][sender.color_id] = (
-                self._ledger[target.name].get(sender.color_id, 0) + ROUND_SEND_AMOUNT_TOKEN
+            return PendingChange(
+                node=sender, txids=[txid],
+                deltas=[
+                    (sender.name, sender.color_id, -ROUND_SEND_AMOUNT_TOKEN),
+                    (target.name, sender.color_id, ROUND_SEND_AMOUNT_TOKEN),
+                ],
+                description=f"round colored transfer to {target.name} ({sender.color_id[:12]}...)",
             )
         else:
-            await self._topup_color(sender)
+            return await self._topup_color(sender)
 
     async def _topup_color(self, sender):
         if sender.token_type == REISSUABLE:
             result = await sender.rpc.call("reissuetoken", [sender.color_id, TOKEN_TOPUP_AMOUNT])
-            for txid in result["txids"]:
-                await self._apply_fee(sender, txid)
-            self._ledger[sender.name][sender.color_id] += TOKEN_TOPUP_AMOUNT
-            log.info(f"{sender.name}: topped up {sender.color_id} by reissuing {TOKEN_TOPUP_AMOUNT}")
+            log.info(f"{sender.name}: reissuing {sender.color_id} to top up by {TOKEN_TOPUP_AMOUNT} (pending confirmation)")
+            return PendingChange(
+                node=sender, txids=result["txids"],
+                deltas=[(sender.name, sender.color_id, TOKEN_TOPUP_AMOUNT)],
+                description=f"colored reissue top-up ({sender.color_id[:12]}...)",
+            )
         else:
             # NON_REISSUABLE/NFT have no reissue path (fixed supply by design) -- mint
             # an entirely new color instead. The node's "own color" moves forward.
-            await self._issue_color(sender)
-            log.info(f"{sender.name}: minted a fresh {TOKEN_TYPE_NAMES[sender.token_type]} color (old one exhausted)")
+            log.info(f"{sender.name}: minting a fresh {TOKEN_TYPE_NAMES[sender.token_type]} color (old one exhausted)")
+            return await self._issue_color(sender)
 
     # -- height polling ------------------------------------------------------------
 
@@ -467,7 +530,15 @@ class TrafficGenerator:
         actual = await self._current_height()
         for height in range(self._last_credited_height + 1, actual + 1):
             await self._credit_coinbase_for_height(height)
-        self._last_credited_height = actual
+        # max(), not a bare assignment: _current_height() takes min() across all 7
+        # nodes, and a chaos node's own invalidateblock can transiently regress its
+        # locally-reported height. A bare assignment would let that regression rewind
+        # this backward, making a later call re-credit a height already credited --
+        # confirmed live: two chaos nodes invalidated their shared tip simultaneously,
+        # regressing the min-height read, and the next call double-credited that
+        # height's coinbase reward. max() keeps this monotonic regardless of when a
+        # regression lands.
+        self._last_credited_height = max(self._last_credited_height, actual)
         return actual
 
     async def _credit_coinbase_for_height(self, height):
@@ -548,23 +619,66 @@ class TrafficGenerator:
         else:
             log.info(f"height {height}: {node_name} {asset}: {actual} (matches ledger)")
 
-    async def _apply_fee(self, node, txid):
+    async def _resolve_pending_changes(self, pending_changes, height, final, count_success=True):
+        """Applies each PendingChange's ledger deltas only once every one of its
+        txids has actually confirmed (see PendingChange's own docstring for why).
+        Not final: unconfirmed changes are returned for a later retry at the next
+        block height (mirrors the round's own check/settle two-step). Final: an
+        unconfirmed change is dropped instead -- logged, not credited, not counted
+        as a successful round action -- since nothing later in the run gives it
+        another chance to confirm. count_success=False for the one-time setup calls
+        (funding/issuance) -- MIN_SUCCESSFUL_ACTION_FRACTION's denominator is
+        round_count * 14 round-loop actions only; folding setup successes in would
+        let a count exceed that denominator instead of meaning what it claims to."""
+        if not pending_changes:
+            return []
+        still_pending = []
+        pause_node_orchestrators()
+        try:
+            for change in pending_changes:
+                confirmed = True
+                total_fee = 0.0
+                for txid in change.txids:
+                    try:
+                        tx = await self._call_with_retry(change.node, "gettransaction", [txid])
+                    except RpcError:
+                        confirmed = False  # evicted from the wallet entirely -- lost, not just pending
+                        break
+                    if tx.get("confirmations", 0) < 1:
+                        confirmed = False
+                        break
+                    total_fee += self._extract_fee(tx)
+                if confirmed:
+                    self._ledger[change.node.name][TPC] += total_fee
+                    for node_name, asset, amount in change.deltas:
+                        self._ledger[node_name][asset] = self._ledger[node_name].get(asset, 0) + amount
+                    if count_success:
+                        self._successful_round_actions += 1
+                elif final:
+                    txids_preview = ", ".join(t[:12] for t in change.txids)
+                    log.warn(
+                        f"{change.node.name}: {change.description} ({txids_preview}...) never confirmed "
+                        f"by height {height} -- dropped, not credited"
+                    )
+                else:
+                    still_pending.append(change)
+        finally:
+            resume_node_orchestrators()
+        return still_pending
+
+    def _extract_fee(self, tx):
         # tapyrus-core's gettransaction has no top-level "fee" field here -- and the
         # fee's shape within "details" itself varies by tx type (confirmed
         # against a live node; see doc/work-done.md): a plain TPC send nests "fee"
         # inside its own category="send" entry, while a transaction that also moves a
         # colored output puts it in a separate category="fee" entry instead (and the
         # send/receive entries have no "fee" key of their own in that case).
-        tx = await node.rpc.call("gettransaction", [txid])
-        fee = 0
         for detail in tx.get("details", []):
             if detail.get("category") == "fee":
-                fee = detail["amount"]
-                break
+                return detail["amount"]
             if detail.get("category") == "send" and "fee" in detail:
-                fee = detail["fee"]
-                break
-        self._ledger[node.name][TPC] += fee
+                return detail["fee"]
+        return 0
 
 
 def parse_args():
