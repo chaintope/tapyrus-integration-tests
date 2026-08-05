@@ -476,24 +476,28 @@ class TrafficGenerator:
         it's subsidy plus whatever transaction fees that block happened to
         include, so once real traffic is flowing it varies block to block
         (confirmed live)."""
-        by_name = {node.name: node for node in self._nodes}
-        probe = self._nodes[0]
-        blockhash = await probe.rpc.call("getblockhash", [height])
-        block = await probe.rpc.call("getblock", [blockhash])
-        coinbase_txid = block["tx"][0]
-        for name in sorted(COINBASE_EARNING_NODES):
-            try:
-                tx = await by_name[name].rpc.call("gettransaction", [coinbase_txid])
-            except RpcError:
-                continue  # not in this node's wallet -- try the next candidate
-            for detail in tx.get("details", []):
-                if detail.get("category") == "generate":
-                    self._ledger[name][TPC] += detail["amount"]
-                    return
-        raise TrafficGenerationError(
-            f"height {height}: no coinbase-earning node's wallet has a 'generate' "
-            f"transaction for {coinbase_txid}"
-        )
+        pause_node_orchestrators()
+        try:
+            by_name = {node.name: node for node in self._nodes}
+            probe = self._nodes[0]
+            blockhash = await self._call_with_retry(probe, "getblockhash", [height])
+            block = await self._call_with_retry(probe, "getblock", [blockhash])
+            coinbase_txid = block["tx"][0]
+            for name in sorted(COINBASE_EARNING_NODES):
+                try:
+                    tx = await self._call_with_retry(by_name[name], "gettransaction", [coinbase_txid])
+                except RpcError:
+                    continue  # not in this node's wallet -- try the next candidate
+                for detail in tx.get("details", []):
+                    if detail.get("category") == "generate":
+                        self._ledger[name][TPC] += detail["amount"]
+                        return
+            raise TrafficGenerationError(
+                f"height {height}: no coinbase-earning node's wallet has a 'generate' "
+                f"transaction for {coinbase_txid}"
+            )
+        finally:
+            resume_node_orchestrators()
 
     # -- balance logging / verification --------------------------------------------
 

@@ -443,13 +443,12 @@ assignment, and the balance-shortfall top-up mechanic). Implemented as `TrafficN
   their own sections below).
 - **Every setup/verification RPC sequence is chaos-tolerant**, since this script runs
   continuously against the node orchestrator's background chaos (`work-done.md`):
-  address collection, balance seeding, coinbase-rotation calibration, every block
-  wait, and every balance verification all pause chaos for their own span
+  address collection, balance seeding, every per-height coinbase credit, every
+  block wait, and every balance verification all pause chaos for their own span
   (`scripts/lib/orchestrator_control.py`) *and* retry individual RPC calls on
   `RpcUnreachable` (`_call_with_retry`) rather than treating one node's momentary
   restart as a hard failure -- the pause file alone can't interrupt a restart already
-  in flight the instant it lands. Coinbase-rotation calibration additionally retries
-  the whole 3-height observation (up to 5 attempts) if a signer's turn gets skipped.
+  in flight the instant it lands.
   Verified live against a real chaos-supervised 7-node stack: multiple full runs,
   every balance/color check across all 7 nodes matched the ledger, zero mismatches.
 - **`core-1a`/`2a`/`3a`'s coinbase income is fully asserted too**, not excluded --

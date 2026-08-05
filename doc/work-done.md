@@ -192,12 +192,11 @@ does.
   isolated phase -- see the pause-file bullet below for how that's kept safe.
 - **core-1a/2a/3a never take a deliberate chaos action -- only core-1b/2b/3b/core-7
   do** (`CHAOS_NODES` in `node_orchestrator.py`). core-1a/2a/3a are the 3 signers'
-  own RPC targets; live testing found that even one of them briefly catching up from
-  a chaos-triggered restart could make it miss its turn in `tapyrus-signer`'s
-  round-robin master selection, throwing off `generate_traffic.py`'s
-  coinbase-rotation tracking mid-calibration. They still get crash-recovery
-  supervision like every other node (`_supervise_crashes`), just never a deliberate
-  stop/restart/invalidate. `NODE_ORCHESTRATOR_FLAVOR` is still set for these 3 in
+  own RPC targets, threshold 2-of-3 -- disrupting them risks reducing available
+  signing capacity below threshold if more than one is ever down at once. They
+  still get crash-recovery supervision like every other node
+  (`_supervise_crashes`), just never a deliberate stop/restart/invalidate.
+  `NODE_ORCHESTRATOR_FLAVOR` is still set for these 3 in
   `docker-compose.yml` (matching the round-robin assignment below) but is unused
   dead config for them specifically, since nothing ever reads it without the chaos
   loop running.
@@ -227,16 +226,17 @@ does.
   `simulate_maxblocksize_change.py` each have a single, non-retrying
   `getblockchaininfo` confirmation check that a node mid-restart at the wrong moment
   would fail spuriously; `generate_traffic.py` brackets every all-nodes-reachable
-  RPC sequence the same way (address collection, balance seeding, coinbase-rotation
-  calibration, every block wait, every balance verification). All touch the pause
-  file before their sensitive window and remove it in a `finally` (guaranteed even
-  on failure) -- every core node's orchestrator checks for it before any action, not
-  just restarts, so it also covers `invalidateblock` (which doesn't take RPC down).
-  Calls nest via a depth counter (`pause_node_orchestrators`/
-  `resume_node_orchestrators`), so an inner pause/resume pair (e.g.
-  `generate_traffic.py`'s own `_wait_for_next_block`, called from within its broader
-  calibration window) doesn't prematurely resume chaos while an outer caller still
-  needs it paused. The pause file only stops *new* actions -- it can't interrupt one
+  RPC sequence the same way (address collection, balance seeding, every
+  per-height coinbase credit, every block wait, every balance verification). All
+  touch the pause file before their sensitive window and remove it in a `finally`
+  (guaranteed even on failure) -- every core node's orchestrator checks for it
+  before any action, not just restarts, so it also covers `invalidateblock`
+  (which doesn't take RPC down). Calls nest via a depth counter
+  (`pause_node_orchestrators`/`resume_node_orchestrators`), so an inner
+  pause/resume pair (e.g. `generate_traffic.py`'s own `_wait_for_next_block`,
+  called from within `_next_block_with_coinbase`'s own paused window) doesn't
+  prematurely resume chaos while an outer caller still needs it paused. The
+  pause file only stops *new* actions -- it can't interrupt one
   already in flight the instant it lands, so `generate_traffic.py`'s own RPC calls
   additionally retry on `RpcUnreachable` (`_call_with_retry`) rather than treating a
   momentary straggler as a hard failure.
