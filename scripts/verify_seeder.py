@@ -216,6 +216,31 @@ class SeederVerifier:
         await self._bring_up_seeder()
         await bring_up(*CORE_NODES)
         await self._wait_for_all_rpc_ready(CORE_NODES)
+        self._persist_env_for_rest_of_job()
+
+    def _persist_env_for_rest_of_job(self):
+        # GENESIS_BLOCK_WITH_SIG/SEEDER_IP/CORE_<NAME>_ARGS only live in this
+        # process's own os.environ otherwise -- any later script or workflow step
+        # that touches `docker compose up` on these containers, from a fresh
+        # process that never re-derives them, sees Compose treat the
+        # resolved-to-empty fallback as a real config change and silently
+        # recreates them, resetting -connect (and anything else in command:) to
+        # whatever that fresh process happens to resolve. Confirmed live twice:
+        # "Bring up signers" recreating core-1a/2a/3a via their depends_on on
+        # signer-0/1/2 (SEEDER_IP unset there), and simulate_reorg.py stranding
+        # core-1b/core-2b with no peers this same way when it restarts group A --
+        # which hung the whole job past its own timeout, since nothing else can
+        # ever make group A's height-wait succeed once two of its four nodes can
+        # never receive another block. See doc/work-done.md.
+        github_env = os.environ.get("GITHUB_ENV")
+        if not github_env:
+            return  # not running under GitHub Actions -- nothing to persist to
+        with open(github_env, "a") as f:
+            f.write(f"GENESIS_BLOCK_WITH_SIG={os.environ['GENESIS_BLOCK_WITH_SIG']}\n")
+            f.write(f"SEEDER_IP={os.environ['SEEDER_IP']}\n")
+            for node, args in CONNECT_MODE_ARGS.items():
+                f.write(f"{_args_env_var(node)}={args}\n")
+        log.info("persisted GENESIS_BLOCK_WITH_SIG/SEEDER_IP/CORE_*_ARGS to $GITHUB_ENV for the rest of the job")
 
     def _resolve_node_ips(self):
         ips = {name: _container_ip(f"docker-{name}-1") for name in CORE_NODES}

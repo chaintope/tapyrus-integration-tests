@@ -197,6 +197,29 @@ does.
   the time. A separate theory (inconsistent Schnorr share selection across process
   invocations) was tested and ruled out via 60/60 clean ceremony rounds. This was a
   `tapyrus-signer` bug, fixed upstream.
+- **A silent `docker compose up`-triggered recreate stranded two nodes and hung
+  a real CI run for 3+ hours until the job's own timeout killed it.**
+  `simulate_reorg.py` restarts group A (`start_nodes`, which is `docker compose up
+  -d --no-deps ...`) from its own fresh process, which had never re-set
+  `CORE_1B_ARGS`/`CORE_2B_ARGS` -- Compose resolved them to empty, saw that as a
+  real config change from what the container was created with, and recreated
+  core-1b/core-2b *without* their `-connect=` flag, permanently stranding them
+  with zero peers (`--no-deps` only stops cascading to *other* services'
+  `depends_on` targets; it doesn't protect a service's own `command:` from
+  drifting when its own env var isn't set). core-1a/core-2a kept building blocks
+  completely normally, so the height-wait the rest of the recipe was blocked on
+  could never succeed -- confirmed live: 137 blocks past the intended target
+  before the job was externally killed, while core-1b/core-2b sat frozen at their
+  restart-time height the entire time. The same root cause, independently, made
+  "Bring up signers" silently recreate core-1a/2a/3a mid-run too (`SEEDER_IP`
+  unset there this time) -- survived only by luck (their connect-mode args happen
+  to be empty strings, so nothing actually changed that run). Fixed at the
+  source: `verify_seeder.py` persists `GENESIS_BLOCK_WITH_SIG`/`SEEDER_IP`/every
+  `CORE_*_ARGS` to `$GITHUB_ENV` once connect mode is up, so every later step in
+  the job resolves the same values regardless of which fresh process touches
+  `docker compose` next -- not a per-script patch, since any future script with
+  the same oversight would reintroduce the same failure mode. "Bring up signers"
+  also gained `--no-deps` as defense in depth.
 - **`round-duration=60` avoids transient `InvalidBlock` errors** around round
   boundaries that shorter durations (e.g. 10) hit. `round-duration=30` also verified
   clean.

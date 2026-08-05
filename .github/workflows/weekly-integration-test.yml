@@ -147,10 +147,13 @@ jobs:
           ROUND_DURATION="$ROUND_DURATION" ./scripts/assemble_signer_configs.py signer-set-a 2 \
             /tmp/core-rpc-hosts.txt "$CORE_RPC_PORT" "$CORE_RPC_USER" "$CORE_RPC_PASS" redis 6379 /tmp/addrs.txt
       - name: Bring up signers
-        run: |
-          cd docker
-          GENESIS_BLOCK_WITH_SIG=$(cat ../secrets/signer-set-a/genesis.hex) \
-            docker compose up -d signer-0 signer-1 signer-2
+        # --no-deps: signer-0/1/2 each depends_on a core-1a/2a/3a node
+        # (docker/docker-compose.yml) -- without it, `up` also reconciles those
+        # already-running dependencies, and GENESIS_BLOCK_WITH_SIG/SEEDER_IP/
+        # CORE_*_ARGS being real job-level env vars (persisted by
+        # verify_seeder.py, see its own docstring) is what keeps their resolved
+        # config from drifting either way. See doc/work-done.md.
+        run: cd docker && docker compose up -d --no-deps signer-0 signer-1 signer-2
 
       - name: Generate traffic (before reorg)
         run: ./scripts/generate_traffic.py "$TX_ROUND_COUNT"
