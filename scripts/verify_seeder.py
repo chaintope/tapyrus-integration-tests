@@ -144,6 +144,14 @@ class SeederVerifier:
         self._rpc_pass = rpc_pass
 
     async def run(self):
+        # Every core-* service bind-mounts ../runtime/orchestrator-control -- if
+        # runtime/ doesn't exist yet when the first `docker compose up` below creates
+        # it, the Docker daemon (root) creates it owned by root:root, and every
+        # host-side write under runtime/ afterwards (this job's own
+        # PAUSE_FILE.touch(), assemble_signer_configs.py's default output dir) then
+        # fails as the non-root runner user. Pre-creating it here, before any
+        # container touches it, keeps ownership with the runner.
+        (REPO_ROOT / "runtime" / "orchestrator-control").mkdir(parents=True, exist_ok=True)
         # Same signed genesis every core-* node loads -- needed in this process's own
         # environment for both bring-up phases below (docker-compose.yml's
         # GENESIS_BLOCK_WITH_SIG substitution), same as the workflow's old "Bring up

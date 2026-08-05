@@ -72,6 +72,7 @@ services:
       NODE_NAME: core-1a
       NODE_ORCHESTRATOR: ${NODE_ORCHESTRATOR:-}
       NODE_ORCHESTRATOR_FLAVOR: reindex
+      PRNG_SEED_BASE: ${PRNG_SEED_BASE:-0}
     volumes:
       - ./generated/tapyrus.conf:/etc/tapyrus/tapyrus.conf
       - ../scripts:/app/scripts:ro
@@ -89,6 +90,7 @@ services:
       NODE_NAME: core-2a
       NODE_ORCHESTRATOR: ${NODE_ORCHESTRATOR:-}
       NODE_ORCHESTRATOR_FLAVOR: reloadxfield
+      PRNG_SEED_BASE: ${PRNG_SEED_BASE:-0}
     volumes:
       - ./generated/tapyrus.conf:/etc/tapyrus/tapyrus.conf
       - ../scripts:/app/scripts:ro
@@ -106,6 +108,7 @@ services:
       NODE_NAME: core-3a
       NODE_ORCHESTRATOR: ${NODE_ORCHESTRATOR:-}
       NODE_ORCHESTRATOR_FLAVOR: reindex-chainstate
+      PRNG_SEED_BASE: ${PRNG_SEED_BASE:-0}
     volumes:
       - ./generated/tapyrus.conf:/etc/tapyrus/tapyrus.conf
       - ../scripts:/app/scripts:ro
@@ -125,6 +128,7 @@ services:
       NODE_NAME: core-1b
       NODE_ORCHESTRATOR: ${NODE_ORCHESTRATOR:-}
       NODE_ORCHESTRATOR_FLAVOR: reindex-chainstate
+      PRNG_SEED_BASE: ${PRNG_SEED_BASE:-0}
     volumes:
       - ./generated/tapyrus.conf:/etc/tapyrus/tapyrus.conf
       - ../scripts:/app/scripts:ro
@@ -142,6 +146,7 @@ services:
       NODE_NAME: core-2b
       NODE_ORCHESTRATOR: ${NODE_ORCHESTRATOR:-}
       NODE_ORCHESTRATOR_FLAVOR: reindex
+      PRNG_SEED_BASE: ${PRNG_SEED_BASE:-0}
     volumes:
       - ./generated/tapyrus.conf:/etc/tapyrus/tapyrus.conf
       - ../scripts:/app/scripts:ro
@@ -159,6 +164,7 @@ services:
       NODE_NAME: core-3b
       NODE_ORCHESTRATOR: ${NODE_ORCHESTRATOR:-}
       NODE_ORCHESTRATOR_FLAVOR: reloadxfield
+      PRNG_SEED_BASE: ${PRNG_SEED_BASE:-0}
     volumes:
       - ./generated/tapyrus.conf:/etc/tapyrus/tapyrus.conf
       - ../scripts:/app/scripts:ro
@@ -178,6 +184,7 @@ services:
       NODE_NAME: core-7
       NODE_ORCHESTRATOR: ${NODE_ORCHESTRATOR:-}
       NODE_ORCHESTRATOR_FLAVOR: reindex
+      PRNG_SEED_BASE: ${PRNG_SEED_BASE:-0}
     volumes:
       - ./generated/tapyrus.conf:/etc/tapyrus/tapyrus.conf
       - ../scripts:/app/scripts:ro

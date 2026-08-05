@@ -55,9 +55,10 @@ A single `integration-test` job runs these steps in order:
 7. **Start the node orchestrator** (`scripts/start_node_orchestrator.py`) -- switches
    the 7 core-* nodes into chaos-supervised mode. core-1b/2b/3b/core-7 randomly
    stop/restart/reindex/invalidate themselves for the rest of the job;
-   core-1a/2a/3a (the signers' own RPC targets) get crash-recovery supervision but
-   never a deliberate chaos action, since disrupting them risks throwing off
-   `generate_traffic.py`'s coinbase-rotation tracking (see `doc/work-done.md`).
+   core-1a/2a/3a (the signers' own RPC targets, threshold 2-of-3) get
+   crash-recovery supervision but never a deliberate chaos action, since
+   disrupting them risks reducing available signing capacity below threshold
+   (see `doc/work-done.md`).
 8. **Wait for the P2P topology to converge** (`scripts/wait_for_topology.py`, polling
    `getconnectioncount` against the expected 1/2/1/2/1/2/3 pattern) against the
    now-finalized fixed topology, then collect a coinbase address from each
@@ -67,10 +68,12 @@ A single `integration-test` job runs these steps in order:
    `scripts/assemble_signer_configs.py`, bring up the 3 signer-set-a containers.
 10. **Per-node activity**: round-robin TPC + colored-coin traffic across all 7 nodes
     with balances confirmed after each block (`scripts/generate_traffic.py`),
-    including the 3 first-layer nodes' coinbase income -- calibrated from 3 real,
-    consecutive height observations early in the run (see `doc/work-done.md`), not
-    just excluded from the assertion. Runs continuously against the node
-    orchestrator's background chaos from step 7 onward.
+    including the 3 first-layer nodes' coinbase income -- observed directly per
+    block (see `doc/work-done.md`), not just excluded from the assertion. Runs
+    against the node orchestrator's background chaos from step 7 onward, though
+    chaos is paused for the duration of each block wait -- the overwhelming
+    majority of this step's wall time -- so most real churn lands between
+    workflow steps rather than overlapping traffic generation itself.
 11. **Reorg**: split the network into two groups, let each build its own real
     threshold-signed fork, reconnect, and confirm convergence via `getchaintips`
     (`scripts/simulate_reorg.py`).

@@ -247,7 +247,16 @@ does.
   up` touching those dependents (Bring up signers, Federation change) would resolve
   `NODE_ORCHESTRATOR` back to unset, and Compose would recreate that core node to
   match its now-different resolved config -- silently reverting it to plain
-  `tapyrusd`. Confirmed live: this exact drift happened mid-session.
+  `tapyrusd`. Confirmed live: this exact drift happened mid-session. Persisted by
+  the script itself (`_persist_env_for_rest_of_job`, same pattern as
+  `verify_seeder.py`'s own), not by a separate `echo >> $GITHUB_ENV` in the
+  workflow step -- self-contained, so running this script in any other context
+  doesn't silently reintroduce the same drift.
+- **Every script logs a `done.` line as its last action, naming whatever it
+  handed off** (a file it wrote, an env var it persisted, a condition it
+  confirmed) -- a deliberate, uniform convention, not incidental: `grep '\] done\.'`
+  across a job's combined log surfaces every script's completion point, in order,
+  as a one-line trace of the whole pipeline's handoffs.
 - **Secrets scope**: this repo only generates local dev secrets
   (`generate_dev_secrets.py`); it never provisions real GitHub secrets. No CI
   secret is currently needed at all -- Slack notification was deferred (see

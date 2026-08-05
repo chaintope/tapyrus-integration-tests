@@ -71,10 +71,12 @@ async def bring_up(*service_names):
 
 
 async def recreate_fresh(*service_names):
-    """`docker compose up -d --force-recreate <service_names>` -- forces a genuinely
-    new container (fresh writable layer), not just a process restart. For services
-    with no mounted volume, this is the only way to reset their state -- see
+    """`docker compose up -d --force-recreate --no-deps <service_names>` -- forces a
+    genuinely new container (fresh writable layer), not just a process restart. For
+    services with no mounted volume, this is the only way to reset their state -- see
     simulate_reorg.py's redis reset, where round-coordination state must not survive
-    between the isolated groups' builds.
+    between the isolated groups' builds. --no-deps for the same reason as
+    start_nodes/bring_up: harmless for redis today (no depends_on), but this helper
+    should stay safe by default if it's ever pointed at a service that has one.
     """
-    await compose("up", "-d", "--force-recreate", *service_names)
+    await compose("up", "-d", "--force-recreate", "--no-deps", *service_names)

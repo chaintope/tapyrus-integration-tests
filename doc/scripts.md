@@ -442,13 +442,19 @@ assignment, and the balance-shortfall top-up mechanic). Implemented as `TrafficN
   signer-set-a bring-up (rotation and max-block-size change are both active too, see
   their own sections below).
 - **Every setup/verification RPC sequence is chaos-tolerant**, since this script runs
-  continuously against the node orchestrator's background chaos (`work-done.md`):
-  address collection, balance seeding, every per-height coinbase credit, every
-  block wait, and every balance verification all pause chaos for their own span
+  against the node orchestrator's background chaos (`work-done.md`): address
+  collection, balance seeding, every per-height coinbase credit, every block wait,
+  and every balance verification all pause chaos for their own span
   (`scripts/lib/orchestrator_control.py`) *and* retry individual RPC calls on
   `RpcUnreachable` (`_call_with_retry`) rather than treating one node's momentary
   restart as a hard failure -- the pause file alone can't interrupt a restart already
-  in flight the instant it lands.
+  in flight the instant it lands. In practice this means chaos is mostly
+  suppressed during this script's own run, not overlapping it: block waits are the
+  overwhelming majority of its wall time, and each one pauses chaos for its
+  duration, so most real churn happens between workflow steps rather than during
+  traffic generation itself. Relaxing the all-7-nodes wait to tolerate stragglers
+  (e.g. require only the 3 stable RPC targets) would let chaos genuinely overlap
+  traffic -- a real follow-up, not done here.
   Verified live against a real chaos-supervised 7-node stack: multiple full runs,
   every balance/color check across all 7 nodes matched the ledger, zero mismatches.
 - **`core-1a`/`2a`/`3a`'s coinbase income is fully asserted too**, not excluded --

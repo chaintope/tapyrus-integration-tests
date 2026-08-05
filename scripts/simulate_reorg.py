@@ -167,24 +167,27 @@ class ReorgSimulator:
 
     async def run(self):
         await self._build_baseline()
-        # Paused for the whole span where exactly one group is ever up and
-        # building -- a concurrent orchestrator restart or invalidateblock could
-        # corrupt the fork being carefully built. try/finally, not just a resume
-        # call at the natural end of _build_group_a_fork, so a failure partway
-        # through still leaves node_orchestrator.py's chaos actions resumed
-        # afterward rather than silently disabled for the rest of the job.
+        # Paused for the whole span where the recipe's precision requirements hold,
+        # not just where exactly one group is up and building: a concurrent
+        # orchestrator restart or invalidateblock could corrupt the fork being
+        # carefully built, but it's just as capable of failing the exact-count
+        # reconnect wait or the getchaintips shape assertions that follow -- those
+        # aren't self-tolerant either. try/finally, not just a resume call at the
+        # natural end, so a failure partway through still leaves
+        # node_orchestrator.py's chaos actions resumed afterward rather than
+        # silently disabled for the rest of the job.
         pause_node_orchestrators()
         try:
             await self._build_group_b_fork()
             await self._restore_group_a()
             await self._inject_canary_transaction()
             await self._build_group_a_fork()
+            await self._reconnect_group_b()
+            await self._confirm_tie_holds()
+            await self._extend_group_b_by_two_blocks()
+            await self._confirm_convergence()
         finally:
             resume_node_orchestrators()
-        await self._reconnect_group_b()
-        await self._confirm_tie_holds()
-        await self._extend_group_b_by_two_blocks()
-        await self._confirm_convergence()
         await self._verify_canary_transaction_survived()
         await self._restore_default_signers()
         log.info(
