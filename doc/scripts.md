@@ -519,17 +519,33 @@ via `scripts/lib/compose.py`'s shared helpers.
   depending on the original "Collect coinbase addresses" step's `/tmp` file still
   being around. The reconnect step reuses `wait_for_topology.py`'s `TopologyWaiter`
   directly, same reasoning.
-- **`core-7` needs a different convergence check than `core-3a`/`core-3b`**:
-  `core-3a`/`core-3b` are only P2P-connected within group B (see
-  `docker-compose.yml`'s topology), so each should show a single active
-  `getchaintips` tip. `core-7`, by design, is P2P-connected to *all three*
-  second-layer nodes, bridging both groups -- so it legitimately learns group A's
-  abandoned fork via header relay even though it never builds/extends it, showing a
-  second tip at group A's height with status `valid-headers` (headers relayed and
-  known, not necessarily fully-validated as a real candidate), not `valid-fork` like
-  the ex-group-A nodes, since group B's own chain was always at least as long by the
-  time `core-7` reconnects to it. `_confirm_convergence` only asserts `core-7`'s
-  *active* tip matches group B, not its total tip count.
+- **Every node's expected `getchaintips` shape at `_confirm_convergence` is
+  derived from two propagation mechanisms, not just P2P adjacency**: (1) each
+  signer submits a block it masters directly to its own RPC target
+  (`core-1a`/`2a`/`3a`), no core-to-core P2P needed for that -- confirmed by
+  `_build_group_a_fork`'s own precondition (`signer-2`'s target `core-3a` is
+  unreachable while group B is stopped, and only `signer-0`/`1` submitting to
+  `core-1a`/`2a` independently is what still lets group A's fork round complete);
+  (2) P2P relay along `docker-compose.yml`'s static edges: `core-1a<->core-1b`,
+  `core-2a<->core-2b`, `core-3a<->core-3b`, `core-7<->{core-1b,core-2b,core-3b}`
+  -- `core-7` is the *only* bridge between the three otherwise-disconnected
+  pairs. From these:
+
+  | Node | Hops from group A | Expected tips |
+  |---|---|---|
+  | `core-1a`, `core-1b`, `core-2a`, `core-2b` | 0 (built it themselves) | Exactly 2, always: `active` = group B, `valid-fork` = group A (their own prior-active chain, demoted -- deterministic, exact hash/branchlen asserted) |
+  | `core-3a` | 3 (`1b`/`2b` -> `7` -> `3b` -> `3a`) | Exactly 1: `active` = group B only (never observed to leak within the reconnect window) |
+  | `core-3b` | 2 (`1b`/`2b` -> `7` -> `3b`) | `active` = group B, plus an *optional* `valid-headers` tip -- if present, must be group A's fork exactly, not just "any extra tip" (timing-dependent, not deterministic) |
+  | `core-7` | 1 (`1b`/`2b` -> `7`) | Same as `core-3b` |
+
+  `core-3b`/`core-7`'s optional tip, when present, is `valid-headers` (headers
+  relayed and known, not necessarily fully-validated as a real candidate), not
+  `valid-fork` like the ex-group-A nodes -- group B's own chain is always at
+  least as long by the time either reconnects, so neither ever adopts it. The
+  "must be group A's fork exactly, not just any extra tip" requirement was a
+  deliberate tightening: the original (`core-7`-only) version tolerated any
+  extra tip blindly, which would have silently passed a genuinely unexpected
+  chain too.
 - **Output**: none written to disk -- verification results are logged; a mismatch at
   any step raises `ReorgError` (non-zero exit); failures across all 7 nodes are
   collected and reported together, not just the first one hit.

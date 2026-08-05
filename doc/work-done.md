@@ -300,6 +300,50 @@ does.
   `docker compose` next -- not a per-script patch, since any future script with
   the same oversight would reintroduce the same failure mode. "Bring up signers"
   also gained `--no-deps` as defense in depth.
+- **Chaos-triggered `invalidateblock` corrupted `generate_traffic.py`'s ledger two
+  distinct ways, both traced to a real CI failure via the container logs.** (1)
+  `_current_height()` takes `min()` across all 7 nodes; a chaos node's own
+  transient height regression (mid-`invalidateblock`) could rewind
+  `_last_credited_height`, a bare assignment at the time, making a later call
+  re-credit an already-credited coinbase height. Fixed with `max()` --
+  monotonic regardless of when a regression lands. (2) sends/issuances credited
+  the ledger the instant broadcast succeeded, with no on-chain confirmation
+  check -- confirmed live, one transaction broadcast right as a chaos node's
+  `invalidateblock` hit was relayed once and never confirmed again, permanently
+  draining the ledger's agreement with reality. Fixed: `_send_tpc`/
+  `_send_or_topup_color`/`_topup_color`/`_issue_color`/`_fund_unfunded_nodes` now
+  return a `PendingChange` instead of mutating the ledger directly;
+  `_resolve_pending_changes` applies it only once every one of its txids has
+  actually confirmed (checked at the round's existing check/settle heights),
+  dropping it -- uncredited, not counted as a successful action -- if it never
+  does. Also traced *why* three independently-seeded chaos nodes invalidated the
+  exact same block in the exact same second in that run: not a seeding problem
+  (`random.Random(f"{PRNG_SEED_BASE}:{node_name}")` already gives each node an
+  uncorrelated stream) -- the shared pause file is a release barrier. A node
+  whose own randomized timer expires during any of `generate_traffic.py`'s
+  frequent brief pauses queues at `_wait_out_pause()` and fires the instant the
+  file disappears, regardless of how spread out its original timer was. Added a
+  random 0-15s jitter after a gated release to destagger this.
+- **`core-3b`, not just `core-7`, can legitimately see group A's abandoned fork
+  after a reorg reconnect -- `simulate_reorg.py`'s own convergence check was
+  wrong about this, and re-deriving every node's expected shape from the actual
+  topology (not incremental patching) is what caught it precisely.** Two
+  propagation mechanisms matter, not just P2P adjacency: each signer submits a
+  block it masters directly to its own RPC target (no core-to-core P2P needed),
+  and P2P relay along the static edges (`core-1a<->1b`, `core-2a<->2b`,
+  `core-3a<->3b`, `core-7<->{1b,2b,3b}` -- `core-7` is the only bridge between
+  the three otherwise-disconnected pairs). From this: group A's 4 nodes each
+  personally built their own fork (deterministic 2-tip residue after reorging
+  onto group B's longer chain); `core-3a` has no path to group A within the
+  reconnect window (3 hops away: `1b`/`2b` -> `7` -> `3b` -> `3a`), so it stays
+  strict; `core-3b`/`core-7` are both 1-2 hops from group A via `core-7`'s
+  bridge, so both can pick up group A's fork as headers-only knowledge without
+  adopting it -- confirmed live (a real CI run failed because `core-3b` showed
+  this second tip and the check only tolerated it on `core-7`). Fixed:
+  `core-3b` gets the same tolerant check as `core-7`, but tightened beyond the
+  original `core-7`-only version too -- if either shows a second tip, it must
+  actually be group A's fork specifically, not just "any other tip is fine",
+  so a genuinely unexpected chain wouldn't silently pass.
 - **`round-duration=60` avoids transient `InvalidBlock` errors** around round
   boundaries that shorter durations (e.g. 10) hit. `round-duration=30` also verified
   clean.

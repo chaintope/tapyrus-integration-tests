@@ -299,6 +299,30 @@ class ReorgSimulator:
         await stop_nodes(*SIGNERS)
 
     async def _confirm_convergence(self):
+        # Each node's expected getchaintips shape follows from two propagation
+        # mechanisms, not just P2P adjacency: (1) each signer submits a block it
+        # masters directly to its OWN RPC target (core-1a/2a/3a) -- no core-to-core
+        # P2P needed for that (confirmed by _build_group_a_fork's own precondition:
+        # signer-2's target core-3a is unreachable there, and signer-0/1 submitting
+        # to core-1a/2a independently is what still lets the round complete). (2)
+        # P2P relay along docker-compose.yml's static edges: core-1a<->core-1b,
+        # core-2a<->core-2b, core-3a<->core-3b, core-7<->{core-1b,core-2b,core-3b}
+        # -- core-7 is the ONLY bridge between the three otherwise-disconnected
+        # pairs. See doc/scripts.md for the full derivation; this is the outcome:
+        #
+        #   node      hops from group A   tips expected at this check
+        #   --------  -------------------  --------------------------------------
+        #   core-1a   0 (built it)         exactly 2: active=group B,
+        #   core-1b   0 (built it)                    valid-fork=group A
+        #   core-2a   0 (built it)                    (deterministic -- their own
+        #   core-2b   0 (built it)                    prior-active chain, demoted)
+        #   core-3a   3 (1b/2b->7->3b->3a) exactly 1: active=group B only
+        #                                             (never observed to leak)
+        #   core-3b   2 (1b/2b->7->3b)     active=group B, plus an OPTIONAL
+        #   core-7    1 (1b/2b->7)         valid-headers tip -- IF present, must
+        #                                  be group A's fork exactly, not just
+        #                                  "any extra tip" (timing-dependent,
+        #                                  not deterministic)
         log.step("confirming convergence via getchaintips (checking all 7 nodes, not stopping at the first mismatch)")
         failures = []
 
@@ -321,35 +345,28 @@ class ReorgSimulator:
             log.info(f"{name}: confirmed -- active={active[0]['hash'][:12]}... valid-fork={forks[0]['hash'][:12]}... "
                       f"branchlen={forks[0]['branchlen']}")
 
-        # core-3a/core-3b were on the winning side throughout, and are ONLY
-        # P2P-connected within group B (docker/docker-compose.yml), so neither ever
-        # even learns group A's fork exists -- each should show a single active tip.
-        for name in ("core-3a", "core-3b"):
-            tips = await self._clients[name].call("getchaintips")
-            if len(tips) != 1 or tips[0]["status"] != "active":
-                failures.append(f"{name}: expected a single active tip (never split), got {tips}")
-                continue
-            log.info(f"{name}: confirmed -- single active tip {tips[0]['hash'][:12]}... (never had a competing fork)")
-
-        # core-7 is different: it's P2P-connected to ALL THREE second-layer nodes
-        # (core-1b/core-2b/core-3b), bridging both groups by design (see
-        # docker-compose.yml's topology comment). So it legitimately learns group A's
-        # abandoned fork via header relay even though it was never asked to build or
-        # extend it -- it shows a second tip at group A's height with status
-        # "valid-headers" (headers relayed and known, not necessarily
-        # fully-validated as a real candidate), not "valid-fork" like the ex-group-A
-        # nodes, since group B's own chain was always at least as long by the time it
-        # reconnects. Only the ACTIVE tip is asserted here, not the tip count --
-        # unlike core-3a/core-3b, "exactly 1 tip" isn't the right invariant for it.
-        tips = await self._clients["core-7"].call("getchaintips")
-        active = [t for t in tips if t["status"] == "active"]
-        if len(active) != 1 or active[0]["hash"] != self._group_b_tip:
-            failures.append(f"core-7: expected a single active tip matching group B's {self._group_b_tip}, got {tips}")
+        tips = await self._clients["core-3a"].call("getchaintips")
+        if len(tips) != 1 or tips[0]["status"] != "active" or tips[0]["hash"] != self._group_b_tip:
+            failures.append(f"core-3a: expected a single active tip matching group B's {self._group_b_tip}, got {tips}")
         else:
-            log.info(
-                f"core-7: confirmed -- active tip {active[0]['hash'][:12]}... matches group B "
-                f"({len(tips) - 1} other known tip(s) from its cross-group P2P links, expected)"
-            )
+            log.info(f"core-3a: confirmed -- single active tip {tips[0]['hash'][:12]}... (never had a competing fork)")
+
+        for name in ("core-3b", "core-7"):
+            tips = await self._clients[name].call("getchaintips")
+            active = [t for t in tips if t["status"] == "active"]
+            others = [t for t in tips if t["status"] != "active"]
+            if len(active) != 1 or active[0]["hash"] != self._group_b_tip:
+                failures.append(f"{name}: expected a single active tip matching group B's {self._group_b_tip}, got {tips}")
+            elif others and any(t["hash"] != self._group_a_tip for t in others):
+                failures.append(
+                    f"{name}: active tip matches group B, but has an unexpected non-active tip -- "
+                    f"expected only group A's fork ({self._group_a_tip}) if any, got {others}"
+                )
+            else:
+                log.info(
+                    f"{name}: confirmed -- active tip {active[0]['hash'][:12]}... matches group B "
+                    f"({len(others)} other known tip(s) from its cross-group P2P links, expected)"
+                )
 
         if failures:
             raise ReorgError(
