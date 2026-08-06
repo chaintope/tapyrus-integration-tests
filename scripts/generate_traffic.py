@@ -26,9 +26,14 @@ shared tip in the same instant a round's sends were going out, and one of those 
 never confirmed again). Crediting the ledger the instant broadcast succeeds would
 leave it permanently out of sync with reality in that case. So sends/issuances return
 a PendingChange instead of touching self._ledger directly; _resolve_pending_changes
-applies it only once every one of its txids has confirmed on-chain (checked at check
-and settle height, mirroring the round's own two-step), and drops it -- not counted as
-a successful round action either -- if it never does.
+applies it only once every one of its txids has confirmed on-chain, and drops it --
+not counted as a successful round action either -- if it never does. Every call site
+gets two attempts (an initial check, then one more at the next block), not one:
+confirmed live that a single shot isn't always enough even for a perfectly valid
+transaction (setup's funding/issuance calls used to get only one, and a transaction
+that just needed one more block got dropped anyway -- silently corrupting the ledger
+two ways at once, the missed credit itself plus the fee deduction bundled in the
+same PendingChange).
 
 Usage:
     ./scripts/generate_traffic.py <round-count>
@@ -88,6 +93,13 @@ HEIGHT_POLL_INTERVAL_SECONDS = 3
 HEIGHT_POLL_TIMEOUT_SECONDS = 180
 RPC_READY_TIMEOUT_SECONDS = 120
 RPC_READY_POLL_INTERVAL_SECONDS = 3
+# A block landing mid-read (across either all 7 nodes concurrently, or one node
+# after another sequentially) would otherwise mix pre- and post-block state into
+# one supposedly-consistent snapshot -- a torn read that looks like a real balance
+# mismatch with no real cause. Retried, not just risked once: block cadence is
+# tens of seconds, so a same-height re-read on retry is expected within a couple
+# attempts, not a sign of a stuck chain.
+HEIGHT_CONSISTENT_READ_MAX_ATTEMPTS = 5
 
 # (node name, host-published RPC port) -- see docker/docker-compose.yml's port mappings.
 NODES = (
@@ -215,17 +227,26 @@ class TrafficGenerator:
         # other 4 nodes from them, on a fresh chain where they start at 0.
         for _ in range(3):
             await self._next_block_with_coinbase()
+        # Same two-attempt check/settle tolerance as the round loop below, not a
+        # single shot -- confirmed live, a single block's grace isn't always enough
+        # even for a transaction that's perfectly fine: caught one setup issuance
+        # that simply needed one more block (33s), dropped anyway, which silently
+        # corrupted the ledger two ways at once (the missed color credit drifted it
+        # negative over subsequent sends, and the fee deduction bundled in the same
+        # PendingChange never applied either, leaving TPC permanently too high
+        # relative to reality). A genuinely failed tx still gets dropped -- just
+        # after two tries, not one.
         funding_changes = await self._fund_unfunded_nodes()
-        height = await self._next_block_with_coinbase()
-        # final=True: setup gets exactly one block's grace to confirm, unlike the
-        # round loop's own check/settle two-step -- a dropped funding/issuance tx
-        # here just means that node stays unfunded, same as an outright RpcError
-        # would (both already tolerated by later steps, e.g. _send_or_topup_color's
-        # own None-color-id fallback).
-        await self._resolve_pending_changes(funding_changes, height, final=True, count_success=False)
+        check_height = await self._next_block_with_coinbase()
+        funding_changes = await self._resolve_pending_changes(funding_changes, check_height, final=False, count_success=False)
+        settle_height = await self._next_block_with_coinbase()
+        await self._resolve_pending_changes(funding_changes, settle_height, final=True, count_success=False)
+
         issuance_changes = await self._issue_colors()
-        height = await self._next_block_with_coinbase()
-        await self._resolve_pending_changes(issuance_changes, height, final=True, count_success=False)
+        check_height = await self._next_block_with_coinbase()
+        issuance_changes = await self._resolve_pending_changes(issuance_changes, check_height, final=False, count_success=False)
+        settle_height = await self._next_block_with_coinbase()
+        await self._resolve_pending_changes(issuance_changes, settle_height, final=True, count_success=False)
 
         for round_number in range(1, self._round_count + 1):
             log.step(f"round {round_number}/{self._round_count}")
@@ -297,15 +318,29 @@ class TrafficGenerator:
     async def _seed_ledger_with_current_balances(self):
         log.step("reading each node's current TPC balance to seed the ledger (not assuming a fresh 0.0 start)")
 
-        async def seed(node):
-            balance = await self._call_with_retry(node, "getbalance", [False])
-            self._ledger[node.name][TPC] = balance
-            if balance:
-                log.info(f"{node.name}: starting balance {balance} TPC (carried over from before this run)")
-
         pause_node_orchestrators()
         try:
-            await asyncio.gather(*(seed(node) for node in self._nodes))
+            for attempt in range(1, HEIGHT_CONSISTENT_READ_MAX_ATTEMPTS + 1):
+                before = await self._all_heights()
+                balances = await asyncio.gather(
+                    *(self._call_with_retry(node, "getbalance", [False]) for node in self._nodes)
+                )
+                after = await self._all_heights()
+                if before == after:
+                    break
+                log.warn(
+                    f"height changed ({before} -> {after}) while seeding balances -- "
+                    f"retrying for a consistent snapshot (attempt {attempt}/{HEIGHT_CONSISTENT_READ_MAX_ATTEMPTS})"
+                )
+            else:
+                raise TrafficGenerationError(
+                    f"height kept changing across {HEIGHT_CONSISTENT_READ_MAX_ATTEMPTS} attempts -- "
+                    "never got a stable snapshot to seed the ledger from"
+                )
+            for node, balance in zip(self._nodes, balances):
+                self._ledger[node.name][TPC] = balance
+                if balance:
+                    log.info(f"{node.name}: starting balance {balance} TPC (carried over from before this run)")
         finally:
             resume_node_orchestrators()
 
@@ -519,6 +554,15 @@ class TrafficGenerator:
         except RpcUnreachable:
             return None
 
+    async def _all_heights(self):
+        # Per-node, not _current_height()'s min() across all 7 -- a balance-read
+        # consistency check needs to catch ANY node advancing during the read, not
+        # just whichever one happens to be the slowest. A node that wasn't the
+        # minimum before the read could still advance during it without moving
+        # the aggregate min at all, silently letting a torn read through.
+        heights = await asyncio.gather(*(self._node_height(node) for node in self._nodes))
+        return {node.name: h for node, h in zip(self._nodes, heights)}
+
     async def _next_block_with_coinbase(self):
         """_wait_for_next_block, plus crediting the ledger for every height since
         the last one credited -- not just the height just reached. Master
@@ -593,17 +637,38 @@ class TrafficGenerator:
     async def _verify_round(self, height):
         # This is the run's actual correctness check (ledger vs real balances) --
         # same chaos-paused window, so an unreachable node can't be misread as a
-        # real balance mismatch or abort verification outright.
+        # real balance mismatch or abort verification outright. The per-node loop
+        # below is sequential, not concurrent, so it can take long enough for a
+        # new block to land mid-loop -- nodes read before it would reflect the old
+        # height, nodes read after would reflect the new one, a torn snapshot that
+        # looks like a real mismatch. Guarded the same way as
+        # _seed_ledger_with_current_balances: re-read from scratch if the height
+        # moved during the read, discarding whatever this attempt already recorded.
         pause_node_orchestrators()
         try:
             colors = await self._all_colors()
-            for node in self._nodes:
-                actual_tpc = await self._call_with_retry(node, "getbalance", [False])
-                self._compare(height, node.name, TPC, self._ledger[node.name][TPC], actual_tpc)
-                for color in colors:
-                    actual = await self._call_with_retry(node, "getbalance", [False, color])
-                    expected = self._ledger[node.name].get(color, 0)
-                    self._compare(height, node.name, color, expected, actual)
+            for attempt in range(1, HEIGHT_CONSISTENT_READ_MAX_ATTEMPTS + 1):
+                before = await self._all_heights()
+                mismatches_before = len(self._mismatches)
+                for node in self._nodes:
+                    actual_tpc = await self._call_with_retry(node, "getbalance", [False])
+                    self._compare(height, node.name, TPC, self._ledger[node.name][TPC], actual_tpc)
+                    for color in colors:
+                        actual = await self._call_with_retry(node, "getbalance", [False, color])
+                        expected = self._ledger[node.name].get(color, 0)
+                        self._compare(height, node.name, color, expected, actual)
+                after = await self._all_heights()
+                if before == after:
+                    return
+                del self._mismatches[mismatches_before:]
+                log.warn(
+                    f"height changed ({before} -> {after}) while verifying round {height} -- discarding that "
+                    f"attempt's reads and retrying for a consistent snapshot (attempt {attempt}/{HEIGHT_CONSISTENT_READ_MAX_ATTEMPTS})"
+                )
+            raise TrafficGenerationError(
+                f"height kept changing across {HEIGHT_CONSISTENT_READ_MAX_ATTEMPTS} attempts -- "
+                f"never got a stable snapshot to verify round at height {height}"
+            )
         finally:
             resume_node_orchestrators()
 
