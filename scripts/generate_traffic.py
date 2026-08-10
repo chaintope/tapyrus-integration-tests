@@ -220,8 +220,7 @@ class TrafficGenerator:
         # so seeding from it now and having that transaction confirm mid-run would
         # silently offset the ledger by exactly its amount for the rest of the run.
         await self._wait_for_empty_mempool()
-        await self._seed_ledger_with_current_balances()
-        self._last_credited_height = await self._current_height()
+        self._last_credited_height = await self._seed_ledger_with_current_balances()
         # 3 blocks' worth of coinbase is far more than FUNDING_AMOUNT_TPC needs --
         # ensures core-1a/2a/3a have real spendable balance before funding the
         # other 4 nodes from them, on a fresh chain where they start at 0.
@@ -316,6 +315,13 @@ class TrafficGenerator:
             resume_node_orchestrators()
 
     async def _seed_ledger_with_current_balances(self):
+        """Returns the height this snapshot was taken at, still inside the paused
+        window -- callers seeding _last_credited_height from this must use that
+        return value rather than re-reading the height after chaos resumes: a
+        chaos invalidateblock landing in that instant could regress the height
+        below what the balances were actually seeded at, and the first crediting
+        pass would then re-credit a coinbase already folded into the seeded
+        balance (same double-credit failure mode as elsewhere)."""
         log.step("reading each node's current TPC balance to seed the ledger (not assuming a fresh 0.0 start)")
 
         pause_node_orchestrators()
@@ -341,6 +347,10 @@ class TrafficGenerator:
                 self._ledger[node.name][TPC] = balance
                 if balance:
                     log.info(f"{node.name}: starting balance {balance} TPC (carried over from before this run)")
+            reachable = [h for h in after.values() if h is not None]
+            if not reachable:
+                raise RpcUnreachable("no node was reachable to determine the seeded ledger's height")
+            return min(reachable)
         finally:
             resume_node_orchestrators()
 
