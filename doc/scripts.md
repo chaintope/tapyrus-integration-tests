@@ -371,13 +371,12 @@ assignment, and the balance-shortfall top-up mechanic). Implemented as `TrafficN
   genuinely unbuilt (rotation and max-block-size change are both active too, see
   their own sections below).
 - **`core-1a`/`2a`/`3a`'s coinbase income is fully asserted too**, not excluded --
-  `_calibrate_coinbase_rotation` observes 3 real, consecutive height transitions early
-  in the run to learn which node earns at which height (a fixed 3-cycle rotation, per
-  tapyrus-signer's own sorted-pubkey master selection), then every later height reads
-  the actual reward from the earner's own `generate` transaction. Not a flat amount --
-  subsidy plus whatever transaction fees that block happened to include, confirmed
-  live. See `doc/work-done.md` for why this needed calibrating rather than
-  reimplementing tapyrus-signer's own selection logic in Python.
+  observed directly. `_credit_coinbase_for_height` reads each height's real
+  coinbase transaction and credits whichever of the 3 wallets actually has it,
+  for every height since the last one credited (not just the latest observed,
+  so two blocks landing between polls don't leave one uncredited). The reward
+  itself is not a flat amount -- subsidy plus whatever transaction fees that
+  block happened to include, confirmed live.
 
 ## `scripts/simulate_reorg.py`
 

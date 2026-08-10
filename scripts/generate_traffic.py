@@ -38,16 +38,17 @@ path at all (fixed supply by design), so their "top-up" mints an entirely new co
 each time -- a node's NON-REISSUABLE/NFT identity rotates through multiple distinct
 colors over a long run, which is expected, not a bug.
 
-Coinbase prediction: core-1a/2a/3a (the 3 first-layer, RPC-target nodes) earn a
+Coinbase observation: core-1a/2a/3a (the 3 first-layer, RPC-target nodes) earn a
 coinbase reward whenever their signer is round master -- subsidy plus whatever
 transaction fees that block happened to include (not a flat amount once real traffic
 is flowing), immediately spendable with no coinbase-maturity delay in this codebase
-at all. Which physical node that is at a given height depends on tapyrus-signer's own
-sorted-pubkey master selection, not anything this script controls or reimplements --
-instead, _calibrate_coinbase_rotation observes 3 real, consecutive height transitions
-early in the run to learn the rotation directly, and every later height reads the
-actual reward from the earner's own 'generate' transaction rather than assuming one.
-See doc/work-done.md for why this needed calibrating rather than calculating outright.
+at all. Which physical node earns at a given height depends on tapyrus-signer's own
+sorted-pubkey master selection, not anything this script controls. Every height's
+earner is read directly: _credit_coinbase_for_height asks each candidate's wallet
+for that height's real coinbase transaction and credits whichever one actually has
+it, for every height since the last one credited (not just the latest observed --
+two blocks landing between polls would otherwise leave the one in between never
+credited at all).
 
 See doc/work-done.md for the tapyrus-core RPC facts this script is built on (colored
 address round-trip requirement, issuetoken/transfertoken semantics) -- verified
@@ -147,11 +148,11 @@ class TrafficGenerator:
         self._ledger = {node.name: {} for node in nodes}
         self._mismatches = []
         self._successful_round_actions = 0
-        # Set by _calibrate_coinbase_rotation(): the 3-node cycle order and the
-        # height its first entry corresponds to. Every _next_block_with_coinbase()
-        # call after that credits the ledger with the predicted earner's reward.
-        self._coinbase_rotation = None
-        self._coinbase_rotation_anchor = None
+        # Every _next_block_with_coinbase() call credits every height since this
+        # one, not just the height it happens to observe -- so a block that lands
+        # between two polls still gets its coinbase credited. Set for real once
+        # run() knows the starting height, before any crediting begins.
+        self._last_credited_height = None
 
     async def run(self):
         await self._collect_addresses()
@@ -161,7 +162,12 @@ class TrafficGenerator:
         # silently offset the ledger by exactly its amount for the rest of the run.
         await self._wait_for_empty_mempool()
         await self._seed_ledger_with_current_balances()
-        await self._calibrate_coinbase_rotation()
+        self._last_credited_height = await self._current_height()
+        # 3 blocks' worth of coinbase is far more than FUNDING_AMOUNT_TPC needs --
+        # ensures core-1a/2a/3a have real spendable balance before funding the
+        # other 4 nodes from them, on a fresh chain where they start at 0.
+        for _ in range(3):
+            await self._next_block_with_coinbase()
         await self._fund_unfunded_nodes()
         await self._next_block_with_coinbase()
         await self._issue_colors()
@@ -215,51 +221,6 @@ class TrafficGenerator:
                 log.info(f"{node.name}: starting balance {balance} TPC (carried over from before this run)")
 
         await asyncio.gather(*(seed(node) for node in self._nodes))
-
-    async def _calibrate_coinbase_rotation(self):
-        """core-1a/2a/3a earn a coinbase reward in a fixed rotation -- whichever
-        signer is round master that height, per tapyrus-signer's own
-        sorted-pubkey-based master selection (see doc/work-done.md). Rather than
-        reimplement that selection in Python (fragile: silently drifts from a
-        height-since-genesis assumption if any round in the chain's whole history
-        ever failed to produce a block), this observes 3 real, consecutive height
-        transitions -- a full rotation -- to anchor it instead. Also doubles as the
-        old "wait for each funding source to have spendable TPC" step: 3 rounds of
-        coinbase is far more than FUNDING_AMOUNT_TPC needs.
-
-        The reward itself is NOT a flat 50 TPC -- confirmed live, it's subsidy plus
-        whatever transaction fees that block happened to include (same as any
-        Bitcoin-derived chain), so it varies block to block once real traffic is
-        flowing. Credited here as the real observed balance delta, not a constant.
-        """
-        log.step("calibrating the coinbase rotation from 3 real, consecutive height transitions")
-        by_name = {node.name: node for node in self._nodes}
-        candidates = sorted(COINBASE_EARNING_NODES)
-
-        async def balances():
-            return {name: await by_name[name].rpc.call("getbalance", [False]) for name in candidates}
-
-        observed = {}
-        before = await balances()
-        for _ in range(3):
-            height = await self._wait_for_next_block()
-            after = await balances()
-            earner = max(candidates, key=lambda n: after[n] - before[n])
-            observed[height] = earner
-            self._ledger[earner][TPC] += after[earner] - before[earner]
-            before = after
-
-        heights = sorted(observed)
-        rotation = [observed[h] for h in heights]
-        if set(rotation) != set(candidates):
-            raise TrafficGenerationError(
-                f"coinbase rotation calibration over heights {heights} didn't see all 3 "
-                f"coinbase-earning nodes exactly once ({rotation}) -- the round-robin "
-                f"master-selection assumption doesn't hold this run, can't predict coinbase income"
-            )
-        self._coinbase_rotation_anchor = heights[0]
-        self._coinbase_rotation = rotation
-        log.info(f"coinbase rotation calibrated: {dict(zip(heights, rotation))} (cycles every 3 heights)")
 
     async def _fund_unfunded_nodes(self):
         log.step(f"funding the {len(FUNDING_PAIRS)} nodes with no coinbase income")
@@ -431,42 +392,43 @@ class TrafficGenerator:
         except RpcUnreachable:
             return None
 
-    def _predicted_coinbase_earner(self, height):
-        offset = (height - self._coinbase_rotation_anchor) % len(self._coinbase_rotation)
-        return self._coinbase_rotation[offset]
-
     async def _next_block_with_coinbase(self):
-        """_wait_for_next_block, plus crediting the ledger with whichever
-        coinbase-earning node the calibrated rotation predicts for that height --
-        every _wait_for_next_block call after calibration should go through this
-        instead, or that node's ledger entry silently falls behind reality."""
-        height = await self._wait_for_next_block()
-        earner = self._predicted_coinbase_earner(height)
-        reward = await self._read_coinbase_reward(height, earner)
-        self._ledger[earner][TPC] += reward
-        return height
+        """_wait_for_next_block, plus crediting the ledger for every height since
+        the last one credited -- not just the height just reached. Master
+        selection rotates by ROUND, not by block, and a round doesn't always
+        produce one, so two blocks can land between polls; crediting only the
+        latest would silently leave the one in between never credited at all,
+        surfacing as a bogus mismatch at settle time."""
+        await self._wait_for_next_block()
+        actual = await self._current_height()
+        for height in range(self._last_credited_height + 1, actual + 1):
+            await self._credit_coinbase_for_height(height)
+        self._last_credited_height = actual
+        return actual
 
-    async def _read_coinbase_reward(self, height, earner_name):
-        """The reward isn't a flat 50 TPC -- it's subsidy plus whatever transaction
-        fees that block happened to include, so once real round-robin/colored-coin
-        traffic is flowing it varies block to block (confirmed live: a balance-delta
-        approach like calibration uses would also pick up the concurrent round's own
-        sends, not just coinbase). Reads the actual 'generate' transaction instead of
-        assuming an amount -- also doubles as confirmation the rotation prediction
-        itself is still right: a wrong prediction means no such transaction exists in
-        that node's wallet at all, caught explicitly below rather than drifting."""
+    async def _credit_coinbase_for_height(self, height):
+        """Reads the height's real coinbase transaction and credits whichever of
+        core-1a/2a/3a's wallet actually has it. The reward isn't a flat 50 TPC --
+        it's subsidy plus whatever transaction fees that block happened to
+        include, so once real traffic is flowing it varies block to block
+        (confirmed live)."""
         by_name = {node.name: node for node in self._nodes}
-        rpc = by_name[earner_name].rpc
-        blockhash = await rpc.call("getblockhash", [height])
-        block = await rpc.call("getblock", [blockhash])
+        probe = self._nodes[0]
+        blockhash = await probe.rpc.call("getblockhash", [height])
+        block = await probe.rpc.call("getblock", [blockhash])
         coinbase_txid = block["tx"][0]
-        tx = await rpc.call("gettransaction", [coinbase_txid])
-        for detail in tx.get("details", []):
-            if detail.get("category") == "generate":
-                return detail["amount"]
+        for name in sorted(COINBASE_EARNING_NODES):
+            try:
+                tx = await by_name[name].rpc.call("gettransaction", [coinbase_txid])
+            except RpcError:
+                continue  # not in this node's wallet -- try the next candidate
+            for detail in tx.get("details", []):
+                if detail.get("category") == "generate":
+                    self._ledger[name][TPC] += detail["amount"]
+                    return
         raise TrafficGenerationError(
-            f"predicted {earner_name} as the coinbase earner at height {height}, but its own "
-            f"wallet shows no 'generate' transaction for that block -- rotation prediction is wrong"
+            f"height {height}: no coinbase-earning node's wallet has a 'generate' "
+            f"transaction for {coinbase_txid}"
         )
 
     # -- balance logging / verification --------------------------------------------

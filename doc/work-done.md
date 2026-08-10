@@ -74,17 +74,22 @@ does.
 - **`generate_traffic.py` seeds its ledger from each node's real balance**
   (`getbalance`) at startup, since the workflow runs this script multiple times per
   job and a node can carry a non-zero balance into a later run.
-- **`core-1a`/`2a`/`3a`'s coinbase income is fully asserted, not excluded.** Which
-  of the 3 earns at a given height is a fixed rotation, but it's whichever signer
-  sorts first by raw pubkey bytes (`tapyrus-signer`'s `Federation::signers()`,
-  `net.cpp`'s `SignerID::Ord`) -- not creation order, and not something worth
-  reimplementing in Python: doing it from height-since-genesis would silently drift
-  if any round in the chain's whole history ever failed to produce a block.
-  `_calibrate_coinbase_rotation` observes 3 real, consecutive height transitions
-  early in the run to learn the rotation directly instead. The reward itself isn't
-  a flat 50 TPC either -- confirmed live, it's subsidy plus whatever transaction
-  fees that block happened to include, so every later height reads the actual
-  amount from the earner's own `generate` transaction rather than assuming one.
+- **`core-1a`/`2a`/`3a`'s coinbase income is fully asserted, not excluded --
+  observed directly per block.** Which of the 3 earns at a given height is
+  whichever signer sorts first by raw pubkey bytes (`tapyrus-signer`'s
+  `Federation::signers()`, `net.cpp`'s `SignerID::Ord`) -- not creation order,
+  and not something worth reimplementing in Python: doing it from
+  height-since-genesis would silently drift if any round in the chain's whole
+  history ever failed to produce a block. `_credit_coinbase_for_height` reads
+  each height's real coinbase transaction directly instead (asks each of the 3
+  wallets for it, credits whichever one actually has it) -- no anchor needed,
+  so a skipped round costs nothing. `_next_block_with_coinbase` credits every
+  height since the last one credited, not just the height it happens to
+  observe, so two blocks landing between polls don't leave the one in between
+  uncredited. The reward itself isn't a flat 50 TPC either -- confirmed live,
+  it's subsidy plus whatever transaction fees that block happened to include,
+  so every height reads the actual amount from the earner's own `generate`
+  transaction rather than assuming one.
 - **`computesig` requires full-signer-count arrays.** `--sig`/`--block-vss`/
   `--node-vss` must list every signer, not just `threshold` (enforced by an
   `assert_eq!`). It also needs one specific signer's key material (hardcoded to
