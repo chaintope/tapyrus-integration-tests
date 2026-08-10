@@ -276,12 +276,13 @@ itself for the rest of the job -- see `doc/work-done.md` for the full design.
 - **Output**: none written to disk -- a node whose RPC never comes back up raises
   `NodeOrchestratorStartupError` (non-zero exit).
 - **Active in the workflow** as "Start node orchestrator", right after "Bring up
-  tapyrus-seeder and verify it" -- that workflow step also appends
-  `NODE_ORCHESTRATOR=1` to `$GITHUB_ENV` after this script succeeds, since setting it
-  only within this script's own process isn't enough: `signer-0`/`signer-1`/
-  `signer-2` and signer-set-b's services all `depends_on` a core-1a/2a/3a node, so
-  any later `docker compose up` touching them needs to resolve the same value or
-  Compose recreates that core node to match, reverting it to plain `tapyrusd` (see
+  tapyrus-seeder and verify it" -- the script itself persists
+  `NODE_ORCHESTRATOR=1` to `$GITHUB_ENV` after it succeeds (`_persist_env_for_rest_of_job`,
+  same pattern as `verify_seeder.py`'s own), since setting it only within this
+  script's own process isn't enough: `signer-0`/`signer-1`/`signer-2` and
+  signer-set-b's services all `depends_on` a core-1a/2a/3a node, so any later
+  `docker compose up` touching them needs to resolve the same value or Compose
+  recreates that core node to match, reverting it to plain `tapyrusd` (see
   `work-done.md`).
 
 ## `scripts/container/`
