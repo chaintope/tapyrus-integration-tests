@@ -61,11 +61,19 @@ CORE_RPC_PORTS = {
 
 # The fixed topology every other script in this repo runs against (docker-compose.yml
 # section 4b) -- see that file's own "CONNECT/LISTEN DESIGN" comment.
+#
+# core-2b carries -persistmempool=1: it's one of node_orchestrator.py's CHAOS_NODES
+# (deliberately restarted/reindexed/invalidated). With this set, a clean restart
+# persists the mempool to disk first, so a transaction core-2b sent as sender
+# should never go missing from its own wallet view that way -- which is why
+# generate_traffic.py's CHAOS_SENDER_GRACE_NODES deliberately excludes core-2b
+# from the other three chaos nodes' extra confirmation-check retries; it
+# shouldn't need them.
 CONNECT_MODE_ARGS = {
     "core-1a": "",
     "core-1b": "-connect=core-1a -listen=1",
     "core-2a": "",
-    "core-2b": "-connect=core-2a -listen=1",
+    "core-2b": "-connect=core-2a -listen=1 -persistmempool=1",
     "core-3a": "",
     "core-3b": "-connect=core-3a -listen=1",
     "core-7": "-connect=core-1b -connect=core-2b -connect=core-3b",

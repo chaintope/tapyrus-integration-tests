@@ -324,6 +324,36 @@ does.
   frequent brief pauses queues at `_wait_out_pause()` and fires the instant the
   file disappears, regardless of how spread out its original timer was. Added a
   random 0-15s jitter after a gated release to destagger this.
+- **A `PendingChange` whose sender is one of `node_orchestrator.py`'s
+  `CHAOS_NODES` (`core-1b`/`core-2b`/`core-3b`/`core-7`) can still get wrongly
+  dropped even with the two-attempt check/settle tolerance above, if that same
+  node's own restart lands in between.** Traced live: `core-2b`'s own
+  `reissuetoken` topup and a round send routed through another chaos node both
+  showed the identical signature -- a permanent, unchanging real-vs-ledger
+  offset appearing once and persisting through every later height, matching
+  the dropped change's amount exactly (e.g. `core-2b`'s own color balance
+  reading a fixed `+3` above what the ledger tracked, from the height it first
+  appeared onward). A chaos node's restart wipes its in-memory mempool; a
+  transaction that node itself just broadcast but hadn't seen confirmed yet
+  can vanish from *its own* `gettransaction` view (`RpcError`, "unknown txid")
+  even though it was already relayed and got mined via another node's mempool
+  copy -- confirmed on the network the whole time, just invisible to the one
+  node `_resolve_pending_changes` happened to be asking. The node's own
+  restart downtime (`DOWNTIME_MIN/MAX_BLOCKS` = 2-4 blocks,
+  `node_orchestrator.py`) can easily outlast the normal two-block check/settle
+  window on its own. Fixed two ways, one per root cause rather than one fix
+  applied uniformly: `verify_seeder.py`'s `CONNECT_MODE_ARGS` sets
+  `-persistmempool=1` on `core-2b` specifically (the node actually implicated
+  in the live failure), so a clean chaos restart flushes its mempool to disk
+  first instead of losing it -- no dropped self-broadcast transaction should
+  be possible from `core-2b` at all anymore. The other three chaos nodes
+  (`core-1b`/`core-3b`/`core-7`) don't have that flag, so they still rely on
+  `_give_chaos_senders_grace`: a still-pending change gets up to
+  `CHAOS_SENDER_EXTRA_RESOLVE_ATTEMPTS` (3) more blocks before the final
+  settle check, but only if its sender is in `CHAOS_SENDER_GRACE_NODES`
+  (`generate_traffic.py`) -- deliberately `CHAOS_NODES` minus `core-2b`, since
+  `core-2b` no longer needs it -- every other change reaches settle on the
+  original schedule, no added wall-clock cost.
 - **`core-3b`, not just `core-7`, can legitimately see group A's abandoned fork
   after a reorg reconnect -- `simulate_reorg.py`'s own convergence check was
   wrong about this, and re-deriving every node's expected shape from the actual

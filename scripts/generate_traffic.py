@@ -11,10 +11,11 @@ hops from any first-layer node, see docker/docker-compose.yml) never causes a ra
                     balance shortfall" below. Broadcasting doesn't touch the ledger yet
                     -- see "Deferred ledger crediting" below.
   - check height:  each send's ledger delta is applied once its txid actually confirms
-                    (still-pending ones get one more try at settle height); balances
-                    are then polled and logged, not asserted -- P2P propagation to all
-                    7 nodes isn't guaranteed complete the instant the height ticks
-                    over, so asserting here would be a false-negative risk.
+                    (still-pending ones get more tries -- see "Deferred ledger
+                    crediting" below); balances are then polled and logged, not
+                    asserted -- P2P propagation to all 7 nodes isn't guaranteed
+                    complete the instant the height ticks over, so asserting here
+                    would be a false-negative risk.
   - settle height: any send still unconfirmed here is dropped, not credited -- and
                     balances are polled and asserted against the ledger this script
                     has been keeping since the funding phase.
@@ -33,7 +34,13 @@ confirmed live that a single shot isn't always enough even for a perfectly valid
 transaction (setup's funding/issuance calls used to get only one, and a transaction
 that just needed one more block got dropped anyway -- silently corrupting the ledger
 two ways at once, the missed credit itself plus the fee deduction bundled in the
-same PendingChange).
+same PendingChange). Every call site -- setup and the round loop alike -- also
+routes still-pending changes through _give_chaos_senders_grace before the final
+settle check: a change whose sender is one of CHAOS_SENDER_GRACE_NODES gets
+extra attempts beyond the normal two, since that node's own restart can wipe
+its in-memory mempool for a not-yet-confirmed self-broadcast transaction,
+hiding it from gettransaction on that exact node well past the normal window
+even though it already confirmed on the network via another node's mempool copy.
 
 Usage:
     ./scripts/generate_traffic.py <round-count>
@@ -100,6 +107,10 @@ RPC_READY_POLL_INTERVAL_SECONDS = 3
 # tens of seconds, so a same-height re-read on retry is expected within a couple
 # attempts, not a sign of a stuck chain.
 HEIGHT_CONSISTENT_READ_MAX_ATTEMPTS = 5
+# A chaos node's own restart downtime (DOWNTIME_MIN/MAX_BLOCKS=2-4 blocks,
+# node_orchestrator.py) can outlast the normal check/settle window on its own --
+# see _give_chaos_senders_grace.
+CHAOS_SENDER_EXTRA_RESOLVE_ATTEMPTS = 3
 
 # (node name, host-published RPC port) -- see docker/docker-compose.yml's port mappings.
 NODES = (
@@ -116,6 +127,13 @@ NODES = (
 # to-address), so only they ever receive coinbase. The other 4 need on-chain funding
 # before they can send anything.
 COINBASE_EARNING_NODES = {"core-1a", "core-2a", "core-3a"}
+# node_orchestrator.py's CHAOS_NODES (core-1b/2b/3b/core-7) minus core-2b: its
+# CONNECT_MODE_ARGS entry (verify_seeder.py) carries -persistmempool=1, so its
+# own restart no longer risks losing a not-yet-confirmed transaction it broadcast
+# itself -- the other 3 still can. When one of these is a pending change's
+# sender, _give_chaos_senders_grace gives it extra confirmation-check attempts
+# beyond the normal check/settle window.
+CHAOS_SENDER_GRACE_NODES = {"core-1b", "core-3b", "core-7"}
 FUNDING_PAIRS = (
     ("core-1a", "core-1b"),
     ("core-2a", "core-2b"),
@@ -238,12 +256,14 @@ class TrafficGenerator:
         funding_changes = await self._fund_unfunded_nodes()
         check_height = await self._next_block_with_coinbase()
         funding_changes = await self._resolve_pending_changes(funding_changes, check_height, final=False, count_success=False)
+        funding_changes = await self._give_chaos_senders_grace(funding_changes)
         settle_height = await self._next_block_with_coinbase()
         await self._resolve_pending_changes(funding_changes, settle_height, final=True, count_success=False)
 
         issuance_changes = await self._issue_colors()
         check_height = await self._next_block_with_coinbase()
         issuance_changes = await self._resolve_pending_changes(issuance_changes, check_height, final=False, count_success=False)
+        issuance_changes = await self._give_chaos_senders_grace(issuance_changes)
         settle_height = await self._next_block_with_coinbase()
         await self._resolve_pending_changes(issuance_changes, settle_height, final=True, count_success=False)
 
@@ -254,6 +274,7 @@ class TrafficGenerator:
             check_height = await self._next_block_with_coinbase()
             pending = await self._resolve_pending_changes(pending, check_height, final=False)
             await self._log_balances(check_height, "check")
+            pending = await self._give_chaos_senders_grace(pending)
             settle_height = await self._next_block_with_coinbase()
             await self._resolve_pending_changes(pending, settle_height, final=True)
             await self._verify_round(settle_height)
@@ -693,6 +714,27 @@ class TrafficGenerator:
             self._mismatches.append(message)
         else:
             log.info(f"height {height}: {node_name} {asset}: {actual} (matches ledger)")
+
+    async def _give_chaos_senders_grace(self, pending):
+        """A chaos node's own restart can wipe its in-memory mempool, so a
+        not-yet-confirmed transaction it broadcast itself can briefly look unknown
+        to gettransaction on that exact node even though it already confirmed on
+        the network via another node's mempool copy. The normal check/settle
+        window (one retry) doesn't reliably outlast that node's own restart
+        downtime -- so a pending change still unconfirmed after the check height
+        gets up to CHAOS_SENDER_EXTRA_RESOLVE_ATTEMPTS more blocks before the
+        final settle check, but only if its sender is one of
+        CHAOS_SENDER_GRACE_NODES; every other change is untouched and reaches
+        settle on the normal schedule."""
+        for _ in range(CHAOS_SENDER_EXTRA_RESOLVE_ATTEMPTS):
+            chaos_pending = [change for change in pending if change.node.name in CHAOS_SENDER_GRACE_NODES]
+            if not chaos_pending:
+                break
+            non_chaos_pending = [change for change in pending if change.node.name not in CHAOS_SENDER_GRACE_NODES]
+            extra_height = await self._next_block_with_coinbase()
+            chaos_pending = await self._resolve_pending_changes(chaos_pending, extra_height, final=False)
+            pending = non_chaos_pending + chaos_pending
+        return pending
 
     async def _resolve_pending_changes(self, pending_changes, height, final, count_success=True):
         """Applies each PendingChange's ledger deltas only once every one of its
