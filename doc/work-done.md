@@ -1,306 +1,284 @@
 # Known issues, gotchas, design decisions
 
-Consolidated record of open problems, gotchas, and deliberate design choices behind
-this repo's scripts, CI workflow, and compose stack. Referenced throughout the
-code/config as "see doc/work-done.md" rather than carrying this narrative in comments
-themselves -- this file is the one place to look for the *why* behind anything that
-looks non-obvious.
+Open problems, gotchas, and design choices behind this repo's scripts, CI workflow,
+and compose stack. Code/config comments point here ("see doc/work-done.md") instead
+of repeating this detail inline.
 
 See [`weekly-integration-test-plan.md`](weekly-integration-test-plan.md) for the
 original scenario design, [`project-plan.md`](project-plan.md) for tracked
-done-vs-outstanding progress (including the full list of what's not yet built or
-tested), and [`scripts.md`](scripts.md) for what each script does.
+done-vs-outstanding progress, and [`scripts.md`](scripts.md) for what each script
+does.
 
 ## Known issues (open)
 
-- **GitHub-hosted `ubuntu-latest` runner's CPU/disk sufficiency is unconfirmed** for 7
-  core nodes + 3 signers + redis + seeder running concurrently -- may need
-  self-hosted.
-- **CI timing budget is bounded by GitHub-hosted's 6h hard cap**, which can't be
-  raised past regardless of `timeout-minutes`. Block production only comes from the
-  live signer round-robin at `ROUND_DURATION` cadence (no instant-mining shortcut),
-  so scenario time is `blocks x ROUND_DURATION` -- `tx_round_count`/`reorg_length`/
-  `round_duration` need to stay sized against that.
-- **`docker/docker-compose.yml` has no compose-level healthchecks** /
-  `depends_on: condition: service_healthy` yet (plan doc section 3 step 6 guidance).
-  `scripts/wait_for_topology.py` is a CI-level equivalent -- arguably stronger, since
-  it confirms real P2P peer counts rather than just RPC reachability, and its own
-  mismatch/timeout-reporting logic is now confirmed working (see `project-plan.md`) --
-  but the compose-file enhancement itself is separate, unstarted work.
-- **Signer count (3) / threshold (2) is hardcoded**, not a per-run variable -- the
-  7-node topology in `docker-compose.yml` is wired 1:1 to exactly 3 signers; changing
-  the count means redesigning the topology, not just passing a different number.
-- **Scenario mechanics not yet built** (see `project-plan.md`'s Outstanding work for
-  the tracked list): per-node lifecycle orchestrator, Slack report, `tapyrus-seeder`
-  actually brought up as a running service.
-- **`tapyrus-setup`'s offline `--xfield sign`/`computesig` rejected a fresh, otherwise
-  valid signature with `InvalidSig` roughly half the time** -- confirmed via repeated
-  isolated trials (2/6 accepted, all 3 verifying nodes always agreeing, so it was the
-  signature itself, not a per-node view difference). Root cause: `Sign::format_signature`
-  (`sign.rs`) encoded a signature's `v` point as only its x-coordinate, discarding the
-  y-parity entirely, before it was re-parsed back into a point on the
-  `federation_watcher.rs` verification side (`multi_party_signature_from_hex`) --
-  whichever y the reconstruction assumed only matched the original half the time. (An
-  earlier theory -- that the positive/negative Schnorr share selection in
-  `crypto/vss.rs` is re-derived inconsistently across the separate `sign`/`computesig`
-  process invocations -- was tested and ruled out: 60/60 fresh ceremony rounds against
-  the real `tapyrus-setup` binary verified correctly, and that selection is a pure
-  function of public VSS commitment data, identical across every process by
-  construction.) This was a `tapyrus-signer` bug, not this repo's scripts; fixed
-  upstream.
-- **Planned runner-matrix expansion**: once CI is stable on a single `ubuntu-latest`
-  runner, add macOS (native arm64) and x86_64 nodes to the runner mix, so each
-  platform builds natively instead of relying on `DOCKER_BUILD_PLATFORM`-forced QEMU
-  emulation on a mismatched runner architecture.
-- **`scripts/generate_traffic.py`'s hardcoded constants worth revisiting eventually**:
-  `FUNDING_AMOUNT_TPC`/`TOKEN_ISSUE_AMOUNT`/etc. were picked conservatively and work
-  fine at small round counts, but haven't been stress-tested at a larger round count
-  where the balance-shortfall top-up mechanic would trigger much more often.
+- **CI timing is capped at GitHub-hosted's 6h hard limit.** Blocks only come from the
+  live signer round-robin (`ROUND_DURATION` cadence, no instant-mining), so scenario
+  time is `blocks x ROUND_DURATION`. Size `tx_round_count`/`reorg_length`/
+  `round_duration` accordingly.
+- **No compose-level healthchecks yet** (`depends_on: condition: service_healthy`).
+  `scripts/wait_for_topology.py` covers this at the CI level by checking real P2P
+  peer counts, but the compose-file enhancement itself is still unstarted.
+- **Signer count (3) and threshold (2) are hardcoded.** The 7-node topology is wired
+  1:1 to exactly 3 signers, so changing the count means redesigning the topology, not
+  just passing a new number.
+- **Per-node lifecycle orchestrator not built yet** -- see `project-plan.md`'s
+  Outstanding work.
+- **`generate_traffic.py`'s constants haven't been stress-tested at scale.**
+  `FUNDING_AMOUNT_TPC`/`TOKEN_ISSUE_AMOUNT`/etc. work fine at small round counts, but
+  a larger round count would trigger the balance-shortfall top-up mechanic much more
+  often, and that hasn't been checked.
 
 ## Design decisions
 
-- **All scripts are Python** (stdlib only, no third-party dependencies) -- class-based
-  (`RepoCheckout`, `AggpubkeyCeremony`, `GenesisSigningCeremony`,
-  `SignerConfigAssembler`, `TopologyWaiter`), sharing a uniform logger
-  (`scripts/lib/log.py`) and a common ceremony base class (`scripts/lib/ceremony.py`,
-  `TapyrusSetupCeremony`) rather than duplicating
-  `_run_setup`/`extract_vss_for`/`require_executable` across scripts, and a shared
-  `docker compose` service-control module (`scripts/lib/compose.py`) rather than each
-  script owning its own subprocess helper.
-- **Reorg mechanic**: forced via federation rotation (a second, disjoint signer set
-  signs off on the handoff via `--xfield`), not a network partition -- a genuine
-  two-sided fork built by two isolated groups independently threshold-signing their
-  own blocks from a common tip, then reconnected. `scripts/simulate_reorg.py` drives
-  this via strict alternation: only one group's core nodes are ever up and building
-  at a time (never both, until the final reconnect), so neither side can influence or
-  observe the other's blocks while forking. See the script's own module docstring for
-  the exact step sequence.
-- **`tapyrus-genesis` invocation in CI**: runs via
-  `docker run --rm --entrypoint tapyrus-genesis` against the already-built
-  `tapyrus/tapyrusd:master-local` image, bypassing the image's own `entrypoint.sh`
-  (which wraps the default CMD in `bash -c "$*"` and expects `GENESIS_BLOCK_WITH_SIG`
-  for the long-running daemon). `tapyrus-genesis` is a stateless one-shot tool with
-  none of that daemon machinery, and reusing the already-built image guarantees the
-  unsigned genesis matches the exact tapyrus-core commit under test.
-- **How `NETWORK_ID` reaches `tapyrusd`**: `tapyrus/tapyrusd`'s own `entrypoint.sh`
-  only auto-generates a `tapyrus.conf` if none is mounted at
-  `${CONF_DIR}/tapyrus.conf`, and separately greps `networkid=` out of whichever conf
-  ends up there to decide which `${DATA_DIR}/genesis.<network_id>` file to write
-  `GENESIS_BLOCK_WITH_SIG` into and which `tapyrusd` then loads.
-  `scripts/render_tapyrus_conf.py` renders a prod-mode conf (no `-dev` on the
-  `tapyrus-genesis` call either -- prod is simply what you get by omitting `-dev`)
-  with `networkid=$NETWORK_ID`, mounted into all 7 core-* services. Not wired into the
-  seeder -- it isn't brought up by any `docker compose up` invocation yet at all (see
-  `project-plan.md`'s Outstanding work).
-- **P2P topology relies on the chain's default port, not an explicit `port=`**:
-  `docker/docker-compose.yml`'s `-connect=<service-name>` targets have no explicit
-  port, and `tapyrus-core` resolves a portless `-connect` against the *chain's own
-  default* P2P port (`CConnman::ConnectNode`), not whatever `port=` says in that
-  node's own conf. Prod mode's default P2P port is `2357`. `render_tapyrus_conf.py`
-  deliberately omits `port=` from the rendered conf so every node falls back to the
-  same chain-default port `-connect` already resolves against.
-- **`generate_traffic.py` needs `fallbackfee` enabled**: `estimatesmartfee` has no
-  history on a brand-new chain, and `tapyrus-signerd`'s `-fallbackfee` default is
-  disabled (0) -- a deliberate mainnet-safety convention, not a bug. Without it, every
-  funding/send/issuance call fails with `-4 Fee estimation failed`. Fixed by adding
-  `fallbackfee=0.0002` to `render_tapyrus_conf.py`'s rendered conf (safe to enable
-  unconditionally here -- there's no real fee market on a throwaway dev chain to
-  misjudge). Also sets `dbcache=64` (450MB default is pure overhead for 7 concurrent
-  containers running a chain with a handful of blocks), `maxorphantx=20` (100 default
-  is sized for a real internet-facing node; this network's only peers are the other 6
-  fixed `-connect` targets, but kept above 0 since the reorg step can transiently
-  orphan real transactions), and `mempoolexpiry=2` (hours; 336h/2-week default targets
-  a long-running production node, not a several-hour CI job).
-- **`generate_traffic.py`'s round-count-only design**: everything (block-height
-  budget, transaction count) derives from one number, `tx_round_count`, rather than
-  independent knobs for total tx count and send interval. Earlier drafts had a
-  separate `tx_interval_seconds` (pacing between sends from the same node) and
-  `tx_total_count` -- both dropped once the design settled on exactly one send per
-  node per round: with no sequence of same-node sends within a round, there's nothing
-  left for an interval to pace, and the total is just `round_count * 14` (7 nodes x
-  {TPC, colored}) by construction, so a separate total would only ever have to agree
-  with that derived number or drift from it.
-- **Colored-coin balance shortfall mints instead of skipping**: rather than issue
-  every node's full lifetime token supply once at the start (all colored-coin
-  activity then front-loaded into one phase, nothing but transfers for the rest of
-  the run), each node only ever holds a small working balance
-  (`TOKEN_ISSUE_AMOUNT`/`TOKEN_TOPUP_AMOUNT` = 3). A round where the sender doesn't
-  have enough issues/reissues more instead of transferring -- still exactly one
-  transaction for that node, so total tx count per round stays fixed at 14 regardless
-  of how many nodes hit a shortfall that round. This is also why NFT nodes (forced to
-  `value=1`) end up minting a fresh NFT color on almost every other round -- expected,
-  not a bug: they transfer their one unit away, then have zero until the next mint.
-- **Top-up timing needs no cross-round lookahead**: an earlier draft of this design
-  considered checking one round ahead (during round K's settle phase, top up for
-  round K+1's send) specifically to avoid a same-round top-up-then-spend needing to
-  chain onto its own unconfirmed output. Dropped once the source read showed
-  `issuetoken`'s NON_REISSUABLE/NFT path selects its input UTXO explicitly
-  (`coin_control.Select(out)`) and only checks `IsMine(...) == ISMINE_SPENDABLE` -- no
-  confirmation-depth check -- so spending a same-round unconfirmed self-send is
-  expected to work, confirmed live in the local E2E run. A shortfall now just
-  substitutes a mint for that round's transfer, with no phase held back a round to
-  accommodate it.
-- **Per-transaction fee tracked via `gettransaction`, not predicted**: the ledger's
-  TPC bookkeeping reads each transaction's actual fee back from `gettransaction`
-  right after broadcasting it, rather than trying to predict it from a fee rate and
-  an assumed tx size. Fee-rate-based prediction would have needed tx vsize to be
-  near-constant across every transaction shape this script produces (plain TPC send,
-  colored transfer, REISSUABLE's 2-tx issuance, NON_REISSUABLE/NFT's single-tx
-  issuance) to stay accurate -- reading the real fee sidesteps needing that
-  assumption to hold at all.
-- **`generate_traffic.py` seeds its ledger from each node's real on-chain balance**
-  at startup (`getbalance`), rather than assuming every node starts at `0.0` -- the
-  workflow runs this script multiple times in the same job (before and after the
-  reorg/rotation steps), so a node can genuinely carry a non-zero balance into a
-  later invocation.
-- **`core-1a`/`2a`/`3a`'s TPC balance can't be predicted by the traffic-generation
-  ledger, and that's expected, not a bug**: these 3 nodes are each credited a fresh
-  50 TPC `"generate"`-category transaction every time they propose a block as that
-  round's federation master, entirely independent of anything `generate_traffic.py`
-  does. Excluded from the exact-ledger TPC assertion; their colored balances (never
-  coinbase-derived) stay fully asserted, and their TPC is still logged for
-  visibility.
-- **`computesig` array-length requirement**: `--sig`/`--block-vss`/`--node-vss`
-  arrays must all be the full signer count (not just `threshold`) -- enforced by an
-  `assert_eq!` in the source. `computesig` must also be run with one specific
-  signer's own key material (hardcoded to signer-0 in this repo's scripts) -- it
-  can't be run by a neutral party without borrowing a signer's secrets, so a
-  "designated signer" is a real v1 limitation, not an oversight.
-- **`tapyrus-signerd` needs a *live* RPC connection to its own configured core node
-  to participate in a signing round at all** -- even purely as a non-master over
-  Redis. With a signer's core-node RPC target down, it fails whether or not it's
-  master that round. There is no Redis-only fallback -- this is why every signer in
-  the reorg recipe's "losing" group gets repointed to that group's one surviving core
-  node before it can sign at all.
-- **`sign`/`computesig` also accept `--xfield` as an alternative to `--block`**,
-  signing an aggpubkey rotation or max-block-size change instead of a genesis block --
-  the actual mechanism behind the federation-rotation design.
-- **`tapyrus-core` auto-disables listening the instant `-connect` is set at all**
-  (`InitParameterInteraction: -connect set -> setting -listen=0`), not just
-  restricting outbound dialing. Every `-connect` edge needs exactly one `-connect`
-  side (the "child" dials its "parent"), with an explicit `-listen=1` added back
-  wherever a node also needs to accept an inbound edge.
-- **`tapyrus/tapyrusd`'s entrypoint does `exec bash -c "$*"`** against the image's
-  default CMD, and docker-compose's `command:` *replaces* that default CMD rather
-  than appending to it -- every `command:` override repeats the full default
-  invocation and appends its own flags.
+- **All scripts are Python** (stdlib only). Class-based (`RepoCheckout`,
+  `AggpubkeyCeremony`, `GenesisSigningCeremony`, `SignerConfigAssembler`,
+  `TopologyWaiter`), sharing a common logger (`scripts/lib/log.py`), ceremony base
+  class (`scripts/lib/ceremony.py`), and compose helper (`scripts/lib/compose.py`).
+- **Reorg mechanic**: genuine network isolation within the current federation, not
+  rotation. `scripts/simulate_reorg.py` keeps only one group's core nodes up at a
+  time (never both) until the final reconnect, so the same signer set independently
+  threshold-signs two real forks from a common tip. See the script's own docstring
+  for the exact steps.
+- **`tapyrus-genesis` runs via `docker run --rm --entrypoint tapyrus-genesis`**
+  against the already-built `tapyrus/tapyrusd:master-local` image, bypassing
+  `entrypoint.sh`. This keeps the unsigned genesis matched to the exact tapyrus-core
+  commit under test.
+- **How `NETWORK_ID` reaches `tapyrusd`**: `entrypoint.sh` reads `networkid=` from
+  the mounted conf to decide which `genesis.<network_id>` file to write
+  `GENESIS_BLOCK_WITH_SIG` into. `render_tapyrus_conf.py` renders that conf with
+  `networkid=$NETWORK_ID` for all 7 core-* services. The seeder's own `-i`/`-s` flags
+  stay hardcoded to `1905960821` (see `docker-compose.yml`'s `seeder` comment).
+- **P2P topology relies on the chain's default port, not `port=`.** `-connect=
+  <service-name>` has no explicit port, and `tapyrus-core` resolves it against the
+  chain's own default P2P port (`2357` in prod mode), not the conf's `port=`.
+  `render_tapyrus_conf.py` omits `port=` so every node matches.
+- **`generate_traffic.py` needs `fallbackfee` enabled.** `-fallbackfee` defaults to
+  disabled (a mainnet-safety default, not a bug), so `estimatesmartfee` fails with no
+  fee history on a new chain. `render_tapyrus_conf.py` sets `fallbackfee=0.0002`,
+  `dbcache=64`, `maxorphantx=20`, and `mempoolexpiry=2` -- all sized down from
+  mainnet defaults for a small, short-lived CI chain.
+- **`generate_traffic.py`'s round-count-only design**: everything derives from
+  `tx_round_count` -- exactly one send per node per round, so total tx count is
+  always `round_count * 14` (7 nodes x {TPC, colored}).
+- **Colored-coin balance shortfall mints instead of skipping.** Each node holds a
+  small working balance (`TOKEN_ISSUE_AMOUNT`/`TOKEN_TOPUP_AMOUNT` = 3). When a
+  sender is short, it issues/reissues more instead of transferring -- still one
+  transaction, so per-round tx count stays fixed at 14. NFT nodes mint a fresh color
+  almost every other round as a result; that's expected.
+- **Top-up timing needs no cross-round lookahead.** `issuetoken`'s NON_REISSUABLE/NFT
+  path only checks `IsMine(...) == ISMINE_SPENDABLE`, no confirmation-depth check, so
+  a same-round top-up-then-spend works fine.
+- **Per-transaction fee is read via `gettransaction`, not predicted.** This avoids
+  needing tx vsize to stay constant across this script's different transaction
+  shapes.
+- **`generate_traffic.py` seeds its ledger from each node's real balance**
+  (`getbalance`) at startup, since the workflow runs this script multiple times per
+  job and a node can carry a non-zero balance into a later run.
+- **`core-1a`/`2a`/`3a`'s coinbase income is fully asserted, not excluded --
+  observed directly per block.** Which of the 3 earns at a given height is
+  whichever signer sorts first by raw pubkey bytes (`tapyrus-signer`'s
+  `Federation::signers()`, `net.cpp`'s `SignerID::Ord`) -- not creation order,
+  and not something worth reimplementing in Python: doing it from
+  height-since-genesis would silently drift if any round in the chain's whole
+  history ever failed to produce a block. `_credit_coinbase_for_height` reads
+  each height's real coinbase transaction directly instead (asks each of the 3
+  wallets for it, credits whichever one actually has it) -- no anchor needed,
+  so a skipped round costs nothing. `_next_block_with_coinbase` credits every
+  height since the last one credited, not just the height it happens to
+  observe, so two blocks landing between polls don't leave the one in between
+  uncredited. The reward itself isn't a flat 50 TPC either -- confirmed live,
+  it's subsidy plus whatever transaction fees that block happened to include,
+  so every height reads the actual amount from the earner's own `generate`
+  transaction rather than assuming one.
+- **`computesig` requires full-signer-count arrays.** `--sig`/`--block-vss`/
+  `--node-vss` must list every signer, not just `threshold` (enforced by an
+  `assert_eq!`). It also needs one specific signer's key material (hardcoded to
+  signer-0 here) -- a real v1 "designated signer" limitation, not an oversight.
+- **`tapyrus-signerd` needs a live RPC connection to its own core node to sign at
+  all**, even as a non-master. There's no Redis-only fallback -- this is why the
+  reorg recipe repoints the losing group's signers to their one surviving core node
+  before signing.
+- **`sign`/`computesig` also accept `--xfield`** as an alternative to `--block`, to
+  sign an aggpubkey rotation or max-block-size change instead of a genesis block --
+  the mechanism behind federation rotation.
+- **`tapyrus-core` disables listening entirely once `-connect` is set** (not just
+  outbound dialing). Every `-connect` edge needs an explicit `-listen=1` added back
+  wherever a node also needs to accept an inbound connection.
+- **`tapyrus/tapyrusd`'s entrypoint runs `exec bash -c "$*"`**, and compose's
+  `command:` replaces the image's default CMD rather than appending to it -- every
+  override needs to repeat the full invocation.
 - **`tapyrus-setup createkey` always produces mainnet-prefixed WIFs** (`K`/`L`,
-  `0x80`), unlike tapyrus-core's own `-dev` network convention (`c` prefix, `0xef`).
-- **On macOS, building tapyrus-signer outside Docker also needs
-  `brew install gmp` + `LIBRARY_PATH=/opt/homebrew/lib`** for the linker to find the
-  system `libgmp` a transitive dependency wants (separate from the vendored
-  `gmp-mpfr-sys` build).
-- **A benign warning, any `round-duration`**: a non-master signer's own `submitblock`
-  call occasionally races a block another signer already submitted, and
-  tapyrus-core's `"duplicate"` string response doesn't match what the Rust client's
-  JSON deserializer expects (`invalid type: string "duplicate", expected unit`).
-  Harmless -- the block was already accepted through the other path.
-- **`round-duration=60` avoids transient `InvalidBlock`/"candidate block is not set"
-  errors around round boundaries** that a shorter duration (e.g. 10) hits.
-  `round-duration=30` also verified clean (zero `InvalidBlock` errors, real local run).
-- **`createnodevss`/`createblockvss` output ordering**: output lines
-  (`<receiver_pubkey>:<vss_hex>`) are sorted by receiver pubkey (BTreeMap iteration in
-  the Rust source), NOT by `--public-key` argument order -- extracting by line
-  position instead of matching the actual pubkey fails with an opaque `InvalidSS`
-  error from `tapyrus-setup` itself.
-- **`getnewaddress` right after `docker compose up -d` needs a retry, not a single
-  shot**: a container reported "running" only means the process started, not that
-  `tapyrusd`'s RPC server has finished initializing. `scripts/collect_coinbase_addresses.py`
-  retries each node via `lib/rpc.py`'s `RpcUnreachable` until it answers (or times out
-  loudly) and raises on an empty address instead of writing one. All of the real,
-  exercisable retry paths are now confirmed live -- see `project-plan.md`.
-- **`RPC_IN_WARMUP` (-28) is a real, common state to retry through, not just
-  connection-refused/timeout**: `tapyrusd` serves `-28` as HTTP 500 with a JSON-RPC
-  error body, which is exactly the readiness window right after `docker compose up`.
-  `lib/rpc.py` parses the `HTTPError`'s JSON body and treats `error.code == -28` as
-  retryable (`RpcUnreachable`) same as connection-refused, while still raising
-  `RpcError` (with the JSON-RPC error code/message included) for every other HTTP
-  error. A bad-credentials 401 has no response body at all
-  (`HTTPReq_JSONRPC`'s auth-failure path calls `WriteReply` with no body argument) --
-  doesn't crash the JSON parse.
-- **`workflow_dispatch` inputs have no `default:`**: every default used to be written
-  twice -- once as the input's `default:`, once as the `env:` block's `|| 'literal'`
-  fallback -- a real drift risk if one got updated without the other (flagged in PR
-  review). `workflow_dispatch.inputs.*.default` can't hold an expression, and
-  `schedule`/`pull_request`/`push` runs have no `inputs` context at all, so there was
-  no way to make `env:` read the input's declared default programmatically -- the
-  literal had to live somewhere outside the input either way. Chose to remove it from
-  the input side rather than the env side: `env:` keeps `inputs.x || 'literal'` as the
-  one place each default is written, and every input's `description:` now states its
-  default in words instead. A manual dispatch run left blank resolves to the exact
-  same value `schedule` uses -- the only visible change is the dispatch form showing
-  blank fields instead of pre-filled ones.
-- **`pull_request`/`push` smoke trigger, scoped to this repo's own changes**: added so
-  a change to `scripts/**`, `docker/**`, `config/**`, or the workflow itself is
-  validated before merge, not just discovered on the following Sunday's scheduled
-  run. This is deliberately read as a different concern from
-  `weekly-integration-test-plan.md` section 6's "not on every PR" non-goal: that
-  non-goal is about running the full-scale scenario against every PR opened on
-  `tapyrus-core`/`tapyrus-signer` (cost/runtime prohibitive), not about validating
-  this repo's own, rarely-changing PRs. The smoke trigger runs the identical job at
-  reduced scale (`reorg_length`, `tx_round_count` drop to smaller fallbacks, keyed off
-  `github.event_name` since `pull_request`/`push` runs have no `inputs` context --
-  neither `chain_height_before_reorg` nor `federation_change_height` is in that list;
-  both are always derived from another variable, so they shrink along with it
-  automatically) and a shorter `timeout-minutes` (180 vs. 360). Confirmed working on a
-  real `pull_request`-triggered run, not just locally-simulated env vars -- see
-  `project-plan.md`.
-- **`CHAIN_HEIGHT_BEFORE_REORG`/`FEDERATION_CHANGE_HEIGHT` are floors/offsets, not
-  literal targets**: `CHAIN_HEIGHT_BEFORE_REORG` is always `TX_ROUND_COUNT + 2`, and
-  `simulate_reorg.py`'s `_build_baseline` waits until the chain reaches at least that
-  height, then uses whatever height was *actually* reached (typically well past the
-  floor, since `generate_traffic.py` runs first in the same job) as the real
-  reference point for both forks' target height. `FEDERATION_CHANGE_HEIGHT` is
-  always `REORG_LENGTH`, and `simulate_federation_change.py` schedules its rotation
-  that many blocks past whatever height the chain is at when *it* runs.
-- **Git submodules**: `tapyrus-core` vendors `secp256k1` as a git submodule --
+  `0x80`), unlike tapyrus-core's own `-dev` convention (`c` prefix, `0xef`).
+- **A harmless warning at any round-duration**: a non-master's `submitblock`
+  occasionally races another signer's already-submitted block, and tapyrus-core's
+  `"duplicate"` response doesn't match the Rust client's expected type. The block is
+  already accepted through the other path.
+- **`createnodevss`/`createblockvss` output is sorted by receiver pubkey**, not
+  `--public-key` argument order. Extracting by line position instead of matching the
+  pubkey fails with an opaque `InvalidSS` error.
+- **`getnewaddress` right after `docker compose up -d` needs a retry.** A "running"
+  container just means the process started, not that RPC is ready.
+  `scripts/collect_coinbase_addresses.py` retries via `RpcUnreachable` and raises on
+  an empty address.
+- **`RPC_IN_WARMUP` (-28) is a common, retryable state**, not just
+  connection-refused/timeout. `lib/rpc.py` treats it the same as `RpcUnreachable`,
+  while still raising `RpcError` for any other RPC error.
+- **`workflow_dispatch` inputs have no `default:`.**
+  `workflow_dispatch.inputs.*.default` can't hold an expression, and
+  `schedule`/`pull_request`/`push` have no `inputs` context at all -- so every
+  default lives in the `env:` block's `inputs.x || 'literal'` fallback instead.
+- **`pull_request`/`push` smoke trigger** validates changes to `scripts/**`,
+  `docker/**`, `config/**`, or the workflow itself before merge, at reduced scale
+  (`timeout-minutes: 180` vs. 360).
+- **`CHAIN_HEIGHT_BEFORE_REORG`/`FEDERATION_CHANGE_HEIGHT` are floors, not literal
+  targets.** `CHAIN_HEIGHT_BEFORE_REORG` is `TX_ROUND_COUNT + 2`;
+  `simulate_reorg.py` waits for at least that height, then uses the actual height
+  reached. `FEDERATION_CHANGE_HEIGHT` is `REORG_LENGTH`, counted from whatever height
+  the chain is at when `simulate_federation_change.py` runs.
+- **Git submodules**: `tapyrus-core` vendors `secp256k1` as a submodule.
   `checkout_repos.py` runs `git submodule update --init --recursive` after every
-  clone/update (harmless no-op for repos without submodules).
-- **Python's stdout is fully block-buffered when not attached to a tty** (the normal
-  case in CI) -- every log write in `scripts/lib/log.py` uses `flush=True` so output
-  interleaves correctly with subprocess output.
-- **Core network topology**: enforced entirely via `-connect=`, all 7 nodes on one
-  flat Docker network (not segmented per edge), so a planned future adversary-node
-  extension (connecting P2P to two first-layer nodes) remains buildable without
-  rework.
-- **`tapyrus-seeder` is included** for its own integration coverage even though
-  nothing in the v1 scenario actually depends on it for peer discovery (container DNS
-  already handles that).
-- **Secrets scope**: this repo only ever generates local dev secrets
-  (`generate_dev_secrets.py`); it never provisions real GitHub secrets. The only
-  actual CI secret needed is the Slack webhook URL.
+  clone/update.
+- **Python's stdout is block-buffered when not attached to a tty** (the normal case
+  in CI). `scripts/lib/log.py` uses `flush=True` so output interleaves correctly with
+  subprocess output.
+- **Core network topology** is enforced entirely via `-connect=`, with all 7 nodes on
+  one flat Docker network.
+- **`tapyrus-seeder` genuinely bootstraps a new node** (`scripts/verify_seeder.py`).
+  A brand-new 8th node with no hardcoded topology knowledge discovers and connects to
+  the network entirely through it. Both that node (`seeder-test-node`) and `seeder`
+  itself are stopped and removed once `run()` finishes, in a `finally` (guaranteed on
+  failure too) -- neither is part of the fixed topology every later step (reorg,
+  federation change) runs against. Left running, `seeder-test-node`'s persistent
+  connection into whichever listener it discovered permanently mismatches
+  `wait_for_topology.py`'s exact `getconnectioncount` check on that node, and during
+  `simulate_reorg.py`'s isolated-build phases (one group's core nodes entirely
+  stopped while the other builds alone) gives the supposedly-isolated group a real
+  P2P path to learn the *other* group's blocks via header relay before it's supposed
+  to see them at all -- silently defeating the strict-alternation the whole reorg
+  recipe depends on. The seeder's own crawler adds flakiness on top even where
+  `seeder-test-node` never attached: it re-tests every address on its own ~60s cycle
+  with real TCP connections held open waiting for a reply that never comes (see
+  Lessons learnt below), which can transiently perturb any node's exact-count poll.
+- **Phase 1's addseeder-mode check looks for one real (non-seeder) peer, not a peer
+  count.** The original design captured each node's peer count right after the
+  post-restart `_wait_for_all_rpc_ready` returned, then waited for it to exceed
+  that snapshot -- but P2P connections start forming the moment each process
+  restarts, independent of when its own RPC server finishes initializing, so some
+  nodes were already 2-3 peers in by the time the "baseline" was captured, leaving
+  no observable room to grow within the timeout even though discovery had
+  genuinely worked. Tried requiring an absolute floor of 2+ peers instead (sidesteps
+  that race), but that failed too, for a deeper reason confirmed by reading
+  `tapyrus-core`'s own `net.cpp` (`ThreadOpenConnections`, "Only connect out to one
+  peer per network group"): every core-* node here sits on the same `/24`
+  (`51.51.51.0/24`), so they're all one netgroup, and tapyrus-core's own
+  outbound-connection diversity logic caps each node's OWN dialing at ~1 real peer
+  *permanently* -- a node not also lucky enough to be picked as someone else's
+  inbound target legitimately never exceeds 1 real peer, no matter how long you
+  wait. Confirmed live: a node stuck at 1 only ever reached "2" again once the
+  seeder's own periodic `-s` crawl cycled back around and re-probed it (a second,
+  transient connection) 15+ minutes later -- not new organic discovery, just the
+  seeder's own crawl cadence. The seeder's crawl connection is transient anyway
+  (see Lessons learnt below), so it can't be relied on to pad a count either way.
+  The right, achievable signal is simply: is there a peer whose `subver` isn't the
+  seeder's own (`SEEDER_SUBVER`)? One real peer is enough proof, as long as it's
+  the right one.
+- **Secrets scope**: this repo only generates local dev secrets
+  (`generate_dev_secrets.py`); it never provisions real GitHub secrets. No CI
+  secret is currently needed at all -- Slack notification was deferred (see
+  Outstanding work in `project-plan.md`); GitHub's own built-in failure
+  notifications cover failure detection for now.
+- **Why the network uses `51.51.51.0/24`**: it needs to pass `IsRoutable()`, and
+  neither RFC1918 private ranges nor RFC 5737 test ranges qualify -- `IsRoutable()`
+  excludes both. `51.51.51.0/24` is an arbitrary block confirmed to fall outside
+  every exclusion (see Lessons learnt above). If this ever needs to change, pick a
+  different block and re-check it against that exclusion list.
 
-## Full local end-to-end verification (Tier 3 test)
+## Lessons learnt
 
-Verified for real, locally, with a fresh checkout, real Rust toolchain, real Docker
-builds, and real containers (not simulated):
+- **`tapyrus-setup`'s offline `--xfield sign`/`computesig` rejected valid signatures
+  with `InvalidSig` about half the time.** Root cause: `Sign::format_signature`
+  (`sign.rs`) encoded a signature's `v` point using only its x-coordinate, dropping
+  y-parity, so the verification side's reconstruction guessed the wrong y about half
+  the time. A separate theory (inconsistent Schnorr share selection across process
+  invocations) was tested and ruled out via 60/60 clean ceremony rounds. This was a
+  `tapyrus-signer` bug, fixed upstream.
+- **A silent `docker compose up`-triggered recreate stranded two nodes and hung
+  a real CI run for 3+ hours until the job's own timeout killed it.**
+  `simulate_reorg.py` restarts group A (`start_nodes`, which is `docker compose up
+  -d --no-deps ...`) from its own fresh process, which had never re-set
+  `CORE_1B_ARGS`/`CORE_2B_ARGS` -- Compose resolved them to empty, saw that as a
+  real config change from what the container was created with, and recreated
+  core-1b/core-2b *without* their `-connect=` flag, permanently stranding them
+  with zero peers (`--no-deps` only stops cascading to *other* services'
+  `depends_on` targets; it doesn't protect a service's own `command:` from
+  drifting when its own env var isn't set). core-1a/core-2a kept building blocks
+  completely normally, so the height-wait the rest of the recipe was blocked on
+  could never succeed -- confirmed live: 137 blocks past the intended target
+  before the job was externally killed, while core-1b/core-2b sat frozen at their
+  restart-time height the entire time. The same root cause, independently, made
+  "Bring up signers" silently recreate core-1a/2a/3a mid-run too (`SEEDER_IP`
+  unset there this time) -- survived only by luck (their connect-mode args happen
+  to be empty strings, so nothing actually changed that run). Fixed at the
+  source: `verify_seeder.py` persists `GENESIS_BLOCK_WITH_SIG`/`SEEDER_IP`/every
+  `CORE_*_ARGS` to `$GITHUB_ENV` once connect mode is up, so every later step in
+  the job resolves the same values regardless of which fresh process touches
+  `docker compose` next -- not a per-script patch, since any future script with
+  the same oversight would reintroduce the same failure mode. "Bring up signers"
+  also gained `--no-deps` as defense in depth.
+- **`round-duration=60` avoids transient `InvalidBlock` errors** around round
+  boundaries that shorter durations (e.g. 10) hit. `round-duration=30` also verified
+  clean.
+- **Building `tapyrus-signer` outside Docker on macOS** also needs
+  `brew install gmp` + `LIBRARY_PATH=/opt/homebrew/lib`, for the linker to find the
+  system `libgmp`.
+- **How `tapyrus-seeder` discovers nodes, and what changes between the two
+  `docker-compose.yml` bring-up modes** (`scripts/verify_seeder.py`):
 
-- Real checkout of all three repos
-- Real `tapyrus-setup`/`tapyrus-signerd` build
-- Real `tapyrus-core`, `tapyrus-signer`, and `tapyrus-seeder` Docker images built
-  successfully
-- Real 3-signer ceremony converged on one genuine aggpubkey
-- Real genesis signed by that ceremony, loaded and validated by real `tapyrusd`
-  (`Genesis Block [...] Loaded successfully`)
-- Real 7-node + redis compose stack came up; `wait_for_topology.py` correctly
-  converged against live containers
-- Real signer network produced real threshold-signed blocks, zero `InvalidBlock`
-  errors (`round-duration=60`), confirmed P2P relay to signer-less `core-7`
-- Real two-sided reorg via `scripts/simulate_reorg.py`'s alternating-isolation
-  recipe, confirmed via `getchaintips` (exact `branchlen`/active/valid-fork pattern
-  on every node)
-- Real round-robin TPC + colored-coin traffic via `scripts/generate_traffic.py`,
-  balances confirmed against the tracked ledger
-- Log collection and teardown steps both verified
+  1. **DNS-seed crawling is a direct per-address liveness test, not gossip.**
+     `-s <networkid>:<host>:<port>` seeds an initial candidate list; a pool of
+     crawler threads (`-t`) each open a real TCP connection, do a VERSION/VERACK
+     handshake, and send `getaddr`.
+  2. **`GETADDR` only ever returns what the responding node's own addrman already
+     has, and `-connect` targets are never added to it.** `CAddrMan::Good_()`
+     (`addrman.cpp`) only updates an address already present via `Add()`; `-connect`
+     targets are resolved and dialed directly, skipping `Add()` entirely. So in
+     connect mode every node's addrman stays empty regardless of subnet (confirmed
+     live: no `addr` message ever exchanged on any `-connect` edge, even after hours
+     of uptime) -- crawling from a single node would never find the other 6. Fixed
+     by seeding every node's address directly (`-s` once each) instead of relying on
+     gossip from one entry point.
+  3. **One successful test isn't enough to be servable via DNS.** `IsGood()` needs
+     3+ successes at least `MIN_RETRY` (60s) apart. Before that, `GetIPs_` falls back
+     to one arbitrary attempted address.
+  4. **The default thread count (96) fights small networks.** Idle-retry backoff
+     scales with thread count (`rand() % (500 * nThreads)`), so 96 threads meant up
+     to ~48s of random sleep between retries on top of the 60s `MIN_RETRY`. Turned
+     down to `-t 2`.
+  5. **Neither `tapyrus-seeder` nor `tapyrus-core` will ever treat a private/internal
+     address as usable.** Both gate on `CNetAddr::IsRoutable()`. Docker's default
+     bridge range fails this, and so does RFC 5737 (TEST-NET-3, tried first) --
+     `tapyrus-core`'s `IsRoutable()` explicitly excludes it, unlike the seeder's own
+     simpler check. No IANA special-purpose block passes; `51.51.51.0/24` is an
+     arbitrary block confirmed to fall outside all of them. Safe: this network is an
+     isolated Docker bridge, never reachable from the real internet.
+  6. **Which nodes end up "good" depends on the bring-up mode, not anything the
+     seeder does differently.** In connect mode, `core-7`'s `-connect` (with no
+     offsetting `-listen=1`) disables its listening entirely, so it's the one
+     address that never becomes good -- seeded anyway, deliberately, as a real
+     negative case. In addseeder mode `core-7` has no `-connect` at all, so it
+     listens like the other 6 and the seeder legitimately reports all 7 as good
+     (confirmed live) -- `core-7` never appearing is a connect-mode-only invariant.
+  7. **A node with no `-connect` at all uses its addrman normally, so `-addseeder`
+     genuinely grows its peer count from nothing.** Confirmed live: all 7 nodes
+     given only `-addseeder` organically connect to each other. `-connect`
+     auto-disables `-dnsseed` too, and `-addseeder` with `-dnsseed` off is a fatal
+     `InitError` -- an explicit `-dnsseed=1` override is needed to boot a node that
+     (temporarily) needs both. `ThreadDNSAddressSeed` also only runs once, at
+     process startup -- a node's first attempt always sees a not-yet-converged
+     seeder, so a restart is needed to get real results.
 
-## Full real-CI end-to-end verification
-
-Beyond the local Tier 3 test above, the entire scenario has also run successfully in
-real GitHub Actions CI (not simulated, not local) -- a `pull_request`-triggered smoke
-run went through ceremony, 7-node bring-up, traffic generation, reorg, federation
-change, max-block-size change, and traffic generation again afterward, all
-successfully:
-[run](https://github.com/chaintope/tapyrus-integration-tests/actions/runs/30790964795/job/91614204236).
-This also confirms the smoke trigger's `inputs.<name> || (...)` fallback expressions
-evaluate correctly on a real `pull_request` event, closing the one open question
-local testing couldn't exercise (`on:` trigger behavior).
+  End state: in connect mode the seeder converges on exactly the 6 nodes that
+  actually listen there (never `core-7`), and a brand-new 8th node with only
+  `-addseeder` genuinely discovers and connects to the network through it. In
+  addseeder mode, all 7 nodes -- `core-7` included -- discover and connect to each
+  other organically, confirmed by every node's own peer count growing from nothing.

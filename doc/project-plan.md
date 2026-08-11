@@ -41,7 +41,7 @@ See [`work-done.md`](work-done.md) for known issues and design decisions.
 
 ## Milestone 3 -- Scenario mechanics
 
-- [x] Per-node transaction generation -- `scripts/generate_traffic.py` (`TrafficNode` + `TrafficGenerator`). Round-robin TPC + colored-coin (REISSUABLE/NON_REISSUABLE/NFT mix, one type per node) sends across all 7 nodes, everything derived from a single round count (`tx_round_count`); balance verified against a tracked ledger after every block. Wired into the workflow (`Generate traffic (before reorg)` step). Verified end-to-end: zero send/issuance failures across 2 full rounds, real balance changes throughout, settled correctly. Also guards against a fully-broken run trivially passing: `MIN_SUCCESSFUL_ACTION_FRACTION` asserts at least half the expected send/mint actions actually succeeded, not just that tracked-vs-actual balances agree (a never-funded node's ledger and real balance would otherwise both sit at `0.0` and look "consistent").
+- [x] Per-node transaction generation -- `scripts/generate_traffic.py` (`TrafficNode` + `TrafficGenerator`). Round-robin TPC + colored-coin (REISSUABLE/NON_REISSUABLE/NFT mix, one type per node) sends across all 7 nodes, everything derived from a single round count (`tx_round_count`); balance verified against a tracked ledger after every block, including the 3 coinbase-earning nodes' TPC (observed directly per block, not excluded -- see `work-done.md`). Wired into the workflow (`Generate traffic (before reorg)` step). Verified end-to-end: zero send/issuance failures and zero balance mismatches across 3 full rounds, real balance changes throughout (including coinbase), settled correctly. Also guards against a fully-broken run trivially passing: `MIN_SUCCESSFUL_ACTION_FRACTION` asserts at least half the expected send/mint actions actually succeeded, not just that tracked-vs-actual balances agree (a never-funded node's ledger and real balance would otherwise both sit at `0.0` and look "consistent").
 - [x] Max-block-size (xfield) change -- `scripts/simulate_maxblocksize_change.py`
   (`MaxBlockSizeChangeSimulator`). Signer-set-b (already active after the rotation
   above) signs off on a new max-block-size via a fresh `--xfield sign/computesig`
@@ -128,7 +128,16 @@ Each of these corresponds to a step in `.github/workflows/weekly-integration-tes
   (`_confirm_rotation_via_rpc`: `getblockchaininfo`'s `aggregatePubkeys` array on all
   7 core nodes must show the new pubkey at the scheduled height), rather than a
   separate step.
-
+- [x] `tapyrus-seeder` service actually brought up and verified, in both bring-up
+  modes docker-compose.yml supports for the 7 core-* nodes -- `scripts/verify_seeder.py`
+  (see `scripts.md`). Addseeder mode confirms every node's peer count grows
+  organically from nothing via `-addseeder` alone (no `-connect`); connect mode
+  confirms the seeder reports only genuinely-listening nodes (never `core-7`,
+  deliberately seeded as a real negative case there) and that a brand-new node with
+  no hardcoded topology knowledge auto-bootstraps through it. See `work-done.md`'s
+  Lessons learnt for the underlying investigation (ADDR gossip, DNS-seed reliability
+  thresholds, why `-connect` nodes never populate their own addrman, and why the
+  compose network needs a specific custom subnet).
 ## Outstanding work
 
 Everything not yet implemented or not yet testable, in one place:
@@ -144,11 +153,6 @@ Everything not yet implemented or not yet testable, in one place:
   an orphaned colored-coin issuance (`issuetoken`) that returns to the mempool keeps
   its original color id correctly, or whether that identity can drift on
   reconfirmation.
-- **Slack report step** (pass/fail, run metadata, both aggpubkeys, failure log tail)
-  -- needs a Slack webhook secret provisioned first (see below).
-- **`tapyrus-seeder` service never actually brought up** -- `docker compose up` today
-  only starts `redis`/`core-*`/`signer-*`; the image is built and validated but the
-  service itself is never started -- plus a `dig`-based pass/fail check against it.
 - **`docker/docker-compose.yml` has no compose-level healthchecks** /
   `depends_on: condition: service_healthy` -- `scripts/wait_for_topology.py` is a
   confirmed-working CI-level equivalent (see Milestone 4), but the compose-file
@@ -157,10 +161,15 @@ Everything not yet implemented or not yet testable, in one place:
   `TOKEN_ISSUE_AMOUNT`/etc.) haven't been stress-tested at a larger round count where
   the balance-shortfall top-up mechanic would trigger much more often.
 - **Team review/sign-off** on the design in `weekly-integration-test-plan.md`.
-- **Slack webhook URL** provisioned as a GitHub Actions secret.
-- **GitHub-hosted `ubuntu-latest` runner's CPU/disk sufficiency is unconfirmed** for 7
-  core nodes + 3 signers + redis + seeder running concurrently -- may need
-  self-hosted.
+- **Slack pass/fail report**: deferred by team decision -- GitHub's own built-in
+  failure notifications cover failure detection for now, and the team isn't ready
+  to provision the webhook secret yet, so this shouldn't merge as a code path that
+  stays dormant behind a secret that doesn't exist. Was built and verified
+  (`scripts/send_slack_report.py`, structurally against a local mock webhook
+  listener -- both message formats, implicated-container detection, and the
+  graceful no-webhook skip all confirmed live) before being removed rather than
+  merged. Can come back as its own PR if the team later wants channel-wide
+  visibility or a weekly heartbeat report.
 - **Core-node RPC auth** is the static `rpcuser`/`rpcpassword` (hardcoded in
   `scripts/render_tapyrus_conf.py`, `CORE_RPC_USER`/`CORE_RPC_PASS` in the workflow's
   `env:` block, and every script that calls `CoreRpcClient`) -- switching to cookie

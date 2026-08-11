@@ -38,9 +38,21 @@ path at all (fixed supply by design), so their "top-up" mints an entirely new co
 each time -- a node's NON-REISSUABLE/NFT identity rotates through multiple distinct
 colors over a long run, which is expected, not a bug.
 
+Coinbase observation: core-1a/2a/3a (the 3 first-layer, RPC-target nodes) earn a
+coinbase reward whenever their signer is round master -- subsidy plus whatever
+transaction fees that block happened to include (not a flat amount once real traffic
+is flowing), immediately spendable with no coinbase-maturity delay in this codebase
+at all. Which physical node earns at a given height depends on tapyrus-signer's own
+sorted-pubkey master selection, not anything this script controls. Every height's
+earner is read directly: _credit_coinbase_for_height asks each candidate's wallet
+for that height's real coinbase transaction and credits whichever one actually has
+it, for every height since the last one credited (not just the latest observed --
+two blocks landing between polls would otherwise leave the one in between never
+credited at all).
+
 See doc/work-done.md for the tapyrus-core RPC facts this script is built on (colored
-address round-trip requirement, coinbase maturity, issuetoken/transfertoken semantics)
--- verified against a real 7-node stack, and since via real GitHub Actions CI too.
+address round-trip requirement, issuetoken/transfertoken semantics) -- verified
+against a real 7-node stack, and since via real GitHub Actions CI too.
 """
 import argparse
 import asyncio
@@ -136,6 +148,11 @@ class TrafficGenerator:
         self._ledger = {node.name: {} for node in nodes}
         self._mismatches = []
         self._successful_round_actions = 0
+        # Every _next_block_with_coinbase() call credits every height since this
+        # one, not just the height it happens to observe -- so a block that lands
+        # between two polls still gets its coinbase credited. Set for real once
+        # run() knows the starting height, before any crediting begins.
+        self._last_credited_height = None
 
     async def run(self):
         await self._collect_addresses()
@@ -145,24 +162,24 @@ class TrafficGenerator:
         # silently offset the ledger by exactly its amount for the rest of the run.
         await self._wait_for_empty_mempool()
         await self._seed_ledger_with_current_balances()
-        # Waiting for just one more block isn't enough: with 3 signers rotating as
-        # block proposer, one new block only credits coinbase to whichever signer
-        # proposed it, not all three -- core-1a/2a/3a need to each have proposed at
-        # least once before every funding source has spendable TPC. Poll actual
-        # balances instead of guessing how many blocks that takes.
-        await self._wait_for_funding_source_balances()
+        self._last_credited_height = await self._current_height()
+        # 3 blocks' worth of coinbase is far more than FUNDING_AMOUNT_TPC needs --
+        # ensures core-1a/2a/3a have real spendable balance before funding the
+        # other 4 nodes from them, on a fresh chain where they start at 0.
+        for _ in range(3):
+            await self._next_block_with_coinbase()
         await self._fund_unfunded_nodes()
-        await self._wait_for_next_block()
+        await self._next_block_with_coinbase()
         await self._issue_colors()
-        await self._wait_for_next_block()
+        await self._next_block_with_coinbase()
 
         for round_number in range(1, self._round_count + 1):
             log.step(f"round {round_number}/{self._round_count}")
-            await self._wait_for_next_block()
+            await self._next_block_with_coinbase()
             await self._send_round(round_number)
-            check_height = await self._wait_for_next_block()
+            check_height = await self._next_block_with_coinbase()
             await self._log_balances(check_height, "check")
-            settle_height = await self._wait_for_next_block()
+            settle_height = await self._next_block_with_coinbase()
             await self._verify_round(settle_height)
 
         expected_actions = self._round_count * len(self._nodes) * 2
@@ -204,30 +221,6 @@ class TrafficGenerator:
                 log.info(f"{node.name}: starting balance {balance} TPC (carried over from before this run)")
 
         await asyncio.gather(*(seed(node) for node in self._nodes))
-
-    async def _wait_for_funding_source_balances(self):
-        log.step(f"waiting for each funding source to hold at least {FUNDING_AMOUNT_TPC} TPC")
-        by_name = {node.name: node for node in self._nodes}
-        funders = sorted(COINBASE_EARNING_NODES)
-        deadline = time.monotonic() + HEIGHT_POLL_TIMEOUT_SECONDS * 3
-
-        async def balance_of(name):
-            try:
-                return await by_name[name].rpc.call("getbalance", [False])
-            except RpcUnreachable:
-                return 0
-
-        while True:
-            balances = await asyncio.gather(*(balance_of(name) for name in funders))
-            if all(balance >= FUNDING_AMOUNT_TPC for balance in balances):
-                return
-            if time.monotonic() >= deadline:
-                missing = [name for name, balance in zip(funders, balances) if balance < FUNDING_AMOUNT_TPC]
-                raise TrafficGenerationError(
-                    f"funding source(s) never accumulated {FUNDING_AMOUNT_TPC} TPC "
-                    f"within {HEIGHT_POLL_TIMEOUT_SECONDS * 3}s: {missing}"
-                )
-            await asyncio.sleep(HEIGHT_POLL_INTERVAL_SECONDS)
 
     async def _fund_unfunded_nodes(self):
         log.step(f"funding the {len(FUNDING_PAIRS)} nodes with no coinbase income")
@@ -399,6 +392,45 @@ class TrafficGenerator:
         except RpcUnreachable:
             return None
 
+    async def _next_block_with_coinbase(self):
+        """_wait_for_next_block, plus crediting the ledger for every height since
+        the last one credited -- not just the height just reached. Master
+        selection rotates by ROUND, not by block, and a round doesn't always
+        produce one, so two blocks can land between polls; crediting only the
+        latest would silently leave the one in between never credited at all,
+        surfacing as a bogus mismatch at settle time."""
+        await self._wait_for_next_block()
+        actual = await self._current_height()
+        for height in range(self._last_credited_height + 1, actual + 1):
+            await self._credit_coinbase_for_height(height)
+        self._last_credited_height = actual
+        return actual
+
+    async def _credit_coinbase_for_height(self, height):
+        """Reads the height's real coinbase transaction and credits whichever of
+        core-1a/2a/3a's wallet actually has it. The reward isn't a flat 50 TPC --
+        it's subsidy plus whatever transaction fees that block happened to
+        include, so once real traffic is flowing it varies block to block
+        (confirmed live)."""
+        by_name = {node.name: node for node in self._nodes}
+        probe = self._nodes[0]
+        blockhash = await probe.rpc.call("getblockhash", [height])
+        block = await probe.rpc.call("getblock", [blockhash])
+        coinbase_txid = block["tx"][0]
+        for name in sorted(COINBASE_EARNING_NODES):
+            try:
+                tx = await by_name[name].rpc.call("gettransaction", [coinbase_txid])
+            except RpcError:
+                continue  # not in this node's wallet -- try the next candidate
+            for detail in tx.get("details", []):
+                if detail.get("category") == "generate":
+                    self._ledger[name][TPC] += detail["amount"]
+                    return
+        raise TrafficGenerationError(
+            f"height {height}: no coinbase-earning node's wallet has a 'generate' "
+            f"transaction for {coinbase_txid}"
+        )
+
     # -- balance logging / verification --------------------------------------------
 
     async def _all_colors(self):
@@ -417,14 +449,7 @@ class TrafficGenerator:
         colors = await self._all_colors()
         for node in self._nodes:
             actual_tpc = await node.rpc.call("getbalance", [False])
-            if node.name in COINBASE_EARNING_NODES:
-                # Ongoing coinbase income (whichever signer proposes each round) makes
-                # this node's TPC balance unpredictable from this script's own ledger
-                # alone -- log it, don't assert it. Colored balances are unaffected
-                # (coinbase never carries a color) and stay fully asserted below.
-                log.info(f"height {height}: {node.name} TPC: {actual_tpc} (coinbase-earning, not asserted)")
-            else:
-                self._compare(height, node.name, TPC, self._ledger[node.name][TPC], actual_tpc)
+            self._compare(height, node.name, TPC, self._ledger[node.name][TPC], actual_tpc)
             for color in colors:
                 actual = await node.rpc.call("getbalance", [False, color])
                 expected = self._ledger[node.name].get(color, 0)

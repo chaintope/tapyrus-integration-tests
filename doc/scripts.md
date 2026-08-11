@@ -189,9 +189,107 @@ just string formatting and a file write, nothing to overlap.
   production-node defaults for a small, short-lived, closed-topology test chain (7
   fixed peers, a handful of blocks, a run measured in hours not weeks).
 - **Known limitation**: not wired into the `seeder` service's `-i`/`-s` flags (still
-  hardcoded to `1905960821` in `docker/docker-compose.yml`) -- deliberately, since the
-  seeder isn't brought up by any `docker compose up` invocation yet at all (see
-  `project-plan.md` Milestone 4).
+  hardcoded to `1905960821` in `docker/docker-compose.yml`) -- the seeder is brought
+  up and verified now (`scripts/verify_seeder.py`), this specific value just hasn't
+  been made configurable yet.
+
+## `scripts/verify_seeder.py`
+
+Brings up the `seeder` service and the 7 core-* nodes itself, in two bring-up modes
+in sequence, and verifies both end-to-end. Implemented as `SeederVerifier`. See
+`doc/work-done.md`'s Lessons learnt for the full investigation behind why this
+needed a custom Docker subnet, a reduced crawler thread count, and this two-phase
+design rather than a single `dig` call.
+
+- **Usage**: `./scripts/verify_seeder.py` (no arguments -- reads `CORE_RPC_USER` /
+  `CORE_RPC_PASS` from the environment). Takes over bringing the 7 core-* nodes up
+  entirely -- run it in place of a separate "bring up the 7 core nodes" step, before
+  anything that depends on the fixed topology being stable (`wait_for_topology.py`,
+  traffic generation, reorg, etc.), since it tears the nodes down and recreates them
+  partway through.
+- **Phase 1 -- addseeder mode, verifies organic peer discovery**: all 7 core-*
+  nodes come up with only `-addseeder=<seed-hostname>`, no `-connect` at all. Waits
+  for the seeder's own `-s`-driven crawl to converge (independent of the core nodes'
+  own config), then restarts the 7 nodes so their one-shot DNS-seed lookup
+  (`tapyrus-core` only runs this once, at process startup) runs again with real
+  answers available, then polls `getpeerinfo` on all 7 until each has a peer whose
+  `subver` isn't the seeder's own (`SEEDER_SUBVER`). Not a raw peer count, and not
+  "grew from a captured baseline" either (two designs tried and rejected in the same
+  investigation, see `work-done.md`) -- every core-* node here sits on the same /24,
+  so tapyrus-core's own netgroup-diversity outbound logic caps each node's OWN
+  dialing at ~1 real peer permanently, regardless of how many addresses `-addseeder`
+  handed it; a node not also lucky enough to be picked as someone else's inbound
+  target legitimately never exceeds 1. The seeder's own crawl connection is
+  transient too, so it can't be relied on to pad a count either. A single real
+  (non-seeder) peer is both the right signal and the achievable one.
+- **Phase 2 -- connect mode, the fixed topology**: stops and removes the 7 core-*
+  nodes and the seeder (a fresh seeder avoids phase 1's now-stale "good" set, keyed
+  on IPs that no longer exist once the nodes are recreated), then brings both back up
+  with the fixed `-connect` topology every other script in this repo runs against.
+  Re-verifies the seeder converges on exactly the 6 nodes that actually listen here
+  (`core-1a`/`1b`/`2a`/`2b`/`3a`/`3b`) -- `core-7` is seeded too, deliberately, as a
+  real negative case (it never listens, see `docker-compose.yml`'s "CONNECT/LISTEN
+  DESIGN" note) -- then brings up `seeder-test-node` (an 8th node with no `-connect`
+  at all, only `-addseeder`, its container DNS resolver pointed at the seeder via
+  `SEEDER_IP`) and confirms it auto-bootstraps onto one of the 6 listening nodes
+  through the seeder alone.
+- **Both `seeder-test-node` and `seeder` itself are stopped and removed once `run()`
+  finishes, in a `finally` (guaranteed on failure too, not just success).** Left
+  running, `seeder-test-node`'s persistent connection into whichever listener it
+  discovered permanently mismatches `wait_for_topology.py`'s exact
+  `getconnectioncount` check on that node, and during `simulate_reorg.py`'s
+  isolated-build phases gives the supposedly-isolated group a real path to learn
+  the other group's blocks via header relay -- silently defeating the
+  strict-alternation the whole reorg recipe depends on. The seeder's own crawler
+  adds flakiness on top even where `seeder-test-node` never attached (see
+  `work-done.md`'s Lessons learnt on its held-open probe connections).
+- **Output**: none written to disk -- verification results are logged; a mismatch
+  at any check raises `SeederVerificationError` (non-zero exit).
+- **Active in the workflow** as "Bring up tapyrus-seeder and verify it".
+
+## `scripts/wait_for_topology.py`
+
+Polls every core-* node's RPC port until the 7-node topology (plan doc section 4b)
+has fully converged -- each node's own `getconnectioncount` matches the pattern the
+`-connect` graph is supposed to produce (the `1/2/1/2/1/2/3` sequence in the root
+README's variable table), not just "all 7 containers are up". Implemented as
+`TopologyWaiter`, using `lib/rpc.py`'s `CoreRpcClient`. All 7 nodes are polled
+**concurrently** each attempt (`asyncio.gather`) -- one slow or unreachable node
+doesn't delay checking the other 6.
+
+- **Usage**: `./scripts/wait_for_topology.py [--timeout-seconds N] [--poll-interval-seconds N]`
+  (defaults: 300s timeout, 5s poll interval).
+- Node names, host-published RPC ports, and expected connection counts are hardcoded
+  (see `docker/docker-compose.yml`'s port mappings) -- not configurable per-run, since
+  the 7-node topology itself is wired 1:1 to exactly 3 signers (see the root
+  `README.md`'s variable table).
+- **`CORE_RPC_USER` / `CORE_RPC_PASS` env vars** (defaults `rpcuser` / `rpcpassword`)
+  -- match the workflow's existing job-level env vars of the same names.
+- A node that isn't reachable yet (connection refused -- still starting) is treated
+  the same as a wrong connection count: "not converged yet", not a hard failure,
+  until the timeout is hit.
+- **On timeout**: logs every still-mismatched node's actual vs. expected state, then
+  exits 1.
+- Note: `docker/docker-compose.yml` doesn't yet have the compose-level healthcheck +
+  `depends_on: condition: service_healthy` guidance from the same plan doc step --
+  this script is a CI-level equivalent (arguably stronger, since it confirms real P2P
+  peer counts rather than just RPC reachability), but the compose-file enhancement
+  itself is separate, unstarted work.
+
+## `scripts/collect_coinbase_addresses.py`
+
+Collects one coinbase payout address from each first-layer core-* node's wallet
+(`getnewaddress`), retrying each node until its RPC actually answers instead of
+assuming `docker compose up -d` returning means the RPC server is ready. Also fails
+loudly (non-zero exit) on an empty address instead of writing a blank line to the
+output file.
+
+- **Usage**: `./scripts/collect_coinbase_addresses.py <port> [<port> ...] [--output FILE] [--timeout-seconds N] [--poll-interval-seconds N]`
+  (defaults: `./runtime/addrs.txt`, 120s per-node timeout, 3s poll interval).
+- Ports run **concurrently** (`asyncio.gather`), same convention as the rest of
+  `scripts/`. **`CORE_RPC_USER` / `CORE_RPC_PASS` env vars** match the workflow's
+  existing job-level env vars.
+- **Output**: one address per line, in the same order as the ports given.
 
 ## `scripts/assemble_signer_configs.py`
 
@@ -238,50 +336,6 @@ file reads/writes, no subprocess or network I/O to run concurrently.
   `--xfield` handoff. Handled by a subclass rather than editing this class directly:
   see `simulate_federation_change.py`'s `RotationSignerConfigAssembler` below.
 
-## `scripts/collect_coinbase_addresses.py`
-
-Collects one coinbase payout address from each first-layer core-* node's wallet
-(`getnewaddress`), retrying each node until its RPC actually answers instead of
-assuming `docker compose up -d` returning means the RPC server is ready. Also fails
-loudly (non-zero exit) on an empty address instead of writing a blank line to the
-output file.
-
-- **Usage**: `./scripts/collect_coinbase_addresses.py <port> [<port> ...] [--output FILE] [--timeout-seconds N] [--poll-interval-seconds N]`
-  (defaults: `./runtime/addrs.txt`, 120s per-node timeout, 3s poll interval).
-- Ports run **concurrently** (`asyncio.gather`), same convention as the rest of
-  `scripts/`. **`CORE_RPC_USER` / `CORE_RPC_PASS` env vars** match the workflow's
-  existing job-level env vars.
-- **Output**: one address per line, in the same order as the ports given.
-
-## `scripts/wait_for_topology.py`
-
-Polls every core-* node's RPC port until the 7-node topology (plan doc section 4b)
-has fully converged -- each node's own `getconnectioncount` matches the pattern the
-`-connect` graph is supposed to produce (the `1/2/1/2/1/2/3` sequence in the root
-README's variable table), not just "all 7 containers are up". Implemented as
-`TopologyWaiter`, using `lib/rpc.py`'s `CoreRpcClient`. All 7 nodes are polled
-**concurrently** each attempt (`asyncio.gather`) -- one slow or unreachable node
-doesn't delay checking the other 6.
-
-- **Usage**: `./scripts/wait_for_topology.py [--timeout-seconds N] [--poll-interval-seconds N]`
-  (defaults: 300s timeout, 5s poll interval).
-- Node names, host-published RPC ports, and expected connection counts are hardcoded
-  (see `docker/docker-compose.yml`'s port mappings) -- not configurable per-run, since
-  the 7-node topology itself is wired 1:1 to exactly 3 signers (see the root
-  `README.md`'s variable table).
-- **`CORE_RPC_USER` / `CORE_RPC_PASS` env vars** (defaults `rpcuser` / `rpcpassword`)
-  -- match the workflow's existing job-level env vars of the same names.
-- A node that isn't reachable yet (connection refused -- still starting) is treated
-  the same as a wrong connection count: "not converged yet", not a hard failure,
-  until the timeout is hit.
-- **On timeout**: logs every still-mismatched node's actual vs. expected state, then
-  exits 1.
-- Note: `docker/docker-compose.yml` doesn't yet have the compose-level healthcheck +
-  `depends_on: condition: service_healthy` guidance from the same plan doc step --
-  this script is a CI-level equivalent (arguably stronger, since it confirms real P2P
-  peer counts rather than just RPC reachability), but the compose-file enhancement
-  itself is separate, unstarted work.
-
 ## `scripts/generate_traffic.py`
 
 Drives round-robin TPC + colored-coin traffic across all 7 nodes and confirms every
@@ -298,8 +352,8 @@ assignment, and the balance-shortfall top-up mechanic). Implemented as `TrafficN
 - **Output**: none written to disk -- verification results are logged; a settle-height
   balance mismatch raises `TrafficGenerationError` (non-zero exit) after all rounds run,
   listing every mismatch found, not just the first.
-- Verified end-to-end against a real 7-node stack (`round_count=2`, all three
-  colored-coin types).
+- Verified end-to-end against a real 7-node stack (`round_count=3`, all three
+  colored-coin types, all 7 nodes' TPC -- coinbase-earning ones included).
 - **Requires `fallbackfee` set** (see `render_tapyrus_conf.py` above, which sets
   it) -- without it, every funding/send/issuance call on a brand-new chain fails with
   `-4 Fee estimation failed`. This incident is why `run()` now tracks how many of the
@@ -316,10 +370,13 @@ assignment, and the balance-shortfall top-up mechanic). Implemented as `TrafficN
   signer-set-a bring-up; the per-node lifecycle orchestrator is the one piece still
   genuinely unbuilt (rotation and max-block-size change are both active too, see
   their own sections below).
-- **Known limitation**: `core-1a`/`2a`/`3a`'s TPC balance is intentionally excluded from
-  the settle-height assertion (logged, not asserted) -- they receive ongoing coinbase
-  income whenever they propose a block, at a rate this script can't predict in advance.
-  Their colored balances stay fully asserted.
+- **`core-1a`/`2a`/`3a`'s coinbase income is fully asserted too**, not excluded --
+  observed directly. `_credit_coinbase_for_height` reads each height's real
+  coinbase transaction and credits whichever of the 3 wallets actually has it,
+  for every height since the last one credited (not just the latest observed,
+  so two blocks landing between polls don't leave one uncredited). The reward
+  itself is not a flat amount -- subsidy plus whatever transaction fees that
+  block happened to include, confirmed live.
 
 ## `scripts/simulate_reorg.py`
 
@@ -467,6 +524,10 @@ Implemented as `MaxBlockSizeChangeSimulator`, reusing `simulate_federation_chang
 
 Not a script, but the other piece every scenario run depends on -- the 7-core-node +
 `redis` + 3-signer + `seeder` stack described in `weekly-integration-test-plan.md`
-section 4b. Brought up in two stages (core nodes first, to mint coinbase addresses;
-signers second, once `assemble_signer_configs.py` has consumed those addresses) -- see
-the root `README.md`'s CI step 5.
+section 4b, on a custom subnet (`51.51.51.0/24`, not Docker's own default bridge
+range -- see `doc/work-done.md`'s Lessons learnt for why that's required at all).
+Each core-* node's extra P2P flags come from its own `CORE_<NAME>_ARGS` env var, not
+a fixed `command:` -- `scripts/verify_seeder.py` sets these to bring the 7 nodes up
+in two modes in the same run (addseeder-only, then the fixed `-connect` topology)
+before anything else in the workflow depends on them being stable. Also defines
+`seeder-test-node`, a throwaway 8th node brought up only by that same script.
