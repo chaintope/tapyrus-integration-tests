@@ -30,9 +30,8 @@ Usage:
 
 Requires the 7-node topology and signer-set-a already up and converged (same
 precondition as scripts/generate_traffic.py). Reads
-CHAIN_HEIGHT_BEFORE_REORG / REORG_LENGTH / CORE_RPC_USER / CORE_RPC_PASS /
-ROUND_DURATION from the environment -- the same job-level env vars the workflow
-already sets for the other steps.
+CHAIN_HEIGHT_BEFORE_REORG / REORG_LENGTH / ROUND_DURATION from the environment --
+the same job-level env vars the workflow already sets for the other steps.
 
 CHAIN_HEIGHT_BEFORE_REORG is a floor to wait for, not an assumed starting point (and
 in the workflow, it's always TX_ROUND_COUNT + 2, not an independent value -- see the
@@ -154,9 +153,7 @@ class ReorgError(Exception):
 
 
 class ReorgSimulator:
-    def __init__(self, rpc_user, rpc_pass, baseline_height, reorg_length, round_duration):
-        self._rpc_user = rpc_user
-        self._rpc_pass = rpc_pass
+    def __init__(self, baseline_height, reorg_length, round_duration):
         self._baseline_height = baseline_height
         self._reorg_length = reorg_length
         self._round_duration = round_duration
@@ -434,7 +431,7 @@ class ReorgSimulator:
 
         assembler = SignerConfigAssembler(
             set_dir, SIGNER_THRESHOLD, aggpubkey,
-            CoreRpc(CORE_RPC_PORT, self._rpc_user, self._rpc_pass),
+            CoreRpc(CORE_RPC_PORT),
             Redis(REDIS_HOST, REDIS_PORT),
             self._round_duration,
         )
@@ -539,8 +536,6 @@ class ReorgSimulator:
 
 
 async def main():
-    rpc_user = os.environ.get("CORE_RPC_USER", "rpcuser")
-    rpc_pass = os.environ.get("CORE_RPC_PASS", "rpcpassword")
     baseline_height = int(os.environ.get("CHAIN_HEIGHT_BEFORE_REORG", "30"))
     reorg_length = int(os.environ.get("REORG_LENGTH", "10"))
     round_duration = os.environ.get("ROUND_DURATION", "60")
@@ -549,7 +544,7 @@ async def main():
         f"simulating a reorg: baseline height {baseline_height}, group B then group A each build "
         f"{reorg_length} block(s) alone, then group B is extended by 2 more"
     )
-    simulator = ReorgSimulator(rpc_user, rpc_pass, baseline_height, reorg_length, round_duration)
+    simulator = ReorgSimulator(baseline_height, reorg_length, round_duration)
     await simulator.run()
 
 
