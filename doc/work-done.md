@@ -25,13 +25,10 @@ does.
   `FUNDING_AMOUNT_TPC`/`TOKEN_ISSUE_AMOUNT`/etc. work fine at small round counts, but
   a larger round count would trigger the balance-shortfall top-up mechanic much more
   often, and that hasn't been checked.
-- **A signer's RPC credential can go stale if its own core node (core-1a/2a/3a)
-  ever restarts.** `assemble_signer_configs.py` bakes that node's cookie-derived
-  `rpc-endpoint-user`/`rpc-endpoint-pass` into `tapyrus-signer.toml` once, at
-  config-assembly time -- `tapyrus-signerd` never re-reads it. core-1a/2a/3a are
-  never deliberately chaos-restarted, but a real crash-recovery restart would
-  regenerate their cookie and silently break that signer's connection until it's
-  manually restarted. No auto-mitigation yet.
+- **This branch's signer cookie-auth wiring depends on an unmerged `tapyrus-signer`
+  change** (`rpc-endpoint-cookiefile` support, a separate branch in that repo) --
+  `assemble_signer_configs.py` writes that TOML field unconditionally, so a
+  `tapyrus-signer` build without it won't start.
 
 ## Design decisions
 
@@ -69,9 +66,12 @@ does.
   reads it fresh on every RPC call rather than caching credentials at construction
   time -- a chaos-restarted node's cookie changes every 30-180s
   (`MIN/MAX_ACTION_INTERVAL_SECONDS`, `node_orchestrator.py`) throughout a run.
-  `assemble_signer_configs.py` resolves each signer's own RPC target's cookie the
-  same way, once, at config-assembly time (see the signer-staleness known issue
-  above for the one limitation this introduces).
+  `assemble_signer_configs.py` points each signer at its own RPC target's cookie
+  file directly (`rpc-endpoint-cookiefile` in `tapyrus-signer.toml`, `/cookies` bind
+  mounted into every signer service too) rather than resolving and baking a value
+  in -- `tapyrus-signer` reads it fresh on every RPC call for the same reason
+  `CoreRpcClient` does, so a signer's own core-RPC-target restarting (chaos or a
+  genuine crash-recovery) doesn't require restarting the signer either.
 - **`generate_traffic.py` needs `fallbackfee` enabled.** `-fallbackfee` defaults to
   disabled (a mainnet-safety default, not a bug), so `estimatesmartfee` fails with no
   fee history on a new chain. `render_tapyrus_conf.py` sets `fallbackfee=0.0002`,

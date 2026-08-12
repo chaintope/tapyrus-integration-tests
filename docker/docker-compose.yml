@@ -210,10 +210,16 @@ services:
       - '12387:12381'
 
   # --- signer-set-a: RPC target is each signer's first-layer node ----------
+  # Every signer service also mounts ../runtime/rpc-cookies:/cookies -- the same
+  # shared mount every core-* node writes its own cookie into (see "RPC AUTH" above)
+  # -- so tapyrus-signerd can read its own RPC target's cookie file directly
+  # (rpc-endpoint-cookiefile in tapyrus-signer.toml, assemble_signer_configs.py).
+  # See doc/work-done.md.
   signer-0:
     image: tapyrus-signer:integration-test
     volumes:
       - ../runtime/signers/node-0:/etc/tapyrus
+      - ../runtime/rpc-cookies:/cookies
     depends_on:
       - redis
       - core-1a
@@ -222,6 +228,7 @@ services:
     image: tapyrus-signer:integration-test
     volumes:
       - ../runtime/signers/node-1:/etc/tapyrus
+      - ../runtime/rpc-cookies:/cookies
     depends_on:
       - redis
       - core-2a
@@ -230,6 +237,7 @@ services:
     image: tapyrus-signer:integration-test
     volumes:
       - ../runtime/signers/node-2:/etc/tapyrus
+      - ../runtime/rpc-cookies:/cookies
     depends_on:
       - redis
       - core-3a
@@ -258,6 +266,7 @@ services:
     image: tapyrus-signer:integration-test
     volumes:
       - ../runtime/signers-b/node-1:/etc/tapyrus
+      - ../runtime/rpc-cookies:/cookies
     depends_on:
       - redis
       - core-2a
@@ -266,6 +275,7 @@ services:
     image: tapyrus-signer:integration-test
     volumes:
       - ../runtime/signers-b/node-2:/etc/tapyrus
+      - ../runtime/rpc-cookies:/cookies
     depends_on:
       - redis
       - core-3a

@@ -385,10 +385,11 @@ file reads/writes, no subprocess or network I/O to run concurrently.
 - `<core-rpc-hosts-file>`: one RPC host (container DNS name) per line, N lines -- each
   signer targets its **own** first-layer core node in the 7-node topology
   (`signer-0 -> core-1a`, `signer-1 -> core-2a`, `signer-2 -> core-3a`), not one shared
-  host. Port is shared across all core nodes; the RPC credential is not -- each
-  node's own cookie file is resolved per host (`scripts.lib.rpc.cookie_path`/
-  `read_cookie`), since cookie auth means every core node has its own distinct
-  credential. See `work-done.md`.
+  host. Port is shared across all core nodes; the RPC credential is not -- the
+  generated `tapyrus-signer.toml` points `rpc-endpoint-cookiefile` at that host's own
+  `/cookies/<host>.cookie` (the same shared mount every core-* node writes its
+  cookie into, also bind-mounted into every signer service) rather than resolving
+  and baking a value in. See `work-done.md`.
 - `<addresses-file>`: one coinbase payout address per line, N lines -- fetch real ones
   from each signer's first-layer node's wallet (`getnewaddress` RPC); doesn't need to
   correspond to the signer's own key.

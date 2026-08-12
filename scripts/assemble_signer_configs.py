@@ -11,9 +11,10 @@ Usage:
 lines -- each signer gets its OWN core node as RPC target, per the 7-core-node
 topology in doc/weekly-integration-test-plan.md section 4b (signer-0 -> core-1a,
 signer-1 -> core-2a, signer-2 -> core-3a), not one shared host. Port is shared across
-all core nodes; the RPC credential is not -- each node's own cookie file
-(scripts.lib.rpc.cookie_path/read_cookie) is resolved per host, since cookie auth
-means every core node has its own distinct credential. See doc/work-done.md.
+all core nodes; the RPC credential is not -- each generated tapyrus-signer.toml
+points at that host's own cookie file (rpc-endpoint-cookiefile) instead, since
+cookie auth means every core node has its own distinct credential and
+tapyrus-signerd reads it directly. See doc/work-done.md.
 
 <addresses-file>: one coinbase payout address per line, N lines -- fetch real ones
 from each signer's first-layer node's wallet (getnewaddress RPC); doesn't need to
@@ -40,7 +41,6 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.lib.ceremony import CeremonyError, extract_vss_for  # noqa: E402
 from scripts.lib.log import log  # noqa: E402
-from scripts.lib.rpc import cookie_path, read_cookie  # noqa: E402
 
 DEFAULT_ROUND_DURATION = "10"
 DEFAULT_ROUND_LIMIT = "15"
@@ -100,10 +100,13 @@ class SignerConfigAssembler:
         )
 
     def _signer_toml(self, pubkey, address, core_rpc_host):
-        # Cookie auth means every core node has its own distinct credential, unlike
-        # the old shared static password -- resolved here, per this signer's own
-        # RPC target, not from self._core_rpc (port only now). See doc/work-done.md.
-        rpc_user, rpc_password = read_cookie(cookie_path(core_rpc_host))
+        # tapyrus-signerd reads this cookie file itself (rpc-endpoint-cookiefile,
+        # this branch's own cookie-auth support) rather than a value resolved and
+        # baked in here -- /cookies is the same shared mount every core-* node
+        # writes its own cookie into (docker-compose.yml's signer services), read
+        # fresh on every RPC call, so a cookie that changes mid-run (e.g. this
+        # signer's core node restarting) doesn't require restarting the signer
+        # too. See doc/work-done.md.
         return (
             "[general]\n"
             f"round-duration = {self._round_duration}\n"
@@ -120,8 +123,7 @@ class SignerConfigAssembler:
             "[rpc]\n"
             f'rpc-endpoint-host = "{core_rpc_host}"\n'
             f"rpc-endpoint-port = {self._core_rpc.port}\n"
-            f'rpc-endpoint-user = "{rpc_user}"\n'
-            f'rpc-endpoint-pass = "{rpc_password}"\n'
+            f'rpc-endpoint-cookiefile = "/cookies/{core_rpc_host}.cookie"\n'
             "\n"
             "[redis]\n"
             f'redis-host = "{self._redis.host}"\n'
