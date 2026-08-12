@@ -92,10 +92,20 @@ does.
   time GitHub moves it or start failing builds for no real reason (and
   wouldn't have caught the cookie-permission bug above anyway, which came from
   local macOS Docker Desktop behavior silently not matching Linux, not from a
-  runner version bump). So it just captures OS/kernel, Docker, and Python
-  versions into the step log and an `environment-fingerprint` artifact on every
-  run -- visible for whenever a run's behavior needs explaining against what
-  actually executed, without any comparison logic to maintain.
+  runner version bump). So it just captures the runner image identity
+  (`ImageOS`/`ImageVersion` -- the exact `actions/runner-images` release, since
+  GitHub's own published software manifest is keyed by that, not by the
+  `ubuntu-latest` label itself), OS/kernel, Docker, Python, and Rust versions
+  into the step log and an `environment-fingerprint` artifact on every run --
+  no dump of every installed package (hundreds of them irrelevant to this repo,
+  e.g. dotnet/ruby/php), just the toolchains this repo's own build actually
+  depends on. Rust is captured deliberately, not redundantly with Python's
+  explicit `setup-python` pin: `cargo build --release` (building `tapyrus-setup`
+  for the offline ceremony) runs directly on this runner against whatever
+  toolchain it happens to preinstall, unlike the containerized
+  `tapyrus-signer:integration-test` image, which pins `rust:1.82-bookworm` in
+  its own Dockerfile -- genuinely unpinned, unlike everything else this step
+  reports.
 - **`generate_traffic.py` needs `fallbackfee` enabled.** `-fallbackfee` defaults to
   disabled (a mainnet-safety default, not a bug), so `estimatesmartfee` fails with no
   fee history on a new chain. `render_tapyrus_conf.py` sets `fallbackfee=0.0002`,

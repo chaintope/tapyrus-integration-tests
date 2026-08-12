@@ -98,6 +98,8 @@ jobs:
         # and as a downloadable artifact -- see doc/work-done.md.
         run: |
           {
+            echo "## Runner image"
+            echo "ImageOS=$ImageOS ImageVersion=$ImageVersion"
             echo "## OS"
             cat /etc/os-release
             uname -a
@@ -108,6 +110,14 @@ jobs:
             echo
             echo "## Python"
             python3 --version
+            echo
+            echo "## Rust"
+            # Unlike the containerized tapyrus-signer image (pins rust:1.82-bookworm in
+            # its own Dockerfile), tapyrus-setup's build (below) runs cargo build
+            # --release directly on this runner, against whatever toolchain ubuntu-latest
+            # happens to preinstall -- unpinned, so worth recording explicitly.
+            rustc --version
+            cargo --version
           } | tee environment.txt
 
       - name: Upload runner environment fingerprint
