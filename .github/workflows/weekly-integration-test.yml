@@ -68,8 +68,6 @@ env:
   PRNG_SEED_BASE: ${{ github.run_id }}
   NETWORK_ID: ${{ inputs.network_id || '1905960821' }}
   CORE_RPC_PORT: '12381'
-  CORE_RPC_USER: 'rpcuser'
-  CORE_RPC_PASS: 'rpcpassword'
   # Re-sized against the block-production math in doc/work-done.md's "CI timing
   # budget" note -- see there for the reasoning behind these values.
   TX_ROUND_COUNT: ${{ inputs.tx_round_count || ((github.event_name == 'pull_request' || github.event_name == 'push') && '10' || '60') }}
@@ -155,7 +153,7 @@ jobs:
       - name: Assemble signer configs
         run: |
           ROUND_DURATION="$ROUND_DURATION" ./scripts/assemble_signer_configs.py signer-set-a 2 \
-            /tmp/core-rpc-hosts.txt "$CORE_RPC_PORT" "$CORE_RPC_USER" "$CORE_RPC_PASS" redis 6379 /tmp/addrs.txt
+            /tmp/core-rpc-hosts.txt "$CORE_RPC_PORT" redis 6379 /tmp/addrs.txt
       - name: Bring up signers
         # --no-deps: signer-0/1/2 each depends_on a core-1a/2a/3a node
         # (docker/docker-compose.yml) -- without it, `up` also reconciles those
