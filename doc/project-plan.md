@@ -156,9 +156,16 @@ Each of these corresponds to a step in `.github/workflows/weekly-integration-tes
   every core-* node (plus `seeder-test-node`) writes it to a shared
   `runtime/rpc-cookies/` mount (`scripts.lib.rpc.cookie_path`/`read_cookie`), read
   fresh on every RPC call, not cached, since a chaos-restarted node's cookie
-  changes on every restart. Signer configs resolve their own RPC target's cookie
-  once at assembly time (`assemble_signer_configs.py`). See `work-done.md` for the
-  mutual-exclusivity/regeneration facts and the known signer-staleness limitation.
+  changes on every restart. Signer configs point each signer directly at its own
+  RPC target's cookie file (`rpc-endpoint-cookiefile`, `assemble_signer_configs.py`)
+  rather than resolving and baking in a value, closing the earlier
+  resolve-once-at-assembly-time staleness gap -- `tapyrus-signer` itself now reads
+  it fresh on every RPC call too. `entrypoint_wrapper.sh` re-`chmod`s each cookie
+  file to 644 in a background loop, since tapyrus-core always writes it `0600` and
+  every core-* container runs as root -- confirmed live on GitHub Actions that
+  without this, the CI host's own (non-root) reads get `PermissionError`. Still
+  blocked on the corresponding `tapyrus-signer` change (`rpc-endpoint-cookiefile`
+  support) merging upstream -- see `work-done.md`'s Known issues.
 
 ## Outstanding work
 
