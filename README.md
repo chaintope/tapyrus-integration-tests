@@ -166,10 +166,11 @@ could silently drift apart.
 
 Not configurable per-run at all (hardcoded): `max_block_size_new` (`2000000`, the new
 value `scripts/simulate_maxblocksize_change.py` pushes -- no per-run override yet),
-the RPC port/user/pass (`12381` / `rpcuser` / `rpcpassword`), the signer count (3) /
-threshold (2) -- the 7-node topology in `docker/docker-compose.yml` is wired 1:1 to
-exactly 3 signers, so changing the count means redesigning the topology, not just
-passing a different number -- and
+the RPC port (`12381`; RPC auth is a per-process cookie file, not a configurable
+credential -- see `doc/work-done.md`), the signer count (3) / threshold (2) -- the
+7-node topology in `docker/docker-compose.yml` is wired 1:1 to exactly 3 signers, so
+changing the count means redesigning the topology, not just passing a different
+number -- and
 `prng_seed_base` (always `github.run_id`): `doc/weekly-integration-test-plan.md`
 requires the PRNG be seeded deterministically per run so a failure is reproducible,
 so this is deliberately never a per-run override, not just an as-yet-unwired one.

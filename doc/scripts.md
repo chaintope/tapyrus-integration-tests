@@ -172,9 +172,9 @@ just string formatting and a file write, nothing to overlap.
 
 - **Usage**: `./scripts/render_tapyrus_conf.py [output-file]` (default:
   `docker/generated/tapyrus.conf`).
-- **Reads env vars**: `NETWORK_ID` (default `1905960821`), `CORE_RPC_USER`/
-  `CORE_RPC_PASS` (defaults `rpcuser`/`rpcpassword`) -- same job-level env vars the
-  other steps already use.
+- **Reads env vars**: `NETWORK_ID` (default `1905960821`) -- same job-level env var
+  the other steps already use. No `rpcuser`/`rpcpassword` here -- RPC auth is
+  tapyrus-core's own auto-generated cookie file instead, see `work-done.md`.
 - **Why this exists**: `tapyrus/tapyrusd`'s own `entrypoint.sh` only auto-generates a
   conf if none is mounted at `${CONF_DIR}/tapyrus.conf`, and the auto-generated one
   hardcodes `dev=1`/`[dev]`/`networkid=1905960821` -- so without this script,
@@ -210,12 +210,11 @@ in sequence, and verifies both end-to-end. Implemented as `SeederVerifier`. See
 needed a custom Docker subnet, a reduced crawler thread count, and this two-phase
 design rather than a single `dig` call.
 
-- **Usage**: `./scripts/verify_seeder.py` (no arguments -- reads `CORE_RPC_USER` /
-  `CORE_RPC_PASS` from the environment). Takes over bringing the 7 core-* nodes up
-  entirely -- run it in place of a separate "bring up the 7 core nodes" step, before
-  anything that depends on the fixed topology being stable (`wait_for_topology.py`,
-  traffic generation, reorg, etc.), since it tears the nodes down and recreates them
-  partway through.
+- **Usage**: `./scripts/verify_seeder.py` (no arguments). Takes over bringing the 7
+  core-* nodes up entirely -- run it in place of a separate "bring up the 7 core
+  nodes" step, before anything that depends on the fixed topology being stable
+  (`wait_for_topology.py`, traffic generation, reorg, etc.), since it tears the
+  nodes down and recreates them partway through.
 - **Phase 1 -- addseeder mode, verifies organic peer discovery**: all 7 core-*
   nodes come up with only `-addseeder=<seed-hostname>`, no `-connect` at all. Waits
   for the seeder's own `-s`-driven crawl to converge (independent of the core nodes'
@@ -338,8 +337,6 @@ doesn't delay checking the other 6.
   (see `docker/docker-compose.yml`'s port mappings) -- not configurable per-run, since
   the 7-node topology itself is wired 1:1 to exactly 3 signers (see the root
   `README.md`'s variable table).
-- **`CORE_RPC_USER` / `CORE_RPC_PASS` env vars** (defaults `rpcuser` / `rpcpassword`)
-  -- match the workflow's existing job-level env vars of the same names.
 - A node that isn't reachable yet (connection refused -- still starting) is treated
   the same as a wrong connection count: "not converged yet", not a hard failure,
   until the timeout is hit.
@@ -362,8 +359,8 @@ output file.
 - **Usage**: `./scripts/collect_coinbase_addresses.py <port> [<port> ...] [--output FILE] [--timeout-seconds N] [--poll-interval-seconds N]`
   (defaults: `./runtime/addrs.txt`, 120s per-node timeout, 3s poll interval).
 - Ports run **concurrently** (`asyncio.gather`), same convention as the rest of
-  `scripts/`. **`CORE_RPC_USER` / `CORE_RPC_PASS` env vars** match the workflow's
-  existing job-level env vars.
+  `scripts/`. Each port is mapped to its node name internally (`PORT_TO_NAME`) to
+  resolve that node's own cookie file -- the CLI itself only takes ports.
 - **Output**: one address per line, in the same order as the ports given.
 
 ## `scripts/assemble_signer_configs.py`
@@ -380,8 +377,7 @@ file reads/writes, no subprocess or network I/O to run concurrently.
 
   ```sh
   ./scripts/assemble_signer_configs.py <set-name> <threshold> <core-rpc-hosts-file> \
-    <core-rpc-port> <core-rpc-user> <core-rpc-pass> <redis-host> <redis-port> \
-    <addresses-file> [output-dir]
+    <core-rpc-port> <redis-host> <redis-port> <addresses-file> [output-dir]
   ```
 
 - `<threshold>` is parsed as `int` (argparse `type=int`) -- a non-numeric value fails
@@ -389,7 +385,10 @@ file reads/writes, no subprocess or network I/O to run concurrently.
 - `<core-rpc-hosts-file>`: one RPC host (container DNS name) per line, N lines -- each
   signer targets its **own** first-layer core node in the 7-node topology
   (`signer-0 -> core-1a`, `signer-1 -> core-2a`, `signer-2 -> core-3a`), not one shared
-  host. Port/user/pass are shared across all core nodes.
+  host. Port is shared across all core nodes; the RPC credential is not -- each
+  node's own cookie file is resolved per host (`scripts.lib.rpc.cookie_path`/
+  `read_cookie`), since cookie auth means every core node has its own distinct
+  credential. See `work-done.md`.
 - `<addresses-file>`: one coinbase payout address per line, N lines -- fetch real ones
   from each signer's first-layer node's wallet (`getnewaddress` RPC); doesn't need to
   correspond to the signer's own key.
@@ -489,9 +488,8 @@ that the height advanced. Implemented as `ReorgSimulator`, following
 via `scripts/lib/compose.py`'s shared helpers.
 
 - **Usage**: `./scripts/simulate_reorg.py` (no arguments -- reads
-  `CHAIN_HEIGHT_BEFORE_REORG` / `REORG_LENGTH` / `CORE_RPC_USER` / `CORE_RPC_PASS` /
-  `ROUND_DURATION` from the environment, same job-level env vars the workflow already
-  sets).
+  `CHAIN_HEIGHT_BEFORE_REORG` / `REORG_LENGTH` / `ROUND_DURATION` from the
+  environment, same job-level env vars the workflow already sets).
 - Requires the 7-node topology and signer-set-a already up and converged (same
   precondition as `generate_traffic.py`, which this step runs right after in the
   workflow).
@@ -586,8 +584,7 @@ docstring for the full design (xfield encoding, `federations.toml` membership ru
 the shared node-0 identity, live-reload mechanics, the shared-redis open question).
 
 - **Usage**: `./scripts/simulate_federation_change.py` (no arguments -- reads
-  `CORE_RPC_USER` / `CORE_RPC_PASS` / `ROUND_DURATION` / `FEDERATION_CHANGE_HEIGHT`
-  from the environment).
+  `ROUND_DURATION` / `FEDERATION_CHANGE_HEIGHT` from the environment).
 - Requires signer-set-a already generated and signing (same precondition as
   `simulate_reorg.py`).
 - **signer-0/1/2 are never stopped or restarted** -- their `federations.toml` is
@@ -614,8 +611,8 @@ Implemented as `MaxBlockSizeChangeSimulator`, reusing `simulate_federation_chang
 `XFieldSignoffCeremony` directly (it's generic over which xfield gets signed).
 
 - **Usage**: `./scripts/simulate_maxblocksize_change.py` (no arguments -- reads
-  `CORE_RPC_USER` / `CORE_RPC_PASS` / `ROUND_DURATION` / `MAX_BLOCK_SIZE_HEIGHT` /
-  `MAX_BLOCK_SIZE_NEW` from the environment).
+  `ROUND_DURATION` / `MAX_BLOCK_SIZE_HEIGHT` / `MAX_BLOCK_SIZE_NEW` from the
+  environment).
 - **Requires signer-set-b already active** -- `simulate_federation_change.py`'s
   rotation must have already been confirmed; this step signs off using signer-set-b's
   own key material, not signer-set-a's.

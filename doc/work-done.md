@@ -25,6 +25,13 @@ does.
   `FUNDING_AMOUNT_TPC`/`TOKEN_ISSUE_AMOUNT`/etc. work fine at small round counts, but
   a larger round count would trigger the balance-shortfall top-up mechanic much more
   often, and that hasn't been checked.
+- **A signer's RPC credential can go stale if its own core node (core-1a/2a/3a)
+  ever restarts.** `assemble_signer_configs.py` bakes that node's cookie-derived
+  `rpc-endpoint-user`/`rpc-endpoint-pass` into `tapyrus-signer.toml` once, at
+  config-assembly time -- `tapyrus-signerd` never re-reads it. core-1a/2a/3a are
+  never deliberately chaos-restarted, but a real crash-recovery restart would
+  regenerate their cookie and silently break that signer's connection until it's
+  manually restarted. No auto-mitigation yet.
 
 ## Design decisions
 
@@ -50,6 +57,21 @@ does.
   <service-name>` has no explicit port, and `tapyrus-core` resolves it against the
   chain's own default P2P port (`2357` in prod mode), not the conf's `port=`.
   `render_tapyrus_conf.py` omits `port=` so every node matches.
+- **RPC auth is tapyrus-core's own auto-generated cookie file, not a static
+  password.** Setting `rpcuser`/`rpcpassword` disables cookie generation entirely
+  (`InitRPCAuthentication`, `httprpc.cpp`) -- the two are mutually exclusive, so
+  `render_tapyrus_conf.py` sets neither. `entrypoint_wrapper.sh` passes
+  `-rpccookiefile=/cookies/$NODE_NAME.cookie`, where `/cookies` is
+  `runtime/rpc-cookies/` bind-mounted into every core-* container (and the host),
+  so any container -- or a host-side script -- can read any node's cookie, not just
+  its own. The cookie is regenerated with a fresh random value on every single
+  process startup, with no persistence option, so `scripts.lib.rpc.CoreRpcClient`
+  reads it fresh on every RPC call rather than caching credentials at construction
+  time -- a chaos-restarted node's cookie changes every 30-180s
+  (`MIN/MAX_ACTION_INTERVAL_SECONDS`, `node_orchestrator.py`) throughout a run.
+  `assemble_signer_configs.py` resolves each signer's own RPC target's cookie the
+  same way, once, at config-assembly time (see the signer-staleness known issue
+  above for the one limitation this introduces).
 - **`generate_traffic.py` needs `fallbackfee` enabled.** `-fallbackfee` defaults to
   disabled (a mainnet-safety default, not a bug), so `estimatesmartfee` fails with no
   fee history on a new chain. `render_tapyrus_conf.py` sets `fallbackfee=0.0002`,
