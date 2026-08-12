@@ -85,6 +85,17 @@ does.
   enough since a chaos restart regenerates the file from scratch at the same
   mode; the loop re-applies it on every regeneration instead of trying to catch
   the exact moment each one happens.
+- **The workflow's "Record runner environment" step reports, not enforces.**
+  `runs-on: ubuntu-latest` is a floating tag -- GitHub repoints it to a new
+  image periodically, with its own default Docker/kernel/package versions, no
+  pin in this repo's control. A hard baseline diff would need updating every
+  time GitHub moves it or start failing builds for no real reason (and
+  wouldn't have caught the cookie-permission bug above anyway, which came from
+  local macOS Docker Desktop behavior silently not matching Linux, not from a
+  runner version bump). So it just captures OS/kernel, Docker, and Python
+  versions into the step log and an `environment-fingerprint` artifact on every
+  run -- visible for whenever a run's behavior needs explaining against what
+  actually executed, without any comparison logic to maintain.
 - **`generate_traffic.py` needs `fallbackfee` enabled.** `-fallbackfee` defaults to
   disabled (a mainnet-safety default, not a bug), so `estimatesmartfee` fails with no
   fee history on a new chain. `render_tapyrus_conf.py` sets `fallbackfee=0.0002`,

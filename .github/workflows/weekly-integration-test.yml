@@ -89,6 +89,33 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Record runner environment
+        # Report only, no enforcement -- runs-on: ubuntu-latest is a floating tag
+        # GitHub repoints to a new image periodically, with its own default Docker/
+        # kernel/package versions, so a hard pinned-baseline diff would need updating
+        # every time GitHub moves it or it starts failing builds for no real reason.
+        # This just makes what actually ran on a given run visible, in the step log
+        # and as a downloadable artifact -- see doc/work-done.md.
+        run: |
+          {
+            echo "## OS"
+            cat /etc/os-release
+            uname -a
+            echo
+            echo "## Docker"
+            docker version
+            docker compose version
+            echo
+            echo "## Python"
+            python3 --version
+          } | tee environment.txt
+
+      - name: Upload runner environment fingerprint
+        uses: actions/upload-artifact@v4
+        with:
+          name: environment-fingerprint
+          path: environment.txt
+
       - name: Derive CHAIN_HEIGHT_BEFORE_REORG from TX_ROUND_COUNT
         # env: expressions have no arithmetic -- ties the reorg baseline to TX_ROUND_COUNT.
         run: echo "CHAIN_HEIGHT_BEFORE_REORG=$((TX_ROUND_COUNT + 2))" >> "$GITHUB_ENV"
