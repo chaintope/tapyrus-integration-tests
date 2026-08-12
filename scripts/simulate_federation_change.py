@@ -340,7 +340,7 @@ class FederationChangeSimulator:
         self._rpc_pass = rpc_pass
         self._round_duration = round_duration
         self._height_offset = height_offset
-        self._clients = {name: CoreRpcClient(RPC_HOST, port, rpc_user, rpc_pass) for name, port in ALL_NODES}
+        self._clients = {name: CoreRpcClient(RPC_HOST, port, name) for name, port in ALL_NODES}
         self._tapyrus_setup_bin = default_tapyrus_setup_bin()
         self._pubkeys_a = self._read_pubkeys(SIGNER_SET_A)
         self._aggpubkey_a = self._read_aggpubkey(SIGNER_SET_A)

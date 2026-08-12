@@ -17,8 +17,7 @@ Usage:
 
 Requires redis and the 7 core-* nodes already up in connect mode (verify_seeder.py's
 own phase 2 precondition) -- this script's teardown+recreate only touches the core-*
-nodes, not redis. Reads CORE_RPC_USER / CORE_RPC_PASS from the environment, same
-job-level env vars the workflow already sets.
+nodes, not redis.
 """
 import asyncio
 import os
@@ -58,9 +57,6 @@ async def _wait_for_rpc_ready(client, node_name):
 
 
 async def main():
-    rpc_user = os.environ.get("CORE_RPC_USER", "rpcuser")
-    rpc_pass = os.environ.get("CORE_RPC_PASS", "rpcpassword")
-
     log.step("switching the 7 core-* nodes to connect + orchestrator mode")
     # Full teardown + recreate, not just a restart: NODE_ORCHESTRATOR/
     # NODE_ORCHESTRATOR_FLAVOR only take effect at container creation (compose
@@ -79,7 +75,7 @@ async def main():
     await bring_up(*CORE_NODES)
 
     log.step("waiting for all 7 nodes' RPC to come back up under the orchestrator")
-    clients = {name: CoreRpcClient(RPC_HOST, CORE_RPC_PORTS[name], rpc_user, rpc_pass) for name in CORE_NODES}
+    clients = {name: CoreRpcClient(RPC_HOST, CORE_RPC_PORTS[name], name) for name in CORE_NODES}
     await asyncio.gather(*(_wait_for_rpc_ready(client, name) for name, client in clients.items()))
     _persist_env_for_rest_of_job()
     log.info("done. all 7 core-* nodes are now running under scripts/container/node_orchestrator.py")

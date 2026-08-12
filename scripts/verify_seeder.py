@@ -28,8 +28,6 @@ Requires only redis already up (`docker compose up -d redis`) -- this script bri
 the 7 core-* nodes up itself, in both modes above, tearing down and recreating them
 between the two. Run it before wait_for_topology.py and anything else that depends
 on the fixed topology being stable (traffic generation, reorg, etc.), not after.
-Reads CORE_RPC_USER / CORE_RPC_PASS from the environment, same job-level env vars
-the workflow already sets.
 """
 import asyncio
 import os
@@ -147,10 +145,6 @@ def _args_env_var(node_name):
 
 
 class SeederVerifier:
-    def __init__(self, rpc_user, rpc_pass):
-        self._rpc_user = rpc_user
-        self._rpc_pass = rpc_pass
-
     async def run(self):
         # Every core-* service bind-mounts ../runtime/orchestrator-control -- if
         # runtime/ doesn't exist yet when the first `docker compose up` below creates
@@ -265,7 +259,7 @@ class SeederVerifier:
 
     async def _verify_peer_discovery(self):
         log.step("polling all 7 nodes until each has a real peer (not just the seeder's own probe)")
-        clients = {n: CoreRpcClient(RPC_HOST, CORE_RPC_PORTS[n], self._rpc_user, self._rpc_pass) for n in CORE_NODES}
+        clients = {n: CoreRpcClient(RPC_HOST, CORE_RPC_PORTS[n], n) for n in CORE_NODES}
 
         discovered = set()
         deadline = time.monotonic() + PEER_DISCOVERY_TIMEOUT_SECONDS
@@ -354,7 +348,7 @@ class SeederVerifier:
         log.step(f"bringing up seeder-test-node (no -connect, -addseeder only) via seeder at {seeder_ip}")
         await bring_up("seeder-test-node")
 
-        client = CoreRpcClient(RPC_HOST, SEEDER_TEST_NODE_RPC_PORT, self._rpc_user, self._rpc_pass)
+        client = CoreRpcClient(RPC_HOST, SEEDER_TEST_NODE_RPC_PORT, "seeder-test-node")
         await self._wait_for_rpc_ready(client)
 
         log.step("waiting for seeder-test-node's own getpeerinfo to show a peer discovered via the seeder")
@@ -379,7 +373,7 @@ class SeederVerifier:
             await asyncio.sleep(DIG_POLL_INTERVAL_SECONDS)
 
     async def _wait_for_all_rpc_ready(self, nodes):
-        clients = [CoreRpcClient(RPC_HOST, CORE_RPC_PORTS[n], self._rpc_user, self._rpc_pass) for n in nodes]
+        clients = [CoreRpcClient(RPC_HOST, CORE_RPC_PORTS[n], n) for n in nodes]
         await asyncio.gather(*(self._wait_for_rpc_ready(c) for c in clients))
 
     async def _wait_for_rpc_ready(self, client):
@@ -396,11 +390,9 @@ class SeederVerifier:
 
 async def main():
     _require_dig()
-    rpc_user = os.environ.get("CORE_RPC_USER", "rpcuser")
-    rpc_pass = os.environ.get("CORE_RPC_PASS", "rpcpassword")
 
     log.step("verifying tapyrus-seeder in both bring-up modes: addseeder-driven peer growth, then the fixed connect topology")
-    verifier = SeederVerifier(rpc_user, rpc_pass)
+    verifier = SeederVerifier()
     await verifier.run()
 
 

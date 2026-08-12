@@ -160,7 +160,7 @@ class ReorgSimulator:
         self._baseline_height = baseline_height
         self._reorg_length = reorg_length
         self._round_duration = round_duration
-        self._clients = {name: CoreRpcClient(RPC_HOST, port, rpc_user, rpc_pass) for name, port in NODES}
+        self._clients = {name: CoreRpcClient(RPC_HOST, port, name) for name, port in NODES}
         self._group_a_tip = None
         self._group_b_tip = None
         self._canary_txid = None
@@ -267,7 +267,7 @@ class ReorgSimulator:
     async def _reconnect_group_b(self):
         log.step("reconnecting group B alongside group A")
         await start_nodes(*GROUP_B)
-        waiter = TopologyWaiter(self._rpc_user, self._rpc_pass, CONVERGENCE_TIMEOUT_SECONDS, HEIGHT_POLL_INTERVAL_SECONDS)
+        waiter = TopologyWaiter(CONVERGENCE_TIMEOUT_SECONDS, HEIGHT_POLL_INTERVAL_SECONDS)
         await waiter.run()
 
     async def _confirm_tie_holds(self):
