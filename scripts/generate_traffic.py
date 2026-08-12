@@ -22,25 +22,22 @@ hops from any first-layer node, see docker/docker-compose.yml) never causes a ra
 
 Deferred ledger crediting: a send/issuance whose RPC call succeeds can still be
 dropped from the mempool before it confirms -- e.g. a chaos node's own invalidateblock
-racing the broadcast (confirmed live: two chaos nodes coincidentally invalidated their
-shared tip in the same instant a round's sends were going out, and one of those sends
-never confirmed again). Crediting the ledger the instant broadcast succeeds would
-leave it permanently out of sync with reality in that case. So sends/issuances return
-a PendingChange instead of touching self._ledger directly; _resolve_pending_changes
+racing the broadcast. Crediting the ledger the instant broadcast succeeds would leave
+it permanently out of sync with reality in that case. So sends/issuances return a
+PendingChange instead of touching self._ledger directly; _resolve_pending_changes
 applies it only once every one of its txids has confirmed on-chain, and drops it --
 not counted as a successful round action either -- if it never does. Every call site
-gets two attempts (an initial check, then one more at the next block), not one:
-confirmed live that a single shot isn't always enough even for a perfectly valid
-transaction (setup's funding/issuance calls used to get only one, and a transaction
-that just needed one more block got dropped anyway -- silently corrupting the ledger
-two ways at once, the missed credit itself plus the fee deduction bundled in the
-same PendingChange). Every call site -- setup and the round loop alike -- also
-routes still-pending changes through _give_chaos_senders_grace before the final
-settle check: a change whose sender is one of CHAOS_SENDER_GRACE_NODES gets
-extra attempts beyond the normal two, since that node's own restart can wipe
-its in-memory mempool for a not-yet-confirmed self-broadcast transaction,
-hiding it from gettransaction on that exact node well past the normal window
-even though it already confirmed on the network via another node's mempool copy.
+gets two attempts (an initial check, then one more at the next block), not one, since
+a single shot isn't always enough for a perfectly valid transaction that just needs
+one more block. Every call site -- setup and the round loop alike -- also routes
+still-pending changes through _give_chaos_senders_grace before the final settle check:
+a change whose sender is one of CHAOS_SENDER_GRACE_NODES is resolved via
+_wait_for_sender_sync instead -- that node's own restart can wipe its in-memory
+mempool for a not-yet-confirmed self-broadcast transaction, hiding it from
+gettransaction on that exact node even though it already confirmed on the network via
+another node's mempool copy, so this waits for objective proof the node caught back up
+(its own tip matches the network's, height AND blockhash) before trusting anything it
+reports, then makes one authoritative confirmation check.
 
 Usage:
     ./scripts/generate_traffic.py <round-count>
@@ -107,10 +104,6 @@ RPC_READY_POLL_INTERVAL_SECONDS = 3
 # tens of seconds, so a same-height re-read on retry is expected within a couple
 # attempts, not a sign of a stuck chain.
 HEIGHT_CONSISTENT_READ_MAX_ATTEMPTS = 5
-# A chaos node's own restart downtime (DOWNTIME_MIN/MAX_BLOCKS=2-4 blocks,
-# node_orchestrator.py) can outlast the normal check/settle window on its own --
-# see _give_chaos_senders_grace.
-CHAOS_SENDER_EXTRA_RESOLVE_ATTEMPTS = 3
 
 # (node name, host-published RPC port) -- see docker/docker-compose.yml's port mappings.
 NODES = (
@@ -245,13 +238,8 @@ class TrafficGenerator:
         for _ in range(3):
             await self._next_block_with_coinbase()
         # Same two-attempt check/settle tolerance as the round loop below, not a
-        # single shot -- confirmed live, a single block's grace isn't always enough
-        # even for a transaction that's perfectly fine: caught one setup issuance
-        # that simply needed one more block (33s), dropped anyway, which silently
-        # corrupted the ledger two ways at once (the missed color credit drifted it
-        # negative over subsequent sends, and the fee deduction bundled in the same
-        # PendingChange never applied either, leaving TPC permanently too high
-        # relative to reality). A genuinely failed tx still gets dropped -- just
+        # single shot -- a transaction that's perfectly fine can still need one
+        # more block to confirm. A genuinely failed tx still gets dropped, just
         # after two tries, not one.
         funding_changes = await self._fund_unfunded_nodes()
         check_height = await self._next_block_with_coinbase()
@@ -608,11 +596,8 @@ class TrafficGenerator:
         # max(), not a bare assignment: _current_height() takes min() across all 7
         # nodes, and a chaos node's own invalidateblock can transiently regress its
         # locally-reported height. A bare assignment would let that regression rewind
-        # this backward, making a later call re-credit a height already credited --
-        # confirmed live: two chaos nodes invalidated their shared tip simultaneously,
-        # regressing the min-height read, and the next call double-credited that
-        # height's coinbase reward. max() keeps this monotonic regardless of when a
-        # regression lands.
+        # this backward, making a later call re-credit an already-credited height.
+        # max() keeps this monotonic regardless of when a regression lands.
         self._last_credited_height = max(self._last_credited_height, actual)
         return actual
 
@@ -716,25 +701,58 @@ class TrafficGenerator:
             log.info(f"height {height}: {node_name} {asset}: {actual} (matches ledger)")
 
     async def _give_chaos_senders_grace(self, pending):
-        """A chaos node's own restart can wipe its in-memory mempool, so a
-        not-yet-confirmed transaction it broadcast itself can briefly look unknown
-        to gettransaction on that exact node even though it already confirmed on
-        the network via another node's mempool copy. The normal check/settle
-        window (one retry) doesn't reliably outlast that node's own restart
-        downtime -- so a pending change still unconfirmed after the check height
-        gets up to CHAOS_SENDER_EXTRA_RESOLVE_ATTEMPTS more blocks before the
-        final settle check, but only if its sender is one of
-        CHAOS_SENDER_GRACE_NODES; every other change is untouched and reaches
-        settle on the normal schedule."""
-        for _ in range(CHAOS_SENDER_EXTRA_RESOLVE_ATTEMPTS):
-            chaos_pending = [change for change in pending if change.node.name in CHAOS_SENDER_GRACE_NODES]
-            if not chaos_pending:
-                break
-            non_chaos_pending = [change for change in pending if change.node.name not in CHAOS_SENDER_GRACE_NODES]
-            extra_height = await self._next_block_with_coinbase()
-            chaos_pending = await self._resolve_pending_changes(chaos_pending, extra_height, final=False)
-            pending = non_chaos_pending + chaos_pending
-        return pending
+        """For a change still unconfirmed after the check height whose sender is
+        one of CHAOS_SENDER_GRACE_NODES, waits for that node to actually catch
+        back up with the network (_wait_for_sender_sync: its own tip matches the
+        network's, height AND blockhash, not just height) before trusting
+        anything it reports -- a chaos node's own restart can wipe its
+        in-memory mempool, hiding a not-yet-confirmed self-broadcast
+        transaction from gettransaction on that exact node even though it
+        already confirmed on the network via another node's mempool copy. Once
+        synced, a single confirmation check is authoritative: still unconfirmed
+        at that point is a genuine failure, not a timing artifact, and is
+        dropped and logged the same as any other final drop. Every other
+        change is untouched, returned for the caller's own settle-height
+        resolve on the normal schedule."""
+        chaos_pending = [change for change in pending if change.node.name in CHAOS_SENDER_GRACE_NODES]
+        non_chaos_pending = [change for change in pending if change.node.name not in CHAOS_SENDER_GRACE_NODES]
+        if not chaos_pending:
+            return pending
+        senders = {change.node.name: change.node for change in chaos_pending}
+        await asyncio.gather(*(self._wait_for_sender_sync(node) for node in senders.values()))
+        height = await self._current_height()
+        await self._resolve_pending_changes(chaos_pending, height, final=True)
+        return non_chaos_pending
+
+    async def _wait_for_sender_sync(self, node):
+        """Polls until `node`'s own tip matches the network's reference tip --
+        height AND blockhash at that height, not just height alone (a matching
+        height with a different hash means it's still on a stale/reorged fork,
+        e.g. mid invalidateblock/reconsiderblock). core-1a is the reference:
+        never chaos-restarted (COINBASE_EARNING_NODES), so its view is always
+        trustworthy. Bounded by HEIGHT_POLL_TIMEOUT_SECONDS like every other
+        wait in this script, since a node that never converges at all is a
+        real problem, not something to wait out silently."""
+        reference = self._nodes[0]  # core-1a -- never a chaos node, always trustworthy
+        pause_node_orchestrators()
+        try:
+            deadline = time.monotonic() + HEIGHT_POLL_TIMEOUT_SECONDS
+            while True:
+                ref_height = await self._call_with_retry(reference, "getblockcount")
+                ref_hash = await self._call_with_retry(reference, "getblockhash", [ref_height])
+                node_height = await self._node_height(node)
+                if node_height is not None and node_height >= ref_height:
+                    node_hash = await self._call_with_retry(node, "getblockhash", [ref_height])
+                    if node_hash == ref_hash:
+                        return
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"{node.name}: never converged with the network (height {ref_height}, "
+                        f"hash {ref_hash}) within {HEIGHT_POLL_TIMEOUT_SECONDS}s"
+                    )
+                await asyncio.sleep(HEIGHT_POLL_INTERVAL_SECONDS)
+        finally:
+            resume_node_orchestrators()
 
     async def _resolve_pending_changes(self, pending_changes, height, final, count_success=True):
         """Applies each PendingChange's ledger deltas only once every one of its

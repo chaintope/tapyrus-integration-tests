@@ -324,6 +324,16 @@ does.
   frequent brief pauses queues at `_wait_out_pause()` and fires the instant the
   file disappears, regardless of how spread out its original timer was. Added a
   random 0-15s jitter after a gated release to destagger this.
+- **Setup's funding/issuance `PendingChange`s used to resolve with a single
+  `final=True` check, unlike the round loop's own two-attempt check/settle --
+  traced to a real CI failure where a perfectly valid transaction that just
+  needed one more block got dropped anyway, corrupting the ledger the same
+  two ways as above.** Fixed: setup now gets the same two-attempt pattern.
+  Also hardened `_seed_ledger_with_current_balances`/`_verify_round` to retry
+  (`HEIGHT_CONSISTENT_READ_MAX_ATTEMPTS`) if any node's height moves mid-read,
+  since a block landing mid-read across 7 nodes can mix pre- and post-block
+  state into one supposedly-consistent snapshot, surfacing as a spurious
+  mismatch with no real cause.
 - **A `PendingChange` whose sender is one of `node_orchestrator.py`'s
   `CHAOS_NODES` (`core-1b`/`core-2b`/`core-3b`/`core-7`) can still get wrongly
   dropped even with the two-attempt check/settle tolerance above, if that same
@@ -348,12 +358,18 @@ does.
   first instead of losing it -- no dropped self-broadcast transaction should
   be possible from `core-2b` at all anymore. The other three chaos nodes
   (`core-1b`/`core-3b`/`core-7`) don't have that flag, so they still rely on
-  `_give_chaos_senders_grace`: a still-pending change gets up to
-  `CHAOS_SENDER_EXTRA_RESOLVE_ATTEMPTS` (3) more blocks before the final
-  settle check, but only if its sender is in `CHAOS_SENDER_GRACE_NODES`
-  (`generate_traffic.py`) -- deliberately `CHAOS_NODES` minus `core-2b`, since
-  `core-2b` no longer needs it -- every other change reaches settle on the
-  original schedule, no added wall-clock cost.
+  `_give_chaos_senders_grace`/`_wait_for_sender_sync`: for a still-pending
+  change whose sender is in `CHAOS_SENDER_GRACE_NODES` (`generate_traffic.py`,
+  deliberately `CHAOS_NODES` minus `core-2b`), waits until that node's own tip
+  actually matches the network's -- height AND blockhash at that height
+  against `core-1a` as reference (never chaos-restarted, always trustworthy),
+  not just height alone, since a matching height with a different hash still
+  means a stale or mid-reorg fork. No fixed attempt cap, only
+  `HEIGHT_POLL_TIMEOUT_SECONDS` as a genuine-stuck-node backstop. Once synced,
+  one confirmation check is authoritative -- still unconfirmed at that point
+  is a real failure, not a timing artifact, and drops the same as any other
+  final drop. Every other change reaches settle on the original schedule, no
+  added wall-clock cost.
 - **`core-3b`, not just `core-7`, can legitimately see group A's abandoned fork
   after a reorg reconnect -- `simulate_reorg.py`'s own convergence check was
   wrong about this, and re-deriving every node's expected shape from the actual

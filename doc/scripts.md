@@ -243,9 +243,7 @@ design rather than a single `dig` call.
   `SEEDER_IP`) and confirms it auto-bootstraps onto one of the 6 listening nodes
   through the seeder alone.
 - **`core-2b`'s `CONNECT_MODE_ARGS` entry carries `-persistmempool=1`**, the one
-  difference from its sibling chaos nodes' args here -- see `work-done.md` for
-  why (a chaos restart can otherwise wipe a not-yet-confirmed transaction that
-  node itself broadcast from its own mempool).
+  difference from its sibling chaos nodes' args here -- see `work-done.md` for why.
 - **Both `seeder-test-node` and `seeder` itself are stopped and removed once `run()`
   finishes, in a `finally` (guaranteed on failure too, not just success).** Left
   running, `seeder-test-node`'s persistent connection into whichever listener it
@@ -469,16 +467,14 @@ assignment, and the balance-shortfall top-up mechanic). Implemented as `TrafficN
   so two blocks landing between polls don't leave one uncredited). The reward
   itself is not a flat amount -- subsidy plus whatever transaction fees that
   block happened to include, confirmed live.
-- **A pending change's normal two-attempt check/settle tolerance isn't always
-  enough when its sender is one of the chaos nodes that can still lose an
-  in-flight mempool transaction to its own restart.** `_give_chaos_senders_grace`
-  gives a still-pending change up to `CHAOS_SENDER_EXTRA_RESOLVE_ATTEMPTS` (3)
-  more blocks before the final settle check, but only when its sender is in
-  `CHAOS_SENDER_GRACE_NODES` -- `core-1b`/`core-3b`/`core-7`, deliberately not
-  `core-2b` (see its `-persistmempool=1` above). Every other change reaches
-  settle on the original schedule, no added wall-clock cost. Wired into both
-  the setup phase (funding/issuance) and every round. See `doc/work-done.md`
-  for the failure this closes.
+- **A still-pending change whose sender is in `CHAOS_SENDER_GRACE_NODES`
+  (`core-1b`/`core-3b`/`core-7`) gets resolved differently from the normal
+  check/settle schedule**: `_give_chaos_senders_grace` calls
+  `_wait_for_sender_sync` (waits for that node's own tip to match the
+  network's, height and blockhash, against `core-1a` as reference) before a
+  single, final confirmation check. Every other change reaches settle
+  normally. Wired into both the setup phase (funding/issuance) and every
+  round. See `doc/work-done.md` for why.
 
 ## `scripts/simulate_reorg.py`
 
