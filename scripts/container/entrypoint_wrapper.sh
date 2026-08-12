@@ -11,7 +11,15 @@
 # "$@" is whatever docker-compose.yml's command: passed after this script's own path
 # (e.g. -datadir=... -conf=... -connect=core-1a -listen=1) -- tapyrusd's real args
 # either way, just via one extra layer when the orchestrator is supervising it.
+#
+# -rpccookiefile is appended here rather than in docker-compose.yml's own per-node
+# args, since $NODE_NAME is already available to build the per-node path -- see
+# doc/work-done.md. Applies to every tapyrusd launch, including chaos restarts:
+# node_orchestrator.py reuses these same "$@" args (its own tapyrusd_args) for
+# every _launch() call, not just the first.
 set -eu
+
+set -- "$@" -rpccookiefile="/cookies/${NODE_NAME}.cookie"
 
 if [ -n "${NODE_ORCHESTRATOR:-}" ]; then
     exec python3 /app/scripts/container/node_orchestrator.py \

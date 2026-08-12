@@ -57,6 +57,13 @@
 # by scripts/render_tapyrus_conf.py before `docker compose up` -- see the workflow)
 # with networkid=$NETWORK_ID -- see doc/work-done.md.
 #
+# RPC AUTH: every core-* node (plus seeder-test-node) also mounts
+# ../runtime/rpc-cookies:/cookies -- entrypoint_wrapper.sh passes
+# -rpccookiefile=/cookies/$NODE_NAME.cookie so tapyrus-core writes its
+# auto-generated credential there instead of inside its own datadir, making it
+# readable by every other container (and the host) via this same shared mount.
+# See doc/work-done.md.
+#
 services:
   redis:
     image: redis:5.0-alpine
@@ -77,6 +84,7 @@ services:
       - ./generated/tapyrus.conf:/etc/tapyrus/tapyrus.conf
       - ../scripts:/app/scripts:ro
       - ../runtime/orchestrator-control:/orchestrator-control
+      - ../runtime/rpc-cookies:/cookies
     dns:
       - ${SEEDER_IP}
     command: /app/scripts/container/entrypoint_wrapper.sh -datadir=$${DATA_DIR} -conf=$${CONF_DIR}/tapyrus.conf ${CORE_1A_ARGS:-}
@@ -95,6 +103,7 @@ services:
       - ./generated/tapyrus.conf:/etc/tapyrus/tapyrus.conf
       - ../scripts:/app/scripts:ro
       - ../runtime/orchestrator-control:/orchestrator-control
+      - ../runtime/rpc-cookies:/cookies
     dns:
       - ${SEEDER_IP}
     command: /app/scripts/container/entrypoint_wrapper.sh -datadir=$${DATA_DIR} -conf=$${CONF_DIR}/tapyrus.conf ${CORE_2A_ARGS:-}
@@ -113,6 +122,7 @@ services:
       - ./generated/tapyrus.conf:/etc/tapyrus/tapyrus.conf
       - ../scripts:/app/scripts:ro
       - ../runtime/orchestrator-control:/orchestrator-control
+      - ../runtime/rpc-cookies:/cookies
     dns:
       - ${SEEDER_IP}
     command: /app/scripts/container/entrypoint_wrapper.sh -datadir=$${DATA_DIR} -conf=$${CONF_DIR}/tapyrus.conf ${CORE_3A_ARGS:-}
@@ -133,6 +143,7 @@ services:
       - ./generated/tapyrus.conf:/etc/tapyrus/tapyrus.conf
       - ../scripts:/app/scripts:ro
       - ../runtime/orchestrator-control:/orchestrator-control
+      - ../runtime/rpc-cookies:/cookies
     dns:
       - ${SEEDER_IP}
     command: /app/scripts/container/entrypoint_wrapper.sh -datadir=$${DATA_DIR} -conf=$${CONF_DIR}/tapyrus.conf ${CORE_1B_ARGS:-}
@@ -151,6 +162,7 @@ services:
       - ./generated/tapyrus.conf:/etc/tapyrus/tapyrus.conf
       - ../scripts:/app/scripts:ro
       - ../runtime/orchestrator-control:/orchestrator-control
+      - ../runtime/rpc-cookies:/cookies
     dns:
       - ${SEEDER_IP}
     command: /app/scripts/container/entrypoint_wrapper.sh -datadir=$${DATA_DIR} -conf=$${CONF_DIR}/tapyrus.conf ${CORE_2B_ARGS:-}
@@ -169,6 +181,7 @@ services:
       - ./generated/tapyrus.conf:/etc/tapyrus/tapyrus.conf
       - ../scripts:/app/scripts:ro
       - ../runtime/orchestrator-control:/orchestrator-control
+      - ../runtime/rpc-cookies:/cookies
     dns:
       - ${SEEDER_IP}
     command: /app/scripts/container/entrypoint_wrapper.sh -datadir=$${DATA_DIR} -conf=$${CONF_DIR}/tapyrus.conf ${CORE_3B_ARGS:-}
@@ -189,6 +202,7 @@ services:
       - ./generated/tapyrus.conf:/etc/tapyrus/tapyrus.conf
       - ../scripts:/app/scripts:ro
       - ../runtime/orchestrator-control:/orchestrator-control
+      - ../runtime/rpc-cookies:/cookies
     dns:
       - ${SEEDER_IP}
     command: /app/scripts/container/entrypoint_wrapper.sh -datadir=$${DATA_DIR} -conf=$${CONF_DIR}/tapyrus.conf ${CORE_7_ARGS:-}
@@ -343,9 +357,10 @@ services:
       GENESIS_BLOCK_WITH_SIG: ${GENESIS_BLOCK_WITH_SIG}
     volumes:
       - ./generated/tapyrus.conf:/etc/tapyrus/tapyrus.conf
+      - ../runtime/rpc-cookies:/cookies
     dns:
       - ${SEEDER_IP}
-    command: tapyrusd -datadir=$${DATA_DIR} -conf=$${CONF_DIR}/tapyrus.conf -addseeder=seed.tapyrus-integration-tests.local
+    command: tapyrusd -datadir=$${DATA_DIR} -conf=$${CONF_DIR}/tapyrus.conf -addseeder=seed.tapyrus-integration-tests.local -rpccookiefile=/cookies/seeder-test-node.cookie
     ports:
       - '12388:12381'
     depends_on:
