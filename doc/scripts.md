@@ -468,13 +468,13 @@ assignment, and the balance-shortfall top-up mechanic). Implemented as `TrafficN
   itself is not a flat amount -- subsidy plus whatever transaction fees that
   block happened to include, confirmed live.
 - **A still-pending change whose sender is in `CHAOS_SENDER_GRACE_NODES`
-  (`core-1b`/`core-3b`/`core-7`) gets resolved differently from the normal
-  check/settle schedule**: `_give_chaos_senders_grace` calls
-  `_wait_for_sender_sync` (waits for that node's own tip to match the
-  network's, height and blockhash, against `core-1a` as reference) before a
-  single, final confirmation check. Every other change reaches settle
-  normally. Wired into both the setup phase (funding/issuance) and every
-  round. See `doc/work-done.md` for why.
+  (`core-1b`/`core-3b`/`core-7`) gets an extra check before the same
+  settle-height resolve every other change gets**: `_give_chaos_senders_grace`
+  calls `_wait_for_sender_sync` (waits for that node's own tip to match the
+  network's, height and blockhash, against `core-1a` as reference) first, then
+  makes its final confirmation check alongside every other change, at the same
+  height. Wired into both the setup phase (funding/issuance) and every round.
+  See `doc/work-done.md` for why.
 
 ## `scripts/simulate_reorg.py`
 

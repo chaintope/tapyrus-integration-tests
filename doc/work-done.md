@@ -365,11 +365,25 @@ does.
   against `core-1a` as reference (never chaos-restarted, always trustworthy),
   not just height alone, since a matching height with a different hash still
   means a stale or mid-reorg fork. No fixed attempt cap, only
-  `HEIGHT_POLL_TIMEOUT_SECONDS` as a genuine-stuck-node backstop. Once synced,
-  one confirmation check is authoritative -- still unconfirmed at that point
-  is a real failure, not a timing artifact, and drops the same as any other
-  final drop. Every other change reaches settle on the original schedule, no
-  added wall-clock cost.
+  `HEIGHT_POLL_TIMEOUT_SECONDS` as a genuine-stuck-node backstop.
+
+  **This still wasn't enough on its own -- a second real CI run hit the same
+  permanent-offset signature again, on `core-1b` (sender) and `core-2a`
+  (round-robin target), even though `core-1b` is in `CHAOS_SENDER_GRACE_NODES`
+  and the sync-wait ran and passed.** Root cause: `_give_chaos_senders_grace`
+  made its "authoritative" check immediately after `_wait_for_sender_sync`
+  returned, at whatever height happened to be current -- still `check_height`,
+  one full block earlier than the `settle_height` every other pending change
+  gets judged at. When the sender wasn't actually behind (sync-wait returns
+  near-instantly), that gave it *less* room than a non-chaos change, not more:
+  a perfectly valid transaction that simply needed one more block -- the exact
+  class of bug already fixed once for setup, see the entry above -- got
+  dropped a block early. Fixed by moving the sync-wait-then-check to run at
+  `settle_height` instead of immediately after check-height: every call site
+  now advances to `settle_height` first and passes it in, so a
+  `CHAOS_SENDER_GRACE_NODES` change gets the identical one-block cushion as
+  every other change, with the sync-wait layered on top as insurance against
+  the mempool-wipe case right before that same final check.
 - **`core-3b`, not just `core-7`, can legitimately see group A's abandoned fork
   after a reorg reconnect -- `simulate_reorg.py`'s own convergence check was
   wrong about this, and re-deriving every node's expected shape from the actual

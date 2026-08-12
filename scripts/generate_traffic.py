@@ -30,14 +30,14 @@ not counted as a successful round action either -- if it never does. Every call 
 gets two attempts (an initial check, then one more at the next block), not one, since
 a single shot isn't always enough for a perfectly valid transaction that just needs
 one more block. Every call site -- setup and the round loop alike -- also routes
-still-pending changes through _give_chaos_senders_grace before the final settle check:
-a change whose sender is one of CHAOS_SENDER_GRACE_NODES is resolved via
-_wait_for_sender_sync instead -- that node's own restart can wipe its in-memory
+still-pending changes through _give_chaos_senders_grace at that same final settle
+check: a change whose sender is one of CHAOS_SENDER_GRACE_NODES additionally waits
+for _wait_for_sender_sync first -- that node's own restart can wipe its in-memory
 mempool for a not-yet-confirmed self-broadcast transaction, hiding it from
 gettransaction on that exact node even though it already confirmed on the network via
 another node's mempool copy, so this waits for objective proof the node caught back up
 (its own tip matches the network's, height AND blockhash) before trusting anything it
-reports, then makes one authoritative confirmation check.
+reports, then makes its confirmation check alongside every other change.
 
 Usage:
     ./scripts/generate_traffic.py <round-count>
@@ -244,15 +244,15 @@ class TrafficGenerator:
         funding_changes = await self._fund_unfunded_nodes()
         check_height = await self._next_block_with_coinbase()
         funding_changes = await self._resolve_pending_changes(funding_changes, check_height, final=False, count_success=False)
-        funding_changes = await self._give_chaos_senders_grace(funding_changes)
         settle_height = await self._next_block_with_coinbase()
+        funding_changes = await self._give_chaos_senders_grace(funding_changes, settle_height)
         await self._resolve_pending_changes(funding_changes, settle_height, final=True, count_success=False)
 
         issuance_changes = await self._issue_colors()
         check_height = await self._next_block_with_coinbase()
         issuance_changes = await self._resolve_pending_changes(issuance_changes, check_height, final=False, count_success=False)
-        issuance_changes = await self._give_chaos_senders_grace(issuance_changes)
         settle_height = await self._next_block_with_coinbase()
+        issuance_changes = await self._give_chaos_senders_grace(issuance_changes, settle_height)
         await self._resolve_pending_changes(issuance_changes, settle_height, final=True, count_success=False)
 
         for round_number in range(1, self._round_count + 1):
@@ -262,8 +262,8 @@ class TrafficGenerator:
             check_height = await self._next_block_with_coinbase()
             pending = await self._resolve_pending_changes(pending, check_height, final=False)
             await self._log_balances(check_height, "check")
-            pending = await self._give_chaos_senders_grace(pending)
             settle_height = await self._next_block_with_coinbase()
+            pending = await self._give_chaos_senders_grace(pending, settle_height)
             await self._resolve_pending_changes(pending, settle_height, final=True)
             await self._verify_round(settle_height)
 
@@ -700,28 +700,29 @@ class TrafficGenerator:
         else:
             log.info(f"height {height}: {node_name} {asset}: {actual} (matches ledger)")
 
-    async def _give_chaos_senders_grace(self, pending):
-        """For a change still unconfirmed after the check height whose sender is
-        one of CHAOS_SENDER_GRACE_NODES, waits for that node to actually catch
-        back up with the network (_wait_for_sender_sync: its own tip matches the
-        network's, height AND blockhash, not just height) before trusting
-        anything it reports -- a chaos node's own restart can wipe its
-        in-memory mempool, hiding a not-yet-confirmed self-broadcast
-        transaction from gettransaction on that exact node even though it
-        already confirmed on the network via another node's mempool copy. Once
-        synced, a single confirmation check is authoritative: still unconfirmed
-        at that point is a genuine failure, not a timing artifact, and is
-        dropped and logged the same as any other final drop. Every other
-        change is untouched, returned for the caller's own settle-height
-        resolve on the normal schedule."""
+    async def _give_chaos_senders_grace(self, pending, settle_height):
+        """Called at settle_height, immediately before the caller's own final
+        resolve there -- so a change whose sender is one of
+        CHAOS_SENDER_GRACE_NODES gets the exact same one-more-block cushion as
+        every other pending change, not less. On top of that cushion, it also
+        waits for that sender to actually catch back up with the network
+        (_wait_for_sender_sync: its own tip matches the network's, height AND
+        blockhash, not just height) before trusting anything it reports -- a
+        chaos node's own restart can wipe its in-memory mempool, hiding a
+        not-yet-confirmed self-broadcast transaction from gettransaction on
+        that exact node even though it already confirmed on the network via
+        another node's mempool copy. The confirmation check right after that
+        sync is authoritative: still unconfirmed at that point is a genuine
+        failure, not a timing artifact, and is dropped and logged the same as
+        any other final drop. Every other change is untouched, returned for
+        the caller's own settle-height resolve."""
         chaos_pending = [change for change in pending if change.node.name in CHAOS_SENDER_GRACE_NODES]
         non_chaos_pending = [change for change in pending if change.node.name not in CHAOS_SENDER_GRACE_NODES]
         if not chaos_pending:
             return pending
         senders = {change.node.name: change.node for change in chaos_pending}
         await asyncio.gather(*(self._wait_for_sender_sync(node) for node in senders.values()))
-        height = await self._current_height()
-        await self._resolve_pending_changes(chaos_pending, height, final=True)
+        await self._resolve_pending_changes(chaos_pending, settle_height, final=True)
         return non_chaos_pending
 
     async def _wait_for_sender_sync(self, node):
