@@ -72,6 +72,19 @@ does.
   in -- `tapyrus-signer` reads it fresh on every RPC call for the same reason
   `CoreRpcClient` does, so a signer's own core-RPC-target restarting (chaos or a
   genuine crash-recovery) doesn't require restarting the signer either.
+- **`entrypoint_wrapper.sh` re-`chmod`s every cookie file to 644 in a background
+  loop, once a second, for as long as the container runs.** tapyrus-core always
+  writes the cookie file `0600` (owner-only, `umask 077`) -- every core-*
+  container (and seeder-test-node, routed through the same wrapper) runs as
+  root, so container-to-container reads already work regardless of that mode,
+  but the CI host process reading the same file straight off the
+  `runtime/rpc-cookies/` bind mount is a non-root user and got `PermissionError`
+  every time (confirmed live on GitHub Actions -- masked in local macOS Docker
+  Desktop testing by its own bind-mount ownership translation, which doesn't
+  happen on a real Linux runner). A one-shot `chmod` right after startup isn't
+  enough since a chaos restart regenerates the file from scratch at the same
+  mode; the loop re-applies it on every regeneration instead of trying to catch
+  the exact moment each one happens.
 - **`generate_traffic.py` needs `fallbackfee` enabled.** `-fallbackfee` defaults to
   disabled (a mainnet-safety default, not a bug), so `estimatesmartfee` fails with no
   fee history on a new chain. `render_tapyrus_conf.py` sets `fallbackfee=0.0002`,

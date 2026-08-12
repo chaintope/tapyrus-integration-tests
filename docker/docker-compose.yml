@@ -365,12 +365,14 @@ services:
     image: tapyrus/tapyrusd:master-local
     environment:
       GENESIS_BLOCK_WITH_SIG: ${GENESIS_BLOCK_WITH_SIG}
+      NODE_NAME: seeder-test-node
     volumes:
       - ./generated/tapyrus.conf:/etc/tapyrus/tapyrus.conf
+      - ../scripts:/app/scripts:ro
       - ../runtime/rpc-cookies:/cookies
     dns:
       - ${SEEDER_IP}
-    command: tapyrusd -datadir=$${DATA_DIR} -conf=$${CONF_DIR}/tapyrus.conf -addseeder=seed.tapyrus-integration-tests.local -rpccookiefile=/cookies/seeder-test-node.cookie
+    command: /app/scripts/container/entrypoint_wrapper.sh -datadir=$${DATA_DIR} -conf=$${CONF_DIR}/tapyrus.conf -addseeder=seed.tapyrus-integration-tests.local
     ports:
       - '12388:12381'
     depends_on:
