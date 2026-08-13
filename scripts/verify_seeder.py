@@ -154,6 +154,15 @@ class SeederVerifier:
         # fails as the non-root runner user. Pre-creating it here, before any
         # container touches it, keeps ownership with the runner.
         (REPO_ROOT / "runtime" / "orchestrator-control").mkdir(parents=True, exist_ok=True)
+        # Same root-ownership reasoning for the cookie mount, plus clearing any
+        # *.cookie left over from a previous run that got SIGKILLed rather than shut
+        # down cleanly (a clean tapyrus-core shutdown deletes its own cookie file; a
+        # SIGKILL doesn't) -- a stale cookie would otherwise be briefly readable with
+        # the wrong credentials until the fresh one overwrites it.
+        cookie_dir = REPO_ROOT / "runtime" / "rpc-cookies"
+        cookie_dir.mkdir(parents=True, exist_ok=True)
+        for stale_cookie in cookie_dir.glob("*.cookie"):
+            stale_cookie.unlink()
         # Same signed genesis every core-* node loads -- needed in this process's own
         # environment for both bring-up phases below (docker-compose.yml's
         # GENESIS_BLOCK_WITH_SIG substitution), same as the workflow's old "Bring up
