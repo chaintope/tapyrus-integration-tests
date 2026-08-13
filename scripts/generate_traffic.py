@@ -27,17 +27,16 @@ it permanently out of sync with reality in that case. So sends/issuances return 
 PendingChange instead of touching self._ledger directly; _resolve_pending_changes
 applies it only once every one of its txids has confirmed on-chain, and drops it --
 not counted as a successful round action either -- if it never does. Every call site
-gets two attempts (an initial check, then one more at the next block), not one, since
-a single shot isn't always enough for a perfectly valid transaction that just needs
-one more block. Every call site -- setup and the round loop alike -- also routes
-still-pending changes through _give_chaos_senders_grace at that same final settle
-check: a change whose sender is one of CHAOS_SENDER_GRACE_NODES additionally waits
-for _wait_for_sender_sync first -- that node's own restart can wipe its in-memory
-mempool for a not-yet-confirmed self-broadcast transaction, hiding it from
-gettransaction on that exact node even though it already confirmed on the network via
-another node's mempool copy, so this waits for objective proof the node caught back up
-(its own tip matches the network's, height AND blockhash) before trusting anything it
-reports, then makes its confirmation check alongside every other change.
+gets three attempts (an initial check, one more at the next block, then a final grace
+block via _give_final_grace if still unconfirmed), not two -- confirmed live that even
+two isn't always enough for a perfectly valid transaction, regardless of sender. A
+change whose sender is one of CHAOS_SENDER_GRACE_NODES gets one extra safeguard on top
+of that same final grace block: _wait_for_sender_sync first -- that node's own restart
+can wipe its in-memory mempool for a not-yet-confirmed self-broadcast transaction,
+hiding it from gettransaction on that exact node even though it already confirmed on
+the network via another node's mempool copy, so this waits for objective proof the
+node caught back up (its own tip matches the network's, height AND blockhash) before
+trusting anything it reports.
 
 Usage:
     ./scripts/generate_traffic.py <round-count>
@@ -123,9 +122,10 @@ COINBASE_EARNING_NODES = {"core-1a", "core-2a", "core-3a"}
 # node_orchestrator.py's CHAOS_NODES (core-1b/2b/3b/core-7) minus core-2b: its
 # CONNECT_MODE_ARGS entry (verify_seeder.py) carries -persistmempool=1, so its
 # own restart no longer risks losing a not-yet-confirmed transaction it broadcast
-# itself -- the other 3 still can. When one of these is a pending change's
-# sender, _give_chaos_senders_grace gives it extra confirmation-check attempts
-# beyond the normal check/settle window.
+# itself -- the other 3 still can. Every sender gets the same final grace block
+# (_give_final_grace) regardless of membership here; when one of these is a
+# pending change's sender, it additionally waits for _wait_for_sender_sync
+# before that final check, since persistmempool alone doesn't protect it.
 CHAOS_SENDER_GRACE_NODES = {"core-1b", "core-3b", "core-7"}
 FUNDING_PAIRS = (
     ("core-1a", "core-1b"),
@@ -245,15 +245,17 @@ class TrafficGenerator:
         check_height = await self._next_block_with_coinbase()
         funding_changes = await self._resolve_pending_changes(funding_changes, check_height, final=False, count_success=False)
         settle_height = await self._next_block_with_coinbase()
-        funding_changes = await self._give_chaos_senders_grace(funding_changes, settle_height)
-        await self._resolve_pending_changes(funding_changes, settle_height, final=True, count_success=False)
+        funding_changes = await self._resolve_pending_changes(funding_changes, settle_height, final=False, count_success=False)
+        if funding_changes:
+            await self._give_final_grace(funding_changes, count_success=False)
 
         issuance_changes = await self._issue_colors()
         check_height = await self._next_block_with_coinbase()
         issuance_changes = await self._resolve_pending_changes(issuance_changes, check_height, final=False, count_success=False)
         settle_height = await self._next_block_with_coinbase()
-        issuance_changes = await self._give_chaos_senders_grace(issuance_changes, settle_height)
-        await self._resolve_pending_changes(issuance_changes, settle_height, final=True, count_success=False)
+        issuance_changes = await self._resolve_pending_changes(issuance_changes, settle_height, final=False, count_success=False)
+        if issuance_changes:
+            await self._give_final_grace(issuance_changes, count_success=False)
 
         for round_number in range(1, self._round_count + 1):
             log.step(f"round {round_number}/{self._round_count}")
@@ -263,9 +265,11 @@ class TrafficGenerator:
             pending = await self._resolve_pending_changes(pending, check_height, final=False)
             await self._log_balances(check_height, "check")
             settle_height = await self._next_block_with_coinbase()
-            pending = await self._give_chaos_senders_grace(pending, settle_height)
-            await self._resolve_pending_changes(pending, settle_height, final=True)
-            await self._verify_round(settle_height)
+            pending = await self._resolve_pending_changes(pending, settle_height, final=False)
+            final_height = settle_height
+            if pending:
+                final_height = await self._give_final_grace(pending)
+            await self._verify_round(final_height)
 
         expected_actions = self._round_count * len(self._nodes) * 2
         min_required_actions = max(1, int(expected_actions * MIN_SUCCESSFUL_ACTION_FRACTION))
@@ -700,30 +704,34 @@ class TrafficGenerator:
         else:
             log.info(f"height {height}: {node_name} {asset}: {actual} (matches ledger)")
 
-    async def _give_chaos_senders_grace(self, pending, settle_height):
-        """Called at settle_height, immediately before the caller's own final
-        resolve there -- so a change whose sender is one of
-        CHAOS_SENDER_GRACE_NODES gets the exact same one-more-block cushion as
-        every other pending change, not less. On top of that cushion, it also
+    async def _give_final_grace(self, pending, count_success=True):
+        """Called with whatever's still unconfirmed after settle_height's own
+        (non-final) resolve -- gives every remaining change one more block
+        before the truly final drop, regardless of sender. Confirmed live:
+        a plain sender needing a third attempt isn't a chaos-specific
+        problem -- it happened to core-2a (never chaos-restarted at all) and
+        core-2b (chaos, but excluded from CHAOS_SENDER_GRACE_NODES precisely
+        because persistmempool was assumed to make this unnecessary for it)
+        in the same run, with no chaos action anywhere near either incident.
+        The fixed two-block check/settle window was never actually enough to
+        rule out "just needs one more block" for anyone, chaos-designated or
+        not -- see doc/work-done.md.
+
+        A change whose sender is one of CHAOS_SENDER_GRACE_NODES additionally
         waits for that sender to actually catch back up with the network
-        (_wait_for_sender_sync: its own tip matches the network's, height AND
-        blockhash, not just height) before trusting anything it reports -- a
-        chaos node's own restart can wipe its in-memory mempool, hiding a
-        not-yet-confirmed self-broadcast transaction from gettransaction on
-        that exact node even though it already confirmed on the network via
-        another node's mempool copy. The confirmation check right after that
-        sync is authoritative: still unconfirmed at that point is a genuine
-        failure, not a timing artifact, and is dropped and logged the same as
-        any other final drop. Every other change is untouched, returned for
-        the caller's own settle-height resolve."""
+        first (_wait_for_sender_sync: its own tip matches the network's,
+        height AND blockhash, not just height) before trusting anything it
+        reports -- a chaos node's own restart can still wipe its in-memory
+        mempool, hiding a not-yet-confirmed self-broadcast transaction from
+        gettransaction even after this extra block. Returns the height its
+        final check ran at, for the caller's own _verify_round."""
         chaos_pending = [change for change in pending if change.node.name in CHAOS_SENDER_GRACE_NODES]
-        non_chaos_pending = [change for change in pending if change.node.name not in CHAOS_SENDER_GRACE_NODES]
-        if not chaos_pending:
-            return pending
-        senders = {change.node.name: change.node for change in chaos_pending}
-        await asyncio.gather(*(self._wait_for_sender_sync(node) for node in senders.values()))
-        await self._resolve_pending_changes(chaos_pending, settle_height, final=True)
-        return non_chaos_pending
+        if chaos_pending:
+            senders = {change.node.name: change.node for change in chaos_pending}
+            await asyncio.gather(*(self._wait_for_sender_sync(node) for node in senders.values()))
+        height = await self._next_block_with_coinbase()
+        await self._resolve_pending_changes(pending, height, final=True, count_success=count_success)
+        return height
 
     async def _wait_for_sender_sync(self, node):
         """Polls until `node`'s own tip matches the network's reference tip --
@@ -759,13 +767,14 @@ class TrafficGenerator:
         """Applies each PendingChange's ledger deltas only once every one of its
         txids has actually confirmed (see PendingChange's own docstring for why).
         Not final: unconfirmed changes are returned for a later retry at the next
-        block height (mirrors the round's own check/settle two-step). Final: an
-        unconfirmed change is dropped instead -- logged, not credited, not counted
-        as a successful round action -- since nothing later in the run gives it
-        another chance to confirm. count_success=False for the one-time setup calls
-        (funding/issuance) -- MIN_SUCCESSFUL_ACTION_FRACTION's denominator is
-        round_count * 14 round-loop actions only; folding setup successes in would
-        let a count exceed that denominator instead of meaning what it claims to."""
+        block height (the caller's own check/settle/grace attempts -- see
+        _give_final_grace). Final: an unconfirmed change is dropped instead --
+        logged, not credited, not counted as a successful round action -- since
+        nothing later in the run gives it another chance to confirm.
+        count_success=False for the one-time setup calls (funding/issuance) --
+        MIN_SUCCESSFUL_ACTION_FRACTION's denominator is round_count * 14 round-loop
+        actions only; folding setup successes in would let a count exceed that
+        denominator instead of meaning what it claims to."""
         if not pending_changes:
             return []
         still_pending = []

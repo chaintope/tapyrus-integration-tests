@@ -384,6 +384,30 @@ does.
   `CHAOS_SENDER_GRACE_NODES` change gets the identical one-block cushion as
   every other change, with the sync-wait layered on top as insurance against
   the mempool-wipe case right before that same final check.
+
+  **Still not enough -- a third real CI run hit the identical signature on
+  `core-2a` (never chaos-restarted at all) and `core-2b` (chaos, but excluded
+  from `CHAOS_SENDER_GRACE_NODES` specifically because `persistmempool` was
+  assumed to make this unnecessary for it), traced through both the
+  container logs and `generate_traffic.py`'s own output to two separate
+  incidents in one run: a setup-phase `core-2a -> core-2b` `FUNDING_PAIRS`
+  send dropped at the very first settle (persisted unchanged for the rest of
+  the run -- the real-vs-ledger gap matched the funding amount and fee
+  exactly), and a round's own `core-2a`/`core-2b` sends dropped with zero
+  chaos activity anywhere nearby (confirmed against `docker logs core-2a`/
+  `core-2b`: both broadcasts relayed normally, and the block that should
+  have confirmed them contained no other transactions at all).** Root cause:
+  the grace mechanism was still gated on `CHAOS_SENDER_GRACE_NODES`
+  membership, so `core-2a` and `core-2b` never got the extra block at all --
+  they always had exactly two attempts (check, settle), same as before any
+  of this was fixed. "Needs a third attempt" was never actually a
+  chaos-specific problem; the earlier fixes just patched the one subset that
+  had been directly observed failing. Fixed by making settle-height's own
+  resolve non-final and unconditionally giving whatever's still pending
+  afterward one more block (`_give_final_grace`) before the true final drop,
+  for every sender -- `CHAOS_SENDER_GRACE_NODES` membership now only adds the
+  `_wait_for_sender_sync` safeguard on top of that same universal extra
+  block, it no longer gates whether the extra block happens at all.
 - **`core-3b`, not just `core-7`, can legitimately see group A's abandoned fork
   after a reorg reconnect -- `simulate_reorg.py`'s own convergence check was
   wrong about this, and re-deriving every node's expected shape from the actual
