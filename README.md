@@ -99,10 +99,12 @@ have no `inputs` context to read one from anyway, so no default is set on the in
 themselves. Two different mechanisms supply one when a field is left blank (a manual
 dispatch run that leaves a field blank gets the same value schedule does either way):
 
-- `core_repo_ref`/`signer_repo_ref`/`seeder_repo_ref` fall back to
-  [`config/repos.py`](config/repos.py)'s own default for that repo -- the single
-  source of truth for these three, not restated here (see that file for the current
-  values and why).
+- `core_repo_url`/`core_repo_ref`, `signer_repo_url`/`signer_repo_ref`,
+  `seeder_repo_url`/`seeder_repo_ref` fall back to [`config/repos.py`](config/repos.py)'s
+  own default URL/ref for that repo -- the single source of truth for these six, not
+  restated here (see that file for the current values and why). The URL half is for
+  testing a branch that only exists on a fork -- e.g. an upstream PR not yet merged --
+  by pointing the URL at the fork with the ref set to the branch name.
 - Every other variable below falls back to a literal in the workflow's `env:` block
   (`inputs.x || 'literal'`), shown in the table below. `pull_request`/`push` runs use
   smaller "smoke" values for the reorg variable instead of the full-scale default
@@ -116,8 +118,11 @@ input; the rest fall back straight to their `env:` literal on every trigger,
 
 | Variable | Default | Controls |
 | --- | --- | --- |
+| `core_repo_url` | see `config/repos.py` | `tapyrus-core` git URL to check out from -- a fork, to test a branch that only exists there |
 | `core_repo_ref` | see `config/repos.py` | `tapyrus-core` branch/tag/sha to check out |
+| `signer_repo_url` | see `config/repos.py` | `tapyrus-signer` git URL to check out from -- a fork, to test a branch that only exists there |
 | `signer_repo_ref` | see `config/repos.py` | `tapyrus-signer` branch/tag/sha to check out |
+| `seeder_repo_url` | see `config/repos.py` | `tapyrus-seeder` git URL to check out from -- a fork, to test a branch that only exists there |
 | `seeder_repo_ref` | see `config/repos.py` | `tapyrus-seeder` branch/tag/sha to check out |
 | `tx_round_count` | `60` (`10` on pull_request/push) | Round-robin send/check/settle cycles `scripts/generate_traffic.py` runs -- each is 3 block-heights and 14 transactions (7 nodes x {TPC send, colored send-or-mint}), so this alone determines the tx/block/height totals for that step. Also determines the reorg's baseline height -- see below. Sized against the CI timing budget, see `doc/work-done.md` |
 | `reorg_length` | `30` (`5` on pull_request/push) | Blocks each isolated group builds past the baseline, alone, before reconnecting at the tie (`scripts/simulate_reorg.py`: group B builds first while group A is stopped entirely, then group A builds its own, genuinely different set while group B is stopped). Group B is then always extended by exactly 2 more blocks to win (not 1 -- `core-3a` produced group A's original tip itself, so it needs a second block to reclassify that tip as `valid-fork` instead of `valid-headers`) -- not configurable, and not probed for -- see `doc/scripts.md` |

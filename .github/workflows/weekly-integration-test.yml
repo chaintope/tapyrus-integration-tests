@@ -14,10 +14,16 @@ on:
   # No input default: -- defaults live in the env: block below. See doc/work-done.md.
   workflow_dispatch:
     inputs:
+      core_repo_url:
+        description: 'tapyrus-core git URL (e.g. a fork, to test a branch that only exists there) -- leave blank for config/repos.py''s default'
       core_repo_ref:
         description: 'tapyrus-core ref (branch/tag/sha) -- leave blank for config/repos.py''s default'
+      signer_repo_url:
+        description: 'tapyrus-signer git URL (e.g. a fork, to test a branch that only exists there) -- leave blank for config/repos.py''s default'
       signer_repo_ref:
         description: 'tapyrus-signer ref (branch/tag/sha) -- leave blank for config/repos.py''s default'
+      seeder_repo_url:
+        description: 'tapyrus-seeder git URL (e.g. a fork, to test a branch that only exists there) -- leave blank for config/repos.py''s default'
       seeder_repo_ref:
         description: 'tapyrus-seeder ref (branch/tag/sha) -- leave blank for config/repos.py''s default'
 
@@ -60,10 +66,13 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # No literal fallback -- an unset ref resolves to config/repos.py's own default.
+  # No literal fallback -- an unset url/ref resolves to config/repos.py's own default.
   DOCKER_BUILD_PLATFORM: ${{ inputs.docker_build_platform || '' }}
+  CORE_REPO_URL: ${{ inputs.core_repo_url }}
   CORE_REPO_REF: ${{ inputs.core_repo_ref }}
+  SIGNER_REPO_URL: ${{ inputs.signer_repo_url }}
   SIGNER_REPO_REF: ${{ inputs.signer_repo_ref }}
+  SEEDER_REPO_URL: ${{ inputs.seeder_repo_url }}
   SEEDER_REPO_REF: ${{ inputs.seeder_repo_ref }}
   PRNG_SEED_BASE: ${{ github.run_id }}
   NETWORK_ID: ${{ inputs.network_id || '1905960821' }}
