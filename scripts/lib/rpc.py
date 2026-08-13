@@ -35,11 +35,18 @@ class RpcUnreachable(Exception):
     "not ready yet", not a hard failure."""
 
 
-def cookie_path(name):
-    """The shared, host-visible cookie file tapyrus-core writes for node `name`
+def cookie_path(name, cookie_dir=None):
+    """The shared cookie file tapyrus-core writes for node `name`
     (docker/docker-compose.yml's ../runtime/rpc-cookies:/cookies mount,
-    entrypoint_wrapper.sh's -rpccookiefile) -- see doc/work-done.md."""
-    return REPO_ROOT / "runtime" / "rpc-cookies" / f"{name}.cookie"
+    entrypoint_wrapper.sh's -rpccookiefile) -- see doc/work-done.md. `cookie_dir`
+    defaults to the host-side REPO_ROOT-relative path, used by every script that
+    runs on the CI host. node_orchestrator.py runs inside a core-* container
+    instead, where REPO_ROOT resolves to /app (scripts are mounted at
+    /app/scripts), not the repo root -- it passes the container-internal /cookies
+    mount point explicitly instead, the same "container script hardcodes what it
+    knows" pattern this repo already uses for that script's own PAUSE_FILE."""
+    cookie_dir = cookie_dir or (REPO_ROOT / "runtime" / "rpc-cookies")
+    return cookie_dir / f"{name}.cookie"
 
 
 def read_cookie(path):
@@ -63,14 +70,15 @@ class CoreRpcClient:
     not cached at construction time, since a chaos-restarted node's cookie changes
     on every restart). `host` is separate from `name` since it varies by caller:
     127.0.0.1 for host-side scripts (docker-compose's published host ports), a
-    container DNS name for node_orchestrator.py's cross-node peer checks. Cheap to
-    construct -- holds no connection state of its own, so a fresh instance per call
-    (or per polling attempt) is fine.
+    container DNS name for node_orchestrator.py's cross-node peer checks.
+    `cookie_dir` is cookie_path()'s own override, passed through unchanged -- see
+    its docstring. Cheap to construct -- holds no connection state of its own, so a
+    fresh instance per call (or per polling attempt) is fine.
     """
 
-    def __init__(self, host, port, name, timeout_seconds=5):
+    def __init__(self, host, port, name, timeout_seconds=5, cookie_dir=None):
         self._url = f"http://{host}:{port}/"
-        self._cookie_file = cookie_path(name)
+        self._cookie_file = cookie_path(name, cookie_dir)
         self._timeout_seconds = timeout_seconds
 
     async def call(self, method, params=None):

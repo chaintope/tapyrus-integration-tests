@@ -63,6 +63,11 @@ RESTART_FLAVOR_FLAGS = {
 }
 
 PAUSE_FILE = Path("/orchestrator-control/pause")
+# scripts.lib.rpc.cookie_path()'s host-side default (REPO_ROOT-relative) resolves
+# to /app/runtime/rpc-cookies in here, since scripts are mounted at /app/scripts --
+# not the actual /cookies mount (docker-compose.yml). Passed explicitly to every
+# CoreRpcClient this script constructs, same as PAUSE_FILE above.
+COOKIE_DIR = Path("/cookies")
 
 RPC_READY_TIMEOUT_SECONDS = 120
 RPC_READY_POLL_INTERVAL_SECONDS = 3
@@ -111,7 +116,7 @@ class NodeOrchestrator:
         self._node_name = node_name
         self._restart_flavor_flag = RESTART_FLAVOR_FLAGS[restart_flavor]
         self._tapyrusd_args = tapyrusd_args
-        self._rpc = CoreRpcClient(RPC_HOST, RPC_PORT, node_name)
+        self._rpc = CoreRpcClient(RPC_HOST, RPC_PORT, node_name, cookie_dir=COOKIE_DIR)
         self._rng = rng
         self._process = None
         # Guards _process itself -- both deliberate restarts and the crash
@@ -194,7 +199,7 @@ class NodeOrchestrator:
         for other in ALL_NODES:
             if other == self._node_name:
                 continue
-            client = CoreRpcClient(other, RPC_PORT, other)
+            client = CoreRpcClient(other, RPC_PORT, other, cookie_dir=COOKIE_DIR)
             try:
                 return await client.call("getblockcount")
             except (RpcError, RpcUnreachable):

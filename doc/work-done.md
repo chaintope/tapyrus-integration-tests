@@ -72,6 +72,21 @@ does.
   in -- `tapyrus-signer` reads it fresh on every RPC call for the same reason
   `CoreRpcClient` does, so a signer's own core-RPC-target restarting (chaos or a
   genuine crash-recovery) doesn't require restarting the signer either.
+- **`scripts.lib.rpc.cookie_path()`'s default resolves relative to `REPO_ROOT`
+  (`Path(__file__).resolve().parent.parent.parent`), which is only the repo root
+  on the CI host.** `node_orchestrator.py` runs inside a core-* container, where
+  the same relative walk from `/app/scripts/lib/rpc.py` lands on `/app` --
+  `/app/runtime/rpc-cookies/`, not the real `/cookies` mount -- so every
+  `CoreRpcClient` it constructs (its own node's client, and `_peer_height`'s
+  cross-node ones) got `RpcUnreachable` from a cookie file that could never
+  exist, on every single call. Caught via review before any CI run rather than
+  live -- would have failed every orchestrator-mode container at startup
+  (`_wait_for_rpc_ready`'s `RPC_READY_TIMEOUT_SECONDS` then `TimeoutError`).
+  Fixed with an optional `cookie_dir` override on `cookie_path()`/
+  `CoreRpcClient`, which `node_orchestrator.py` passes explicitly
+  (`COOKIE_DIR = Path("/cookies")`) at both of its call sites -- the same
+  "container script hardcodes the absolute path it knows about" pattern this
+  file already uses for its own `PAUSE_FILE`, rather than a new env var.
 - **`entrypoint_wrapper.sh` re-`chmod`s every cookie file to 644 in a background
   loop, once a second, for as long as the container runs.** tapyrus-core always
   writes the cookie file `0600` (owner-only, `umask 077`) -- every core-*
