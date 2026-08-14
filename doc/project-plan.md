@@ -163,10 +163,7 @@ Each of these corresponds to a step in `.github/workflows/weekly-integration-tes
   it fresh on every RPC call too. `entrypoint_wrapper.sh` re-`chmod`s each cookie
   file to 644 in a background loop, since tapyrus-core always writes it `0600` and
   every core-* container runs as root -- confirmed live on GitHub Actions that
-  without this, the CI host's own (non-root) reads get `PermissionError`. The
-  corresponding `tapyrus-signer` change (`rpc-endpoint-cookiefile` support) has
-  since merged upstream, so this no longer depends on a fork/branch override to
-  build against.
+  without this, the CI host's own (non-root) reads get `PermissionError`.
 
 ## Outstanding work
 
