@@ -25,10 +25,6 @@ does.
   `FUNDING_AMOUNT_TPC`/`TOKEN_ISSUE_AMOUNT`/etc. work fine at small round counts, but
   a larger round count would trigger the balance-shortfall top-up mechanic much more
   often, and that hasn't been checked.
-- **This branch's signer cookie-auth wiring depends on an unmerged `tapyrus-signer`
-  change** (`rpc-endpoint-cookiefile` support, a separate branch in that repo) --
-  `assemble_signer_configs.py` writes that TOML field unconditionally, so a
-  `tapyrus-signer` build without it won't start.
 
 ## Design decisions
 

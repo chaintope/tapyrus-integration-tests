@@ -100,13 +100,12 @@ class SignerConfigAssembler:
         )
 
     def _signer_toml(self, pubkey, address, core_rpc_host):
-        # tapyrus-signerd reads this cookie file itself (rpc-endpoint-cookiefile,
-        # this branch's own cookie-auth support) rather than a value resolved and
-        # baked in here -- /cookies is the same shared mount every core-* node
-        # writes its own cookie into (docker-compose.yml's signer services), read
-        # fresh on every RPC call, so a cookie that changes mid-run (e.g. this
-        # signer's core node restarting) doesn't require restarting the signer
-        # too. See doc/work-done.md.
+        # tapyrus-signerd reads this cookie file itself (rpc-endpoint-cookiefile)
+        # rather than a value resolved and baked in here -- /cookies is the same
+        # shared mount every core-* node writes its own cookie into
+        # (docker-compose.yml's signer services), read fresh on every RPC call, so
+        # a cookie that changes mid-run (e.g. this signer's core node restarting)
+        # doesn't require restarting the signer too. See doc/work-done.md.
         return (
             "[general]\n"
             f"round-duration = {self._round_duration}\n"
