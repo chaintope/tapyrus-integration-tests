@@ -424,6 +424,16 @@ does.
   for every sender -- `CHAOS_SENDER_GRACE_NODES` membership now only adds the
   `_wait_for_sender_sync` safeguard on top of that same universal extra
   block, it no longer gates whether the extra block happens at all.
+
+  **`core-2b` added to `CHAOS_SENDER_GRACE_NODES` too, on review, before a
+  fourth CI run could hit it.** `-persistmempool=1` only dumps the mempool on
+  a clean shutdown -- `_restart`'s fallback path in `node_orchestrator.py`
+  (RPC `stop` fails -> `self._process.kill()`) and `_supervise_crashes`'
+  relaunch-after-crash both skip that dump, so the flag alone never fully
+  covered `core-2b`. The universal grace block already covers the likeliest
+  case; the sync-wait is cheap additional insurance (near-instant when
+  `core-2b` is already caught up, the common case) given this exact
+  signature has now surfaced through three separate mechanisms.
 - **`core-3b`, not just `core-7`, can legitimately see group A's abandoned fork
   after a reorg reconnect -- `simulate_reorg.py`'s own convergence check was
   wrong about this, and re-deriving every node's expected shape from the actual

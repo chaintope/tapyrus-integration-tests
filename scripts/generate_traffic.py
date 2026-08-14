@@ -119,14 +119,16 @@ NODES = (
 # to-address), so only they ever receive coinbase. The other 4 need on-chain funding
 # before they can send anything.
 COINBASE_EARNING_NODES = {"core-1a", "core-2a", "core-3a"}
-# node_orchestrator.py's CHAOS_NODES (core-1b/2b/3b/core-7) minus core-2b: its
-# CONNECT_MODE_ARGS entry (verify_seeder.py) carries -persistmempool=1, so its
-# own restart no longer risks losing a not-yet-confirmed transaction it broadcast
-# itself -- the other 3 still can. Every sender gets the same final grace block
-# (_give_final_grace) regardless of membership here; when one of these is a
-# pending change's sender, it additionally waits for _wait_for_sender_sync
-# before that final check, since persistmempool alone doesn't protect it.
-CHAOS_SENDER_GRACE_NODES = {"core-1b", "core-3b", "core-7"}
+# node_orchestrator.py's CHAOS_NODES (core-1b/2b/3b/core-7), all four -- every
+# sender gets the same final grace block (_give_final_grace) regardless of
+# membership here; when one of these is a pending change's sender, it
+# additionally waits for _wait_for_sender_sync before that final check.
+# core-2b's own CONNECT_MODE_ARGS entry (verify_seeder.py) carries
+# -persistmempool=1, but that only dumps the mempool on a clean shutdown --
+# _restart's kill() fallback and _supervise_crashes' relaunch-after-crash both
+# skip it, so core-2b isn't fully covered by the flag alone. Cheap to include
+# regardless: a near-instant sync check in the common (already-synced) case.
+CHAOS_SENDER_GRACE_NODES = {"core-1b", "core-2b", "core-3b", "core-7"}
 FUNDING_PAIRS = (
     ("core-1a", "core-1b"),
     ("core-2a", "core-2b"),
@@ -720,15 +722,10 @@ class TrafficGenerator:
     async def _give_final_grace(self, pending, count_success=True):
         """Called with whatever's still unconfirmed after settle_height's own
         (non-final) resolve -- gives every remaining change one more block
-        before the truly final drop, regardless of sender. Confirmed live:
-        a plain sender needing a third attempt isn't a chaos-specific
-        problem -- it happened to core-2a (never chaos-restarted at all) and
-        core-2b (chaos, but excluded from CHAOS_SENDER_GRACE_NODES precisely
-        because persistmempool was assumed to make this unnecessary for it)
-        in the same run, with no chaos action anywhere near either incident.
-        The fixed two-block check/settle window was never actually enough to
-        rule out "just needs one more block" for anyone, chaos-designated or
-        not -- see doc/work-done.md.
+        before the truly final drop, regardless of sender: a plain sender
+        needing a third attempt isn't a chaos-specific problem, so the fixed
+        two-block check/settle window was never actually enough to rule that
+        out for anyone -- see doc/work-done.md.
 
         A change whose sender is one of CHAOS_SENDER_GRACE_NODES additionally
         waits for that sender to actually catch back up with the network

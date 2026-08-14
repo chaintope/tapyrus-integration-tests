@@ -471,8 +471,8 @@ assignment, and the balance-shortfall top-up mechanic). Implemented as `TrafficN
   drop, regardless of sender**: `_give_final_grace` is called with whatever's
   still unconfirmed after settle-height's own (non-final) check, waits for one
   more block, then makes the actual final confirmation check there. A change
-  whose sender is in `CHAOS_SENDER_GRACE_NODES` (`core-1b`/`core-3b`/`core-7`)
-  additionally calls `_wait_for_sender_sync` first (waits for that node's own
+  whose sender is in `CHAOS_SENDER_GRACE_NODES` (all 4 of `node_orchestrator.py`'s
+  `CHAOS_NODES`) additionally calls `_wait_for_sender_sync` first (waits for that node's own
   tip to match the network's, height and blockhash, against `core-1a` as
   reference). Wired into both the setup phase (funding/issuance) and every
   round. See `doc/work-done.md` for why.
