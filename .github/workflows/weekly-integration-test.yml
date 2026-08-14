@@ -29,10 +29,10 @@ on:
 
       # --- transaction generation (scripts/generate_traffic.py) ---
       tx_round_count:
-        description: 'Round-robin send/check/settle cycles to run (3 block-heights and 14 transactions each); also sets the reorg baseline height (tx_round_count + 2) -- see reorg_length. Leave blank for the default -- see README.md''s variable table (defaults live in the env: block below, not restated here to avoid drift).'
+        description: 'Round-robin send/check/settle cycles to run (3 block-heights and 14 transactions each); also sets the reorg baseline height (tx_round_count + 2) -- see reorg_length_blocks. Leave blank for the default -- see README.md''s variable table (defaults live in the env: block below, not restated here to avoid drift).'
 
       # --- reorg shape ---
-      reorg_length:
+      reorg_length_blocks:
         description: 'Blocks each isolated group builds past the baseline before reconnecting at the tie. How many blocks past this the winning side needs before the reorg actually triggers is no longer an input -- simulate_reorg.py probes for it live, see doc/scripts.md. Leave blank for the default -- see README.md''s variable table.'
 
       # --- block interval ---
@@ -81,7 +81,7 @@ env:
   # budget" note -- see there for the reasoning behind these values.
   TX_ROUND_COUNT: ${{ inputs.tx_round_count || ((github.event_name == 'pull_request' || github.event_name == 'push') && '10' || '60') }}
   ROUND_DURATION: ${{ inputs.round_duration_seconds || '30' }}
-  REORG_LENGTH: ${{ inputs.reorg_length || ((github.event_name == 'pull_request' || github.event_name == 'push') && '5' || '30') }}
+  REORG_LENGTH_BLOCKS: ${{ inputs.reorg_length_blocks || ((github.event_name == 'pull_request' || github.event_name == 'push') && '5' || '30') }}
   MAX_BLOCK_SIZE_NEW: ${{ inputs.max_block_size_new || '2000000' }}
 
 jobs:
@@ -135,15 +135,15 @@ jobs:
           name: environment-fingerprint
           path: environment.txt
 
-      - name: Derive CHAIN_HEIGHT_BEFORE_REORG from TX_ROUND_COUNT
+      - name: Derive REORG_BASELINE_HEIGHT from TX_ROUND_COUNT
         # env: expressions have no arithmetic -- ties the reorg baseline to TX_ROUND_COUNT.
-        run: echo "CHAIN_HEIGHT_BEFORE_REORG=$((TX_ROUND_COUNT + 2))" >> "$GITHUB_ENV"
+        run: echo "REORG_BASELINE_HEIGHT=$((TX_ROUND_COUNT + 2))" >> "$GITHUB_ENV"
 
-      - name: Derive FEDERATION_CHANGE_HEIGHT from REORG_LENGTH
-        run: echo "FEDERATION_CHANGE_HEIGHT=$REORG_LENGTH" >> "$GITHUB_ENV"
+      - name: Derive FEDERATION_CHANGE_OFFSET_BLOCKS from REORG_LENGTH_BLOCKS
+        run: echo "FEDERATION_CHANGE_OFFSET_BLOCKS=$REORG_LENGTH_BLOCKS" >> "$GITHUB_ENV"
 
-      - name: Derive MAX_BLOCK_SIZE_HEIGHT from FEDERATION_CHANGE_HEIGHT
-        run: echo "MAX_BLOCK_SIZE_HEIGHT=$FEDERATION_CHANGE_HEIGHT" >> "$GITHUB_ENV"
+      - name: Derive MAX_BLOCK_SIZE_OFFSET_BLOCKS from FEDERATION_CHANGE_OFFSET_BLOCKS
+        run: echo "MAX_BLOCK_SIZE_OFFSET_BLOCKS=$FEDERATION_CHANGE_OFFSET_BLOCKS" >> "$GITHUB_ENV"
 
       - name: Checkout tapyrus-core + tapyrus-signer + tapyrus-seeder
         run: ./scripts/checkout_repos.py

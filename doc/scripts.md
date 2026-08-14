@@ -489,16 +489,16 @@ that the height advanced. Implemented as `ReorgSimulator`, following
 via `scripts/lib/compose.py`'s shared helpers.
 
 - **Usage**: `./scripts/simulate_reorg.py` (no arguments -- reads
-  `CHAIN_HEIGHT_BEFORE_REORG` / `REORG_LENGTH` / `ROUND_DURATION` from the
+  `REORG_BASELINE_HEIGHT` / `REORG_LENGTH_BLOCKS` / `ROUND_DURATION` from the
   environment, same job-level env vars the workflow already sets).
 - Requires the 7-node topology and signer-set-a already up and converged (same
   precondition as `generate_traffic.py`, which this step runs right after in the
   workflow).
 - **The recipe, in order**: build a common baseline (all 7 nodes) -- stop group A
-  entirely, repoint all 3 signers to group B (`core-3a`), let it build `REORG_LENGTH`
+  entirely, repoint all 3 signers to group B (`core-3a`), let it build `REORG_LENGTH_BLOCKS`
   blocks completely alone -- stop group B, restart group A, reset redis fresh --
   repoint signers back to group A's default mapping, inject the canary transaction,
-  let group A build its *own* `REORG_LENGTH` blocks (genuinely different from group
+  let group A build its *own* `REORG_LENGTH_BLOCKS` blocks (genuinely different from group
   B's, since it never saw group B's blocks or round-state) -- reconnect group B
   alongside group A (a real tie: same height, different tips) and confirm the tie
   alone doesn't cause a reorg -- repoint signers to group B one more time and extend
@@ -508,7 +508,7 @@ via `scripts/lib/compose.py`'s shared helpers.
   height, since group A can only satisfy that by actually reorging --
   confirm convergence via `getchaintips` on all 7 nodes -- verify the canary
   survived.
-- **`CHAIN_HEIGHT_BEFORE_REORG` is a floor, not an assumed starting point**: the
+- **`REORG_BASELINE_HEIGHT` is a floor, not an assumed starting point**: the
   workflow always sets it to `TX_ROUND_COUNT + 2` (see the root `README.md`'s
   variable table), tying it to whatever `generate_traffic.py` produces first in the
   same job. `_build_baseline` waits until height >= that floor, then captures
@@ -561,7 +561,7 @@ via `scripts/lib/compose.py`'s shared helpers.
   any step raises `ReorgError` (non-zero exit); failures across all 7 nodes are
   collected and reported together, not just the first one hit.
 - **Verified live, twice, against a real 7-node + signer-set-a stack** (smoke scale,
-  `REORG_LENGTH=2`, `ROUND_DURATION=60`): both runs produced genuinely different
+  `REORG_LENGTH_BLOCKS=2`, `ROUND_DURATION=60`): both runs produced genuinely different
   group A/group B forks (distinct tip hashes throughout, unlike the old design) and
   converged correctly -- 6/7 nodes exactly matching expectations plus the `core-7`
   nuance above on the first attempt; the second run (re-run against the same
@@ -585,7 +585,7 @@ docstring for the full design (xfield encoding, `federations.toml` membership ru
 the shared node-0 identity, live-reload mechanics, the shared-redis open question).
 
 - **Usage**: `./scripts/simulate_federation_change.py` (no arguments -- reads
-  `ROUND_DURATION` / `FEDERATION_CHANGE_HEIGHT` from the environment).
+  `ROUND_DURATION` / `FEDERATION_CHANGE_OFFSET_BLOCKS` from the environment).
 - Requires signer-set-a already generated and signing (same precondition as
   `simulate_reorg.py`).
 - **signer-0/1/2 are never stopped or restarted** -- their `federations.toml` is
@@ -612,7 +612,7 @@ Implemented as `MaxBlockSizeChangeSimulator`, reusing `simulate_federation_chang
 `XFieldSignoffCeremony` directly (it's generic over which xfield gets signed).
 
 - **Usage**: `./scripts/simulate_maxblocksize_change.py` (no arguments -- reads
-  `ROUND_DURATION` / `MAX_BLOCK_SIZE_HEIGHT` / `MAX_BLOCK_SIZE_NEW` from the
+  `ROUND_DURATION` / `MAX_BLOCK_SIZE_OFFSET_BLOCKS` / `MAX_BLOCK_SIZE_NEW` from the
   environment).
 - **Requires signer-set-b already active** -- `simulate_federation_change.py`'s
   rotation must have already been confirmed; this step signs off using signer-set-b's

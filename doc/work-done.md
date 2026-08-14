@@ -13,7 +13,7 @@ does.
 
 - **CI timing is capped at GitHub-hosted's 6h hard limit.** Blocks only come from the
   live signer round-robin (`ROUND_DURATION` cadence, no instant-mining), so scenario
-  time is `blocks x ROUND_DURATION`. Size `tx_round_count`/`reorg_length`/
+  time is `blocks x ROUND_DURATION`. Size `tx_round_count`/`reorg_length_blocks`/
   `round_duration` accordingly.
 - **No compose-level healthchecks yet** (`depends_on: condition: service_healthy`).
   `scripts/wait_for_topology.py` covers this at the CI level by checking real P2P
@@ -195,11 +195,14 @@ does.
 - **`pull_request`/`push` smoke trigger** validates changes to `scripts/**`,
   `docker/**`, `config/**`, or the workflow itself before merge, at reduced scale
   (`timeout-minutes: 180` vs. 360).
-- **`CHAIN_HEIGHT_BEFORE_REORG`/`FEDERATION_CHANGE_HEIGHT` are floors, not literal
-  targets.** `CHAIN_HEIGHT_BEFORE_REORG` is `TX_ROUND_COUNT + 2`;
-  `simulate_reorg.py` waits for at least that height, then uses the actual height
-  reached. `FEDERATION_CHANGE_HEIGHT` is `REORG_LENGTH`, counted from whatever height
-  the chain is at when `simulate_federation_change.py` runs.
+- **`REORG_BASELINE_HEIGHT` is a floor, not a literal target; `FEDERATION_CHANGE_OFFSET_BLOCKS`
+  is an offset, not an absolute height at all** -- the two are named to reflect that
+  difference, not interchangeable "height" concepts. `REORG_BASELINE_HEIGHT` is
+  `TX_ROUND_COUNT + 2`; `simulate_reorg.py` waits for at least that height, then uses
+  the actual height reached. `FEDERATION_CHANGE_OFFSET_BLOCKS` is `REORG_LENGTH_BLOCKS`,
+  added to whatever height the chain is at when `simulate_federation_change.py` runs --
+  there's no floor/target distinction for it, since it was never a height to wait for
+  in the first place.
 - **Git submodules**: `tapyrus-core` vendors `secp256k1` as a submodule.
   `checkout_repos.py` runs `git submodule update --init --recursive` after every
   clone/update.

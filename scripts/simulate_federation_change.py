@@ -63,7 +63,7 @@ Usage:
     ./scripts/simulate_federation_change.py
 
 Requires signer-set-a already generated and signing (same precondition as
-scripts/simulate_reorg.py). Reads ROUND_DURATION / FEDERATION_CHANGE_HEIGHT from the
+scripts/simulate_reorg.py). Reads ROUND_DURATION / FEDERATION_CHANGE_OFFSET_BLOCKS from the
 environment -- the same job-level env vars the workflow already sets for the other
 steps.
 
@@ -560,7 +560,7 @@ class FederationChangeSimulator:
 
 async def main():
     round_duration = os.environ.get("ROUND_DURATION", "60")
-    height_offset = int(os.environ.get("FEDERATION_CHANGE_HEIGHT", "10"))
+    height_offset = int(os.environ.get("FEDERATION_CHANGE_OFFSET_BLOCKS", "10"))
 
     log.step(f"simulating a federation change: signer-set-b takes over {height_offset} block(s) from now")
     simulator = FederationChangeSimulator(round_duration, height_offset)

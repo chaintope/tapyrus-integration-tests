@@ -31,7 +31,7 @@ Usage:
     ./scripts/simulate_maxblocksize_change.py
 
 Requires signer-set-b already active (scripts/simulate_federation_change.py's
-rotation already confirmed via RPC). Reads ROUND_DURATION / MAX_BLOCK_SIZE_HEIGHT /
+rotation already confirmed via RPC). Reads ROUND_DURATION / MAX_BLOCK_SIZE_OFFSET_BLOCKS /
 MAX_BLOCK_SIZE_NEW from the environment -- the same job-level env vars the workflow
 already sets for the other steps.
 
@@ -264,7 +264,7 @@ class MaxBlockSizeChangeSimulator:
 
 async def main():
     round_duration = os.environ.get("ROUND_DURATION", "60")
-    height_offset = int(os.environ.get("MAX_BLOCK_SIZE_HEIGHT", "10"))
+    height_offset = int(os.environ.get("MAX_BLOCK_SIZE_OFFSET_BLOCKS", "10"))
     new_max_block_size = int(os.environ.get("MAX_BLOCK_SIZE_NEW", "2000000"))
 
     require_executable(

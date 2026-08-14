@@ -125,14 +125,14 @@ input; the rest fall back straight to their `env:` literal on every trigger,
 | `seeder_repo_url` | see `config/repos.py` | `tapyrus-seeder` git URL to check out from -- a fork, to test a branch that only exists there |
 | `seeder_repo_ref` | see `config/repos.py` | `tapyrus-seeder` branch/tag/sha to check out |
 | `tx_round_count` | `60` (`10` on pull_request/push) | Round-robin send/check/settle cycles `scripts/generate_traffic.py` runs -- each is 3 block-heights and 14 transactions (7 nodes x {TPC send, colored send-or-mint}), so this alone determines the tx/block/height totals for that step. Also determines the reorg's baseline height -- see below. Sized against the CI timing budget, see `doc/work-done.md` |
-| `reorg_length` | `30` (`5` on pull_request/push) | Blocks each isolated group builds past the baseline, alone, before reconnecting at the tie (`scripts/simulate_reorg.py`: group B builds first while group A is stopped entirely, then group A builds its own, genuinely different set while group B is stopped). Group B is then always extended by exactly 2 more blocks to win (not 1 -- `core-3a` produced group A's original tip itself, so it needs a second block to reclassify that tip as `valid-fork` instead of `valid-headers`) -- not configurable, and not probed for -- see `doc/scripts.md` |
+| `reorg_length_blocks` | `30` (`5` on pull_request/push) | Blocks each isolated group builds past the baseline, alone, before reconnecting at the tie (`scripts/simulate_reorg.py`: group B builds first while group A is stopped entirely, then group A builds its own, genuinely different set while group B is stopped). Group B is then always extended by exactly 2 more blocks to win (not 1 -- `core-3a` produced group A's original tip itself, so it needs a second block to reclassify that tip as `valid-fork` instead of `valid-headers`) -- not configurable, and not probed for -- see `doc/scripts.md` |
 | `round_duration_seconds` | `30` | `tapyrus-signerd` round-duration (block interval) -- verified clean, see `doc/work-done.md`'s Lessons learnt (`10` is confirmed to hit transient `InvalidBlock` errors) |
 | `network_id` | `1905960821` | Tapyrus network id (prod mode, see `doc/work-done.md`), used by every core-* node's rendered `tapyrus.conf` and the `genesis.<id>` file `tapyrusd` looks for |
 | `docker_build_platform` | *(empty, runner-native)* | Docker `--platform` for image builds -- local verification only ever used `linux/arm64` |
 
-`FEDERATION_CHANGE_HEIGHT` is always `REORG_LENGTH` (computed by the "Derive
-FEDERATION_CHANGE_HEIGHT from REORG_LENGTH" workflow step), and `MAX_BLOCK_SIZE_HEIGHT`
-is always `FEDERATION_CHANGE_HEIGHT` in turn -- `scripts/simulate_federation_change.py`
+`FEDERATION_CHANGE_OFFSET_BLOCKS` is always `REORG_LENGTH_BLOCKS` (computed by the "Derive
+FEDERATION_CHANGE_OFFSET_BLOCKS from REORG_LENGTH_BLOCKS" workflow step), and `MAX_BLOCK_SIZE_OFFSET_BLOCKS`
+is always `FEDERATION_CHANGE_OFFSET_BLOCKS` in turn -- `scripts/simulate_federation_change.py`
 and `scripts/simulate_maxblocksize_change.py` each schedule their change that many
 blocks past whatever height the chain is at when they run, not a fixed literal.
 `max_block_size_new` (`2000000`) is env-literal only, no per-run `workflow_dispatch`
@@ -146,9 +146,9 @@ the TPC/colored-coin split, and per-send pacing; the script settled on a single
 round-count-only design"), so these three no longer correspond to anything the script
 reads -- not obsolete inputs waiting for a slot, just dead names.
 
-**No input at all** (not even an env-literal fallback): `chain_height_before_reorg`.
-`CHAIN_HEIGHT_BEFORE_REORG` is always `TX_ROUND_COUNT + 2` (computed by the "Derive
-CHAIN_HEIGHT_BEFORE_REORG from TX_ROUND_COUNT" workflow step, since `env:` block
+**No input at all** (not even an env-literal fallback): `reorg_baseline_height`.
+`REORG_BASELINE_HEIGHT` is always `TX_ROUND_COUNT + 2` (computed by the "Derive
+REORG_BASELINE_HEIGHT from TX_ROUND_COUNT" workflow step, since `env:` block
 expressions have no arithmetic operators) -- ties the reorg's baseline directly to
 whatever `scripts/generate_traffic.py` actually produces first in the same job,
 rather than an independently-configured value that could silently drift out of sync
@@ -158,10 +158,10 @@ waits until the chain reaches at least that height, then uses whatever height wa
 runs first) as the real reference point for both forks' target -- see
 `doc/work-done.md` for why that distinction matters.
 
-Same treatment for `federation_change_height` and `max_block_size_height`:
-`FEDERATION_CHANGE_HEIGHT` is always `REORG_LENGTH` (computed by the "Derive
-FEDERATION_CHANGE_HEIGHT from REORG_LENGTH" workflow step), and `MAX_BLOCK_SIZE_HEIGHT`
-is always `FEDERATION_CHANGE_HEIGHT` in turn -- `scripts/simulate_federation_change.py`
+Same treatment for `federation_change_offset_blocks` and `max_block_size_offset_blocks`:
+`FEDERATION_CHANGE_OFFSET_BLOCKS` is always `REORG_LENGTH_BLOCKS` (computed by the "Derive
+FEDERATION_CHANGE_OFFSET_BLOCKS from REORG_LENGTH_BLOCKS" workflow step), and `MAX_BLOCK_SIZE_OFFSET_BLOCKS`
+is always `FEDERATION_CHANGE_OFFSET_BLOCKS` in turn -- `scripts/simulate_federation_change.py`
 and `scripts/simulate_maxblocksize_change.py` each schedule their change this many
 blocks past whatever height the chain is at when *they* run (already well past the
 reorg/rotation and another traffic round by then), so there's no independently-meaningful
