@@ -334,6 +334,22 @@ does.
   since a block landing mid-read across 7 nodes can mix pre- and post-block
   state into one supposedly-consistent snapshot, surfacing as a spurious
   mismatch with no real cause.
+- **The same double-credit failure mode as above, a third way in:
+  `_seed_ledger_with_current_balances` returned `min(reachable)` as the height
+  its balance snapshot was seeded at.** Caught via review before a live CI
+  failure this time. The consistent-read loop only requires each node's own
+  height to be stable (`before == after`), not that every node agrees -- a
+  chaos node can sit stably behind the tip for the whole snapshot (e.g. mid
+  `invalidateblock` when the pause landed) and still pass, so `reachable` can
+  legitimately span multiple heights. `min()` anchors to that lagging node's
+  height instead of the tip the seeded balances were actually read at; the
+  first crediting pass then re-credits heights already folded into them.
+  Fixed with `max()`: a block is always submitted to its earner's own RPC
+  node first, and `core-1a`/`2a`/`3a` (the only earners) are never
+  chaos-restarted or invalidated, so earner(h)'s own height is always `>= h`
+  -- every height `<=` the snapshot's max is already folded into that
+  earner's just-seeded balance, and no height above it is. No under-credit
+  either: a block landing mid-snapshot changes `after` and the loop retries.
 - **A `PendingChange` whose sender is one of `node_orchestrator.py`'s
   `CHAOS_NODES` (`core-1b`/`core-2b`/`core-3b`/`core-7`) can still get wrongly
   dropped even with the two-attempt check/settle tolerance above, if that same

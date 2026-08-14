@@ -363,7 +363,20 @@ class TrafficGenerator:
             reachable = [h for h in after.values() if h is not None]
             if not reachable:
                 raise RpcUnreachable("no node was reachable to determine the seeded ledger's height")
-            return min(reachable)
+            # max, not min: the consistent-read loop above only requires each node's
+            # own height to be stable (before == after), not that every node agrees --
+            # a chaos node can sit stably behind the tip for the whole snapshot (e.g.
+            # mid invalidateblock when the pause landed) and still pass. A block is
+            # always submitted to its earner's own RPC node first, and core-1a/2a/3a
+            # (the only earners) are never chaos-restarted or invalidated, so
+            # earner(h)'s own height is always >= h -- every height <= this snapshot's
+            # max is already folded into that earner's just-seeded balance, and no
+            # height above it is. min() would instead anchor to a lagging chaos node's
+            # height, and the first crediting pass would then re-credit heights
+            # already folded into the seeded balances -- the same double-credit
+            # failure mode as elsewhere in this file, reached through height
+            # selection here rather than a dropped PendingChange.
+            return max(reachable)
         finally:
             resume_node_orchestrators()
 
