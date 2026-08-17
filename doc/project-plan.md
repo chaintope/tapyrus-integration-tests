@@ -138,12 +138,24 @@ Each of these corresponds to a step in `.github/workflows/weekly-integration-tes
   Lessons learnt for the underlying investigation (ADDR gossip, DNS-seed reliability
   thresholds, why `-connect` nodes never populate their own addrman, and why the
   compose network needs a specific custom subnet).
+- [x] Per-node lifecycle orchestrator (scenario step 5) -- `scripts/container/node_orchestrator.py`,
+  running inside every core-* container (`scripts/start_node_orchestrator.py` switches
+  them into this mode right after the seeder step). core-1b/2b/3b/core-7 randomly
+  stop/restart/reindex/invalidate themselves for the rest of the job; core-1a/2a/3a
+  (the signers' own RPC targets) get crash-recovery supervision but never a
+  deliberate chaos action, since even one of them briefly catching up from a
+  restart could throw off `generate_traffic.py`'s coinbase-rotation tracking. A
+  shared pause file protects `simulate_reorg.py`/`simulate_federation_change.py`/
+  `simulate_maxblocksize_change.py`/`generate_traffic.py`'s own precise node
+  up/down assumptions during their sensitive windows. See `work-done.md` for the
+  full design. Verified live: `wait_for_topology.py` converges cleanly under
+  chaos, and multiple full `generate_traffic.py` runs against the chaos-supervised
+  stack settled with balances matching the ledger every time, zero mismatches.
+
 ## Outstanding work
 
 Everything not yet implemented or not yet testable, in one place:
 
-- **Per-node lifecycle orchestrator**: RPC health/height/mempool query, stop,
-  restart, confirm resync for each of the 7 nodes (scenario step 5). Not started.
 - **Harder transaction-survival-at-reorg cases** beyond the simple canary already
   covered: (a) a dependent-transaction chain (a second transaction spending the
   canary's own output, both confirmed only post-split), to check whether the mempool

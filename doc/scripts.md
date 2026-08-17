@@ -35,12 +35,21 @@ Shared code the scripts below import rather than duplicate:
 - `lib/rpc.py` -- `CoreRpcClient`, a minimal Tapyrus Core JSON-RPC client (stdlib
   `urllib`, no `requests` dependency) used by `collect_coinbase_addresses.py`,
   `wait_for_topology.py`, `generate_traffic.py`, `simulate_reorg.py`,
-  `simulate_federation_change.py`, and `simulate_maxblocksize_change.py`. The
-  per-node lifecycle orchestrator (not yet built) will be another consumer once it
-  exists. `call()` is `async def`; since stdlib has no async HTTP client, it wraps the
+  `simulate_federation_change.py`, `simulate_maxblocksize_change.py`, and
+  `scripts/container/node_orchestrator.py` (bind-mounted into each core-* container
+  -- confirmed stdlib-only, so it runs there unchanged, see that section below).
+  `call()` is `async def`; since stdlib has no async HTTP client, it wraps the
   blocking `urllib` call in `asyncio.to_thread` so multiple calls can still run
   concurrently. Raises `RpcUnreachable` (connection refused, timeout -- treat as "not
   ready yet") separately from `RpcError` (the node answered with a JSON-RPC error).
+- `lib/orchestrator_control.py` -- `pause_node_orchestrators()`/
+  `resume_node_orchestrators()`, a shared pause file every core-* node's
+  `node_orchestrator.py` checks before any chaos action. Calls nest (a depth
+  counter, not a plain touch/unlink), so an inner pause/resume pair doesn't
+  prematurely resume chaos while an outer caller still needs it paused. Used by
+  `simulate_reorg.py`, `simulate_federation_change.py`, `simulate_maxblocksize_change.py`,
+  and `generate_traffic.py` to protect their own precise node up/down assumptions --
+  see `work-done.md`.
 - `lib/compose.py` -- `start_nodes()`/`stop_nodes()`/`bring_up()`/`recreate_fresh()`,
   thin wrappers around `docker compose <subcommand> <service names>` (run from
   `docker/`), used by `simulate_reorg.py` and `simulate_federation_change.py`. Every
@@ -233,6 +242,8 @@ design rather than a single `dig` call.
   at all, only `-addseeder`, its container DNS resolver pointed at the seeder via
   `SEEDER_IP`) and confirms it auto-bootstraps onto one of the 6 listening nodes
   through the seeder alone.
+- **`core-2b`'s `CONNECT_MODE_ARGS` entry carries `-persistmempool=1`**, the one
+  difference from its sibling chaos nodes' args here -- see `work-done.md` for why.
 - **Both `seeder-test-node` and `seeder` itself are stopped and removed once `run()`
   finishes, in a `finally` (guaranteed on failure too, not just success).** Left
   running, `seeder-test-node`'s persistent connection into whichever listener it
@@ -246,6 +257,70 @@ design rather than a single `dig` call.
 - **Output**: none written to disk -- verification results are logged; a mismatch
   at any check raises `SeederVerificationError` (non-zero exit).
 - **Active in the workflow** as "Bring up tapyrus-seeder and verify it".
+
+## `scripts/start_node_orchestrator.py`
+
+Switches the 7 core-* nodes `verify_seeder.py`'s connect-mode phase left running
+into "connect + orchestrator" mode: tears them down and recreates them with
+`NODE_ORCHESTRATOR` set, so each one's `entrypoint_wrapper.sh` hands off to
+`scripts/container/node_orchestrator.py` instead of running `tapyrusd` directly.
+From this point on, every core-* node randomly stops/restarts/reindexes/invalidates
+itself for the rest of the job -- see `doc/work-done.md` for the full design.
+
+- **Usage**: `./scripts/start_node_orchestrator.py` (no arguments -- reuses
+  `verify_seeder.py`'s own `CONNECT_MODE_ARGS`/`CORE_NODES`/`CORE_RPC_PORTS`
+  directly rather than duplicating them).
+- Only brings the chaos-supervised nodes up and confirms their RPC is reachable --
+  does not itself wait for chaos or assert recovery. The rest of the workflow's own
+  existing checks (`wait_for_topology.py`, every `generate_traffic.py` settle-height
+  assertion, `simulate_reorg.py`'s `getchaintips` checks) are what actually prove the
+  network keeps converging under chaos.
+- **Output**: none written to disk -- a node whose RPC never comes back up raises
+  `NodeOrchestratorStartupError` (non-zero exit).
+- **Active in the workflow** as "Start node orchestrator", right after "Bring up
+  tapyrus-seeder and verify it" -- the script itself persists
+  `NODE_ORCHESTRATOR=1` to `$GITHUB_ENV` after it succeeds (`_persist_env_for_rest_of_job`,
+  same pattern as `verify_seeder.py`'s own), since setting it only within this
+  script's own process isn't enough: `signer-0`/`signer-1`/`signer-2` and
+  signer-set-b's services all `depends_on` a core-1a/2a/3a node, so any later
+  `docker compose up` touching them needs to resolve the same value or Compose
+  recreates that core node to match, reverting it to plain `tapyrusd` (see
+  `work-done.md`).
+
+## `scripts/container/`
+
+Two files that run **inside** a core-* container, not on the CI host like
+everything else in `scripts/` -- bind-mounted read-only (`../scripts:/app/scripts:ro`,
+`docker/docker-compose.yml`) and only active once `start_node_orchestrator.py`
+switches a node into orchestrator mode.
+
+- **`entrypoint_wrapper.sh`**: every core-* service's `command:` now, in every
+  bring-up mode. Reads the `NODE_ORCHESTRATOR` env var: unset, `exec tapyrusd "$@"`
+  directly (identical to before this existed); set, hands off to
+  `node_orchestrator.py` instead. Keeps `docker-compose.yml`'s own command line
+  unchanged across modes instead of nesting a conditional inside the image's own
+  `bash -c "$*"` entrypoint.
+- **`node_orchestrator.py`**: launches `tapyrusd` as a child process and supervises
+  it -- crash recovery (relaunches plain if it ever exits unexpectedly) always
+  applies, for every node. core-1b/2b/3b/core-7 additionally run a randomized action
+  loop for as long as the container runs, after a 360s startup grace period (see
+  `work-done.md`). Every cycle shuffles and runs: a plain restart, a restart with
+  this node's assigned flavor (`-reindex`/`-reindex-chainstate`/`-reloadxfield`,
+  round-robin across all 7 nodes -- see `NODE_ORCHESTRATOR_FLAVOR` in
+  `docker-compose.yml`), and an invalidateblock-then-reconsiderblock pair on the
+  current tip -- guaranteeing every chaos node does at least one of each, in random
+  order, with random delays between. A restarted node stays down until the rest of
+  the network produces a couple more real blocks, bounded at 90s (`work-done.md`).
+  core-1a/2a/3a (the 3 signers' own RPC targets) never join this loop at all -- see
+  `work-done.md` for why. Every action also checks a shared pause file first
+  (`scripts/lib/orchestrator_control.py`) -- see `simulate_reorg.py`/
+  `simulate_federation_change.py`/`simulate_maxblocksize_change.py`/
+  `generate_traffic.py` for where and why they pause it. `PRNG_SEED_BASE`
+  (`github.run_id`) seeds each node's own RNG -- deterministic and reproducible per
+  run, previously defined but unconsumed anywhere.
+- Reuses `scripts/lib/rpc.py` and `scripts/lib/log.py` unchanged (both pure stdlib,
+  confirmed safe in a minimal container) -- not `scripts/lib/compose.py`, which needs
+  the `docker` CLI/socket and stays host-only.
 
 ## `scripts/wait_for_topology.py`
 
@@ -367,9 +442,24 @@ assignment, and the balance-shortfall top-up mechanic). Implemented as `TrafficN
   throughout. See `doc/work-done.md`'s Lessons learnt for the full incident.
 - **Active in the workflow**, right after "Bring up signers" -- uncommented along
   with `simulate_reorg.py` (which runs right after it) and their shared prerequisite,
-  signer-set-a bring-up; the per-node lifecycle orchestrator is the one piece still
-  genuinely unbuilt (rotation and max-block-size change are both active too, see
+  signer-set-a bring-up (rotation and max-block-size change are both active too, see
   their own sections below).
+- **Every setup/verification RPC sequence is chaos-tolerant**, since this script runs
+  against the node orchestrator's background chaos (`work-done.md`): address
+  collection, balance seeding, every per-height coinbase credit, every block wait,
+  and every balance verification all pause chaos for their own span
+  (`scripts/lib/orchestrator_control.py`) *and* retry individual RPC calls on
+  `RpcUnreachable` (`_call_with_retry`) rather than treating one node's momentary
+  restart as a hard failure -- the pause file alone can't interrupt a restart already
+  in flight the instant it lands. In practice this means chaos is mostly
+  suppressed during this script's own run, not overlapping it: block waits are the
+  overwhelming majority of its wall time, and each one pauses chaos for its
+  duration, so most real churn happens between workflow steps rather than during
+  traffic generation itself. Relaxing the all-7-nodes wait to tolerate stragglers
+  (e.g. require only the 3 stable RPC targets) would let chaos genuinely overlap
+  traffic -- a real follow-up, not done here.
+  Verified live against a real chaos-supervised 7-node stack: multiple full runs,
+  every balance/color check across all 7 nodes matched the ledger, zero mismatches.
 - **`core-1a`/`2a`/`3a`'s coinbase income is fully asserted too**, not excluded --
   observed directly. `_credit_coinbase_for_height` reads each height's real
   coinbase transaction and credits whichever of the 3 wallets actually has it,
@@ -377,6 +467,15 @@ assignment, and the balance-shortfall top-up mechanic). Implemented as `TrafficN
   so two blocks landing between polls don't leave one uncredited). The reward
   itself is not a flat amount -- subsidy plus whatever transaction fees that
   block happened to include, confirmed live.
+- **A still-pending change gets one more block's grace before the truly final
+  drop, regardless of sender**: `_give_final_grace` is called with whatever's
+  still unconfirmed after settle-height's own (non-final) check, waits for one
+  more block, then makes the actual final confirmation check there. A change
+  whose sender is in `CHAOS_SENDER_GRACE_NODES` (all 4 of `node_orchestrator.py`'s
+  `CHAOS_NODES`) additionally calls `_wait_for_sender_sync` first (waits for that node's own
+  tip to match the network's, height and blockhash, against `core-1a` as
+  reference). Wired into both the setup phase (funding/issuance) and every
+  round. See `doc/work-done.md` for why.
 
 ## `scripts/simulate_reorg.py`
 
@@ -432,17 +531,33 @@ via `scripts/lib/compose.py`'s shared helpers.
   depending on the original "Collect coinbase addresses" step's `/tmp` file still
   being around. The reconnect step reuses `wait_for_topology.py`'s `TopologyWaiter`
   directly, same reasoning.
-- **`core-7` needs a different convergence check than `core-3a`/`core-3b`**:
-  `core-3a`/`core-3b` are only P2P-connected within group B (see
-  `docker-compose.yml`'s topology), so each should show a single active
-  `getchaintips` tip. `core-7`, by design, is P2P-connected to *all three*
-  second-layer nodes, bridging both groups -- so it legitimately learns group A's
-  abandoned fork via header relay even though it never builds/extends it, showing a
-  second tip at group A's height with status `valid-headers` (headers relayed and
-  known, not necessarily fully-validated as a real candidate), not `valid-fork` like
-  the ex-group-A nodes, since group B's own chain was always at least as long by the
-  time `core-7` reconnects to it. `_confirm_convergence` only asserts `core-7`'s
-  *active* tip matches group B, not its total tip count.
+- **Every node's expected `getchaintips` shape at `_confirm_convergence` is
+  derived from two propagation mechanisms, not just P2P adjacency**: (1) each
+  signer submits a block it masters directly to its own RPC target
+  (`core-1a`/`2a`/`3a`), no core-to-core P2P needed for that -- confirmed by
+  `_build_group_a_fork`'s own precondition (`signer-2`'s target `core-3a` is
+  unreachable while group B is stopped, and only `signer-0`/`1` submitting to
+  `core-1a`/`2a` independently is what still lets group A's fork round complete);
+  (2) P2P relay along `docker-compose.yml`'s static edges: `core-1a<->core-1b`,
+  `core-2a<->core-2b`, `core-3a<->core-3b`, `core-7<->{core-1b,core-2b,core-3b}`
+  -- `core-7` is the *only* bridge between the three otherwise-disconnected
+  pairs. From these:
+
+  | Node | Hops from group A | Expected tips |
+  |---|---|---|
+  | `core-1a`, `core-1b`, `core-2a`, `core-2b` | 0 (built it themselves) | Exactly 2, always: `active` = group B, `valid-fork` = group A (their own prior-active chain, demoted -- deterministic, exact hash/branchlen asserted) |
+  | `core-3a` | 3 (`1b`/`2b` -> `7` -> `3b` -> `3a`) | Exactly 1: `active` = group B only (never observed to leak within the reconnect window) |
+  | `core-3b` | 2 (`1b`/`2b` -> `7` -> `3b`) | `active` = group B, plus an *optional* `valid-headers` tip -- if present, must be group A's fork exactly, not just "any extra tip" (timing-dependent, not deterministic) |
+  | `core-7` | 1 (`1b`/`2b` -> `7`) | Same as `core-3b` |
+
+  `core-3b`/`core-7`'s optional tip, when present, is `valid-headers` (headers
+  relayed and known, not necessarily fully-validated as a real candidate), not
+  `valid-fork` like the ex-group-A nodes -- group B's own chain is always at
+  least as long by the time either reconnects, so neither ever adopts it. The
+  "must be group A's fork exactly, not just any extra tip" requirement was a
+  deliberate tightening: the original (`core-7`-only) version tolerated any
+  extra tip blindly, which would have silently passed a genuinely unexpected
+  chain too.
 - **Output**: none written to disk -- verification results are logged; a mismatch at
   any step raises `ReorgError` (non-zero exit); failures across all 7 nodes are
   collected and reported together, not just the first one hit.

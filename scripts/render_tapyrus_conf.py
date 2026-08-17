@@ -108,7 +108,7 @@ def main():
     renderer = TapyrusConfRenderer(network_id, rpc_user, rpc_pass)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(renderer.render())
-    log.info(f"wrote {args.output}")
+    log.info(f"done. wrote {args.output}")
 
 
 if __name__ == "__main__":

@@ -21,8 +21,6 @@ does.
 - **Signer count (3) and threshold (2) are hardcoded.** The 7-node topology is wired
   1:1 to exactly 3 signers, so changing the count means redesigning the topology, not
   just passing a new number.
-- **Per-node lifecycle orchestrator not built yet** -- see `project-plan.md`'s
-  Outstanding work.
 - **`generate_traffic.py`'s constants haven't been stress-tested at scale.**
   `FUNDING_AMOUNT_TPC`/`TOKEN_ISSUE_AMOUNT`/etc. work fine at small round counts, but
   a larger round count would trigger the balance-shortfall top-up mechanic much more
@@ -182,6 +180,83 @@ does.
   The right, achievable signal is simply: is there a peer whose `subver` isn't the
   seeder's own (`SEEDER_SUBVER`)? One real peer is enough proof, as long as it's
   the right one.
+- **The node orchestrator runs inside each core-* container, not as a host-driven
+  script** (`scripts/container/node_orchestrator.py`, `scripts/start_node_orchestrator.py`).
+  Every core-* node's `command:` (`docker-compose.yml`) is now
+  `entrypoint_wrapper.sh`, which hands off to `node_orchestrator.py` once
+  `NODE_ORCHESTRATOR` is set -- it launches `tapyrusd` as a child process and
+  supervises it directly, rather than being it, so it can genuinely stop/restart/
+  reindex/invalidate it via real RPC calls and still be the one to bring it back.
+  Continuous for the rest of the job (traffic generation, reorg, federation change,
+  max-block-size change all run against chaos-supervised nodes), not its own
+  isolated phase -- see the pause-file bullet below for how that's kept safe.
+- **core-1a/2a/3a never take a deliberate chaos action -- only core-1b/2b/3b/core-7
+  do** (`CHAOS_NODES` in `node_orchestrator.py`). core-1a/2a/3a are the 3 signers'
+  own RPC targets, threshold 2-of-3 -- disrupting them risks reducing available
+  signing capacity below threshold if more than one is ever down at once. They
+  still get crash-recovery supervision like every other node
+  (`_supervise_crashes`), just never a deliberate stop/restart/invalidate.
+  `NODE_ORCHESTRATOR_FLAVOR` is still set for these 3 in
+  `docker-compose.yml` (matching the round-robin assignment below) but is unused
+  dead config for them specifically, since nothing ever reads it without the chaos
+  loop running.
+- **Restart flavor is a static, round-robin assignment per node, not re-randomized
+  per action.** `-reindex`/`-reindex-chainstate`/`-reloadxfield` cycle across the 7
+  nodes (`NODE_ORCHESTRATOR_FLAVOR` in `docker-compose.yml`), though only
+  core-1b/2b/3b/core-7's assignment is actually exercised (see above). Every chaos
+  node still does a plain restart, its one flavored restart, and an
+  invalidate/reconsider at least once per cycle (shuffled order, random delays).
+- **A restarted node stays down until the rest of the network has produced a couple
+  more real blocks**, polled from another node, not a timer -- restarting at the
+  very next block wouldn't give peers real time to notice and drop the now-stale
+  connection. Bounded at 90s (`DOWNTIME_TIMEOUT_SECONDS`): kept well under
+  `wait_for_topology.py`'s own 300s convergence budget, since that check runs before
+  any signer/traffic exists, so the block-count condition can never be satisfied
+  during it and every downtime would otherwise fall through to the timeout.
+- **Chaos waits out a 360s startup grace period before its first action**
+  (`STARTUP_GRACE_SECONDS`). With several nodes each independently churning every
+  30-180s, some node is essentially always mid-restart, which fights
+  `wait_for_topology.py`'s own purpose of confirming the mesh formed correctly right
+  after bring-up. Chaos still runs continuously for the rest of the job; this only
+  delays its first action past that check's own budget.
+- **A shared pause file protects the other scenario scripts' own precise node
+  up/down assumptions from the orchestrator's chaos** (`scripts/lib/orchestrator_control.py`).
+  `simulate_reorg.py`'s isolated-build phases hard-depend on exactly one group being
+  completely up and building alone; `simulate_federation_change.py`/
+  `simulate_maxblocksize_change.py` each have a single, non-retrying
+  `getblockchaininfo` confirmation check that a node mid-restart at the wrong moment
+  would fail spuriously; `generate_traffic.py` brackets every all-nodes-reachable
+  RPC sequence the same way (address collection, balance seeding, every
+  per-height coinbase credit, every block wait, every balance verification). All
+  touch the pause file before their sensitive window and remove it in a `finally`
+  (guaranteed even on failure) -- every core node's orchestrator checks for it
+  before any action, not just restarts, so it also covers `invalidateblock`
+  (which doesn't take RPC down). Calls nest via a depth counter
+  (`pause_node_orchestrators`/`resume_node_orchestrators`), so an inner
+  pause/resume pair (e.g. `generate_traffic.py`'s own `_wait_for_next_block`,
+  called from within `_next_block_with_coinbase`'s own paused window) doesn't
+  prematurely resume chaos while an outer caller still needs it paused. The
+  pause file only stops *new* actions -- it can't interrupt one
+  already in flight the instant it lands, so `generate_traffic.py`'s own RPC calls
+  additionally retry on `RpcUnreachable` (`_call_with_retry`) rather than treating a
+  momentary straggler as a hard failure.
+- **`NODE_ORCHESTRATOR` must be persisted to `$GITHUB_ENV`, not just set within
+  `start_node_orchestrator.py`'s own process.** `signer-0`/`signer-1`/`signer-2` and
+  signer-set-b's services all `depends_on` a core-1a/2a/3a node in
+  `docker-compose.yml`. Without persisting it job-wide, any later `docker compose
+  up` touching those dependents (Bring up signers, Federation change) would resolve
+  `NODE_ORCHESTRATOR` back to unset, and Compose would recreate that core node to
+  match its now-different resolved config -- silently reverting it to plain
+  `tapyrusd`. Confirmed live: this exact drift happened mid-session. Persisted by
+  the script itself (`_persist_env_for_rest_of_job`, same pattern as
+  `verify_seeder.py`'s own), not by a separate `echo >> $GITHUB_ENV` in the
+  workflow step -- self-contained, so running this script in any other context
+  doesn't silently reintroduce the same drift.
+- **Every script logs a `done.` line as its last action, naming whatever it
+  handed off** (a file it wrote, an env var it persisted, a condition it
+  confirmed) -- a deliberate, uniform convention, not incidental: `grep '\] done\.'`
+  across a job's combined log surfaces every script's completion point, in order,
+  as a one-line trace of the whole pipeline's handoffs.
 - **Secrets scope**: this repo only generates local dev secrets
   (`generate_dev_secrets.py`); it never provisions real GitHub secrets. No CI
   secret is currently needed at all -- Slack notification was deferred (see
@@ -225,6 +300,160 @@ does.
   `docker compose` next -- not a per-script patch, since any future script with
   the same oversight would reintroduce the same failure mode. "Bring up signers"
   also gained `--no-deps` as defense in depth.
+- **Chaos-triggered `invalidateblock` corrupted `generate_traffic.py`'s ledger two
+  distinct ways, both traced to a real CI failure via the container logs.** (1)
+  `_current_height()` takes `min()` across all 7 nodes; a chaos node's own
+  transient height regression (mid-`invalidateblock`) could rewind
+  `_last_credited_height`, a bare assignment at the time, making a later call
+  re-credit an already-credited coinbase height. Fixed with `max()` --
+  monotonic regardless of when a regression lands. (2) sends/issuances credited
+  the ledger the instant broadcast succeeded, with no on-chain confirmation
+  check -- confirmed live, one transaction broadcast right as a chaos node's
+  `invalidateblock` hit was relayed once and never confirmed again, permanently
+  draining the ledger's agreement with reality. Fixed: `_send_tpc`/
+  `_send_or_topup_color`/`_topup_color`/`_issue_color`/`_fund_unfunded_nodes` now
+  return a `PendingChange` instead of mutating the ledger directly;
+  `_resolve_pending_changes` applies it only once every one of its txids has
+  actually confirmed (checked at the round's existing check/settle heights),
+  dropping it -- uncredited, not counted as a successful action -- if it never
+  does. Also traced *why* three independently-seeded chaos nodes invalidated the
+  exact same block in the exact same second in that run: not a seeding problem
+  (`random.Random(f"{PRNG_SEED_BASE}:{node_name}")` already gives each node an
+  uncorrelated stream) -- the shared pause file is a release barrier. A node
+  whose own randomized timer expires during any of `generate_traffic.py`'s
+  frequent brief pauses queues at `_wait_out_pause()` and fires the instant the
+  file disappears, regardless of how spread out its original timer was. Added a
+  random 0-15s jitter after a gated release to destagger this.
+- **Setup's funding/issuance `PendingChange`s used to resolve with a single
+  `final=True` check, unlike the round loop's own two-attempt check/settle --
+  traced to a real CI failure where a perfectly valid transaction that just
+  needed one more block got dropped anyway, corrupting the ledger the same
+  two ways as above.** Fixed: setup now gets the same two-attempt pattern.
+  Also hardened `_seed_ledger_with_current_balances`/`_verify_round` to retry
+  (`HEIGHT_CONSISTENT_READ_MAX_ATTEMPTS`) if any node's height moves mid-read,
+  since a block landing mid-read across 7 nodes can mix pre- and post-block
+  state into one supposedly-consistent snapshot, surfacing as a spurious
+  mismatch with no real cause.
+- **The same double-credit failure mode as above, a third way in:
+  `_seed_ledger_with_current_balances` returned `min(reachable)` as the height
+  its balance snapshot was seeded at.** Caught via review before a live CI
+  failure this time. The consistent-read loop only requires each node's own
+  height to be stable (`before == after`), not that every node agrees -- a
+  chaos node can sit stably behind the tip for the whole snapshot (e.g. mid
+  `invalidateblock` when the pause landed) and still pass, so `reachable` can
+  legitimately span multiple heights. `min()` anchors to that lagging node's
+  height instead of the tip the seeded balances were actually read at; the
+  first crediting pass then re-credits heights already folded into them.
+  Fixed with `max()`: a block is always submitted to its earner's own RPC
+  node first, and `core-1a`/`2a`/`3a` (the only earners) are never
+  chaos-restarted or invalidated, so earner(h)'s own height is always `>= h`
+  -- every height `<=` the snapshot's max is already folded into that
+  earner's just-seeded balance, and no height above it is. No under-credit
+  either: a block landing mid-snapshot changes `after` and the loop retries.
+- **A `PendingChange` whose sender is one of `node_orchestrator.py`'s
+  `CHAOS_NODES` (`core-1b`/`core-2b`/`core-3b`/`core-7`) can still get wrongly
+  dropped even with the two-attempt check/settle tolerance above, if that same
+  node's own restart lands in between.** Traced live: `core-2b`'s own
+  `reissuetoken` topup and a round send routed through another chaos node both
+  showed the identical signature -- a permanent, unchanging real-vs-ledger
+  offset appearing once and persisting through every later height, matching
+  the dropped change's amount exactly (e.g. `core-2b`'s own color balance
+  reading a fixed `+3` above what the ledger tracked, from the height it first
+  appeared onward). A chaos node's restart wipes its in-memory mempool; a
+  transaction that node itself just broadcast but hadn't seen confirmed yet
+  can vanish from *its own* `gettransaction` view (`RpcError`, "unknown txid")
+  even though it was already relayed and got mined via another node's mempool
+  copy -- confirmed on the network the whole time, just invisible to the one
+  node `_resolve_pending_changes` happened to be asking. The node's own
+  restart downtime (`DOWNTIME_MIN/MAX_BLOCKS` = 2-4 blocks,
+  `node_orchestrator.py`) can easily outlast the normal two-block check/settle
+  window on its own. Fixed two ways, one per root cause rather than one fix
+  applied uniformly: `verify_seeder.py`'s `CONNECT_MODE_ARGS` sets
+  `-persistmempool=1` on `core-2b` specifically (the node actually implicated
+  in the live failure), so a clean chaos restart flushes its mempool to disk
+  first instead of losing it -- no dropped self-broadcast transaction should
+  be possible from `core-2b` at all anymore. The other three chaos nodes
+  (`core-1b`/`core-3b`/`core-7`) don't have that flag, so they still rely on
+  `_give_chaos_senders_grace`/`_wait_for_sender_sync`: for a still-pending
+  change whose sender is in `CHAOS_SENDER_GRACE_NODES` (`generate_traffic.py`,
+  deliberately `CHAOS_NODES` minus `core-2b`), waits until that node's own tip
+  actually matches the network's -- height AND blockhash at that height
+  against `core-1a` as reference (never chaos-restarted, always trustworthy),
+  not just height alone, since a matching height with a different hash still
+  means a stale or mid-reorg fork. No fixed attempt cap, only
+  `HEIGHT_POLL_TIMEOUT_SECONDS` as a genuine-stuck-node backstop.
+
+  **This still wasn't enough on its own -- a second real CI run hit the same
+  permanent-offset signature again, on `core-1b` (sender) and `core-2a`
+  (round-robin target), even though `core-1b` is in `CHAOS_SENDER_GRACE_NODES`
+  and the sync-wait ran and passed.** Root cause: `_give_chaos_senders_grace`
+  made its "authoritative" check immediately after `_wait_for_sender_sync`
+  returned, at whatever height happened to be current -- still `check_height`,
+  one full block earlier than the `settle_height` every other pending change
+  gets judged at. When the sender wasn't actually behind (sync-wait returns
+  near-instantly), that gave it *less* room than a non-chaos change, not more:
+  a perfectly valid transaction that simply needed one more block -- the exact
+  class of bug already fixed once for setup, see the entry above -- got
+  dropped a block early. Fixed by moving the sync-wait-then-check to run at
+  `settle_height` instead of immediately after check-height: every call site
+  now advances to `settle_height` first and passes it in, so a
+  `CHAOS_SENDER_GRACE_NODES` change gets the identical one-block cushion as
+  every other change, with the sync-wait layered on top as insurance against
+  the mempool-wipe case right before that same final check.
+
+  **Still not enough -- a third real CI run hit the identical signature on
+  `core-2a` (never chaos-restarted at all) and `core-2b` (chaos, but excluded
+  from `CHAOS_SENDER_GRACE_NODES` specifically because `persistmempool` was
+  assumed to make this unnecessary for it), traced through both the
+  container logs and `generate_traffic.py`'s own output to two separate
+  incidents in one run: a setup-phase `core-2a -> core-2b` `FUNDING_PAIRS`
+  send dropped at the very first settle (persisted unchanged for the rest of
+  the run -- the real-vs-ledger gap matched the funding amount and fee
+  exactly), and a round's own `core-2a`/`core-2b` sends dropped with zero
+  chaos activity anywhere nearby (confirmed against `docker logs core-2a`/
+  `core-2b`: both broadcasts relayed normally, and the block that should
+  have confirmed them contained no other transactions at all).** Root cause:
+  the grace mechanism was still gated on `CHAOS_SENDER_GRACE_NODES`
+  membership, so `core-2a` and `core-2b` never got the extra block at all --
+  they always had exactly two attempts (check, settle), same as before any
+  of this was fixed. "Needs a third attempt" was never actually a
+  chaos-specific problem; the earlier fixes just patched the one subset that
+  had been directly observed failing. Fixed by making settle-height's own
+  resolve non-final and unconditionally giving whatever's still pending
+  afterward one more block (`_give_final_grace`) before the true final drop,
+  for every sender -- `CHAOS_SENDER_GRACE_NODES` membership now only adds the
+  `_wait_for_sender_sync` safeguard on top of that same universal extra
+  block, it no longer gates whether the extra block happens at all.
+
+  **`core-2b` added to `CHAOS_SENDER_GRACE_NODES` too, on review, before a
+  fourth CI run could hit it.** `-persistmempool=1` only dumps the mempool on
+  a clean shutdown -- `_restart`'s fallback path in `node_orchestrator.py`
+  (RPC `stop` fails -> `self._process.kill()`) and `_supervise_crashes`'
+  relaunch-after-crash both skip that dump, so the flag alone never fully
+  covered `core-2b`. The universal grace block already covers the likeliest
+  case; the sync-wait is cheap additional insurance (near-instant when
+  `core-2b` is already caught up, the common case) given this exact
+  signature has now surfaced through three separate mechanisms.
+- **`core-3b`, not just `core-7`, can legitimately see group A's abandoned fork
+  after a reorg reconnect -- `simulate_reorg.py`'s own convergence check was
+  wrong about this, and re-deriving every node's expected shape from the actual
+  topology (not incremental patching) is what caught it precisely.** Two
+  propagation mechanisms matter, not just P2P adjacency: each signer submits a
+  block it masters directly to its own RPC target (no core-to-core P2P needed),
+  and P2P relay along the static edges (`core-1a<->1b`, `core-2a<->2b`,
+  `core-3a<->3b`, `core-7<->{1b,2b,3b}` -- `core-7` is the only bridge between
+  the three otherwise-disconnected pairs). From this: group A's 4 nodes each
+  personally built their own fork (deterministic 2-tip residue after reorging
+  onto group B's longer chain); `core-3a` has no path to group A within the
+  reconnect window (3 hops away: `1b`/`2b` -> `7` -> `3b` -> `3a`), so it stays
+  strict; `core-3b`/`core-7` are both 1-2 hops from group A via `core-7`'s
+  bridge, so both can pick up group A's fork as headers-only knowledge without
+  adopting it -- confirmed live (a real CI run failed because `core-3b` showed
+  this second tip and the check only tolerated it on `core-7`). Fixed:
+  `core-3b` gets the same tolerant check as `core-7`, but tightened beyond the
+  original `core-7`-only version too -- if either shows a second tip, it must
+  actually be group A's fork specifically, not just "any other tip is fine",
+  so a genuinely unexpected chain wouldn't silently pass.
 - **`round-duration=60` avoids transient `InvalidBlock` errors** around round
   boundaries that shorter durations (e.g. 10) hit. `round-duration=30` also verified
   clean.

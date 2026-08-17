@@ -8,12 +8,35 @@ hops from any first-layer node, see docker/docker-compose.yml) never causes a ra
   - send height:   every node concurrently sends TPC to its round-robin target, and
                     either transfers its own colored type to the same target (enough
                     balance) or mints more of it (not enough) -- see "Colored-coin
-                    balance shortfall" below.
-  - check height:  balances are polled and logged, not asserted -- P2P propagation to
-                    all 7 nodes isn't guaranteed complete the instant the height ticks
-                    over, so asserting here would be a false-negative risk.
-  - settle height: balances are polled and asserted against the ledger this script has
-                    been keeping since the funding phase.
+                    balance shortfall" below. Broadcasting doesn't touch the ledger yet
+                    -- see "Deferred ledger crediting" below.
+  - check height:  each send's ledger delta is applied once its txid actually confirms
+                    (still-pending ones get more tries -- see "Deferred ledger
+                    crediting" below); balances are then polled and logged, not
+                    asserted -- P2P propagation to all 7 nodes isn't guaranteed
+                    complete the instant the height ticks over, so asserting here
+                    would be a false-negative risk.
+  - settle height: any send still unconfirmed here is dropped, not credited -- and
+                    balances are polled and asserted against the ledger this script
+                    has been keeping since the funding phase.
+
+Deferred ledger crediting: a send/issuance whose RPC call succeeds can still be
+dropped from the mempool before it confirms -- e.g. a chaos node's own invalidateblock
+racing the broadcast. Crediting the ledger the instant broadcast succeeds would leave
+it permanently out of sync with reality in that case. So sends/issuances return a
+PendingChange instead of touching self._ledger directly; _resolve_pending_changes
+applies it only once every one of its txids has confirmed on-chain, and drops it --
+not counted as a successful round action either -- if it never does. Every call site
+gets three attempts (an initial check, one more at the next block, then a final grace
+block via _give_final_grace if still unconfirmed), not two -- confirmed live that even
+two isn't always enough for a perfectly valid transaction, regardless of sender. A
+change whose sender is one of CHAOS_SENDER_GRACE_NODES gets one extra safeguard on top
+of that same final grace block: _wait_for_sender_sync first -- that node's own restart
+can wipe its in-memory mempool for a not-yet-confirmed self-broadcast transaction,
+hiding it from gettransaction on that exact node even though it already confirmed on
+the network via another node's mempool copy, so this waits for objective proof the
+node caught back up (its own tip matches the network's, height AND blockhash) before
+trusting anything it reports.
 
 Usage:
     ./scripts/generate_traffic.py <round-count>
@@ -65,11 +88,21 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.lib.log import log  # noqa: E402
+from scripts.lib.orchestrator_control import pause_node_orchestrators, resume_node_orchestrators  # noqa: E402
 from scripts.lib.rpc import CoreRpcClient, RpcError, RpcUnreachable  # noqa: E402
 
 RPC_HOST = "127.0.0.1"
 HEIGHT_POLL_INTERVAL_SECONDS = 3
 HEIGHT_POLL_TIMEOUT_SECONDS = 180
+RPC_READY_TIMEOUT_SECONDS = 120
+RPC_READY_POLL_INTERVAL_SECONDS = 3
+# A block landing mid-read (across either all 7 nodes concurrently, or one node
+# after another sequentially) would otherwise mix pre- and post-block state into
+# one supposedly-consistent snapshot -- a torn read that looks like a real balance
+# mismatch with no real cause. Retried, not just risked once: block cadence is
+# tens of seconds, so a same-height re-read on retry is expected within a couple
+# attempts, not a sign of a stuck chain.
+HEIGHT_CONSISTENT_READ_MAX_ATTEMPTS = 5
 
 # (node name, host-published RPC port) -- see docker/docker-compose.yml's port mappings.
 NODES = (
@@ -86,6 +119,16 @@ NODES = (
 # to-address), so only they ever receive coinbase. The other 4 need on-chain funding
 # before they can send anything.
 COINBASE_EARNING_NODES = {"core-1a", "core-2a", "core-3a"}
+# node_orchestrator.py's CHAOS_NODES (core-1b/2b/3b/core-7), all four -- every
+# sender gets the same final grace block (_give_final_grace) regardless of
+# membership here; when one of these is a pending change's sender, it
+# additionally waits for _wait_for_sender_sync before that final check.
+# core-2b's own CONNECT_MODE_ARGS entry (verify_seeder.py) carries
+# -persistmempool=1, but that only dumps the mempool on a clean shutdown --
+# _restart's kill() fallback and _supervise_crashes' relaunch-after-crash both
+# skip it, so core-2b isn't fully covered by the flag alone. Cheap to include
+# regardless: a near-instant sync check in the common (already-synced) case.
+CHAOS_SENDER_GRACE_NODES = {"core-1b", "core-2b", "core-3b", "core-7"}
 FUNDING_PAIRS = (
     ("core-1a", "core-1b"),
     ("core-2a", "core-2b"),
@@ -114,7 +157,8 @@ TPC = "TPC"
 # balances, so _verify_round's ledger-vs-actual comparison matches trivially and the
 # run exits 0 despite doing nothing. This floor catches that: at least this fraction
 # of the round_count * 14 (7 nodes x {TPC send, colored send-or-mint}) actions must
-# actually succeed, or the run is treated as failed regardless of what the ledger
+# actually confirm on-chain (see PendingChange/_resolve_pending_changes -- broadcasting
+# alone doesn't count), or the run is treated as failed regardless of what the ledger
 # comparison says.
 MIN_SUCCESSFUL_ACTION_FRACTION = 0.5
 
@@ -136,6 +180,27 @@ class TrafficNode:
         self.color_id = None
 
 
+class PendingChange:
+    """A ledger mutation whose transaction(s) haven't been confirmed on-chain yet --
+    applied only once every one of them is (see _resolve_pending_changes), not the
+    instant broadcast succeeds. A send/issuance that broadcasts fine (no RpcError) can
+    still be dropped from the mempool by a coincidental chaos invalidateblock racing
+    the broadcast -- confirmed live. Crediting the ledger immediately on broadcast
+    would then leave it permanently out of sync with the real, on-chain outcome.
+
+    node: whose wallet owns every txid below (gettransaction is queried against it).
+    txids: all of them must confirm before deltas apply -- a multi-tx operation (e.g.
+        reissuetoken's several component txs) is all-or-nothing, not partial credit.
+    deltas: (node_name, asset, amount) tuples applied to self._ledger once confirmed.
+    """
+
+    def __init__(self, node, txids, deltas, description):
+        self.node = node
+        self.txids = list(txids)
+        self.deltas = deltas
+        self.description = description
+
+
 class TrafficGenerator:
     def __init__(self, nodes, round_count):
         self._nodes = nodes
@@ -155,32 +220,58 @@ class TrafficGenerator:
         self._last_credited_height = None
 
     async def run(self):
+        # The node orchestrator's background chaos runs continuously, including
+        # right through this phase (by design -- see doc/work-done.md), so any of
+        # the 4 uncapped nodes may be mid-restart at the exact moment this starts.
+        # Round actions later on already tolerate that per-call (see
+        # MIN_SUCCESSFUL_ACTION_FRACTION above), but setup isn't a round action --
+        # it needs every node reachable at least once before it can proceed at all.
+        await self._wait_for_all_rpc_ready()
         await self._collect_addresses()
         # A prior step (e.g. simulate_reorg.py's canary) can leave a transaction
         # pending in some node's mempool -- getbalance only counts confirmed balance,
         # so seeding from it now and having that transaction confirm mid-run would
         # silently offset the ledger by exactly its amount for the rest of the run.
         await self._wait_for_empty_mempool()
-        await self._seed_ledger_with_current_balances()
-        self._last_credited_height = await self._current_height()
+        self._last_credited_height = await self._seed_ledger_with_current_balances()
         # 3 blocks' worth of coinbase is far more than FUNDING_AMOUNT_TPC needs --
         # ensures core-1a/2a/3a have real spendable balance before funding the
         # other 4 nodes from them, on a fresh chain where they start at 0.
         for _ in range(3):
             await self._next_block_with_coinbase()
-        await self._fund_unfunded_nodes()
-        await self._next_block_with_coinbase()
-        await self._issue_colors()
-        await self._next_block_with_coinbase()
+        # Same two-attempt check/settle tolerance as the round loop below, not a
+        # single shot -- a transaction that's perfectly fine can still need one
+        # more block to confirm. A genuinely failed tx still gets dropped, just
+        # after two tries, not one.
+        funding_changes = await self._fund_unfunded_nodes()
+        check_height = await self._next_block_with_coinbase()
+        funding_changes = await self._resolve_pending_changes(funding_changes, check_height, final=False, count_success=False)
+        settle_height = await self._next_block_with_coinbase()
+        funding_changes = await self._resolve_pending_changes(funding_changes, settle_height, final=False, count_success=False)
+        if funding_changes:
+            await self._give_final_grace(funding_changes, count_success=False)
+
+        issuance_changes = await self._issue_colors()
+        check_height = await self._next_block_with_coinbase()
+        issuance_changes = await self._resolve_pending_changes(issuance_changes, check_height, final=False, count_success=False)
+        settle_height = await self._next_block_with_coinbase()
+        issuance_changes = await self._resolve_pending_changes(issuance_changes, settle_height, final=False, count_success=False)
+        if issuance_changes:
+            await self._give_final_grace(issuance_changes, count_success=False)
 
         for round_number in range(1, self._round_count + 1):
             log.step(f"round {round_number}/{self._round_count}")
             await self._next_block_with_coinbase()
-            await self._send_round(round_number)
+            pending = await self._send_round(round_number)
             check_height = await self._next_block_with_coinbase()
+            pending = await self._resolve_pending_changes(pending, check_height, final=False)
             await self._log_balances(check_height, "check")
             settle_height = await self._next_block_with_coinbase()
-            await self._verify_round(settle_height)
+            pending = await self._resolve_pending_changes(pending, settle_height, final=False)
+            final_height = settle_height
+            if pending:
+                final_height = await self._give_final_grace(pending)
+            await self._verify_round(final_height)
 
         expected_actions = self._round_count * len(self._nodes) * 2
         min_required_actions = max(1, int(expected_actions * MIN_SUCCESSFUL_ACTION_FRACTION))
@@ -203,24 +294,93 @@ class TrafficGenerator:
 
     # -- setup: addresses, funding, issuance -----------------------------------
 
+    async def _call_with_retry(self, node, method, params=None):
+        """Retries on RpcUnreachable instead of failing on the first attempt.
+        Pausing chaos (see callers) stops NEW actions but can't interrupt one
+        already in flight the instant the pause landed, so a node can still be
+        briefly unreachable inside an otherwise-paused window -- a bare single
+        call would treat that straggler as a hard failure instead of riding it
+        out the same way _wait_for_next_block's own polling already does."""
+        deadline = time.monotonic() + RPC_READY_TIMEOUT_SECONDS
+        while True:
+            try:
+                return await node.rpc.call(method, params)
+            except RpcUnreachable as exc:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"{node.name}: {method} never became reachable within "
+                        f"{RPC_READY_TIMEOUT_SECONDS}s: {exc}"
+                    )
+                await asyncio.sleep(RPC_READY_POLL_INTERVAL_SECONDS)
+
+    async def _wait_for_all_rpc_ready(self):
+        log.step("waiting for all nodes' RPC to be reachable before setup")
+        await asyncio.gather(*(self._call_with_retry(node, "getblockcount") for node in self._nodes))
+
     async def _collect_addresses(self):
         log.step("collecting a receiving address from each node")
 
         async def collect(node):
-            node.address = await node.rpc.call("getnewaddress")
+            node.address = await self._call_with_retry(node, "getnewaddress")
 
-        await asyncio.gather(*(collect(node) for node in self._nodes))
+        pause_node_orchestrators()
+        try:
+            await asyncio.gather(*(collect(node) for node in self._nodes))
+        finally:
+            resume_node_orchestrators()
 
     async def _seed_ledger_with_current_balances(self):
+        """Returns the height this snapshot was taken at, still inside the paused
+        window -- callers seeding _last_credited_height from this must use that
+        return value rather than re-reading the height after chaos resumes: a
+        chaos invalidateblock landing in that instant could regress the height
+        below what the balances were actually seeded at, and the first crediting
+        pass would then re-credit a coinbase already folded into the seeded
+        balance (same double-credit failure mode as elsewhere)."""
         log.step("reading each node's current TPC balance to seed the ledger (not assuming a fresh 0.0 start)")
 
-        async def seed(node):
-            balance = await node.rpc.call("getbalance", [False])
-            self._ledger[node.name][TPC] = balance
-            if balance:
-                log.info(f"{node.name}: starting balance {balance} TPC (carried over from before this run)")
-
-        await asyncio.gather(*(seed(node) for node in self._nodes))
+        pause_node_orchestrators()
+        try:
+            for attempt in range(1, HEIGHT_CONSISTENT_READ_MAX_ATTEMPTS + 1):
+                before = await self._all_heights()
+                balances = await asyncio.gather(
+                    *(self._call_with_retry(node, "getbalance", [False]) for node in self._nodes)
+                )
+                after = await self._all_heights()
+                if before == after:
+                    break
+                log.warn(
+                    f"height changed ({before} -> {after}) while seeding balances -- "
+                    f"retrying for a consistent snapshot (attempt {attempt}/{HEIGHT_CONSISTENT_READ_MAX_ATTEMPTS})"
+                )
+            else:
+                raise TrafficGenerationError(
+                    f"height kept changing across {HEIGHT_CONSISTENT_READ_MAX_ATTEMPTS} attempts -- "
+                    "never got a stable snapshot to seed the ledger from"
+                )
+            for node, balance in zip(self._nodes, balances):
+                self._ledger[node.name][TPC] = balance
+                if balance:
+                    log.info(f"{node.name}: starting balance {balance} TPC (carried over from before this run)")
+            reachable = [h for h in after.values() if h is not None]
+            if not reachable:
+                raise RpcUnreachable("no node was reachable to determine the seeded ledger's height")
+            # max, not min: the consistent-read loop above only requires each node's
+            # own height to be stable (before == after), not that every node agrees --
+            # a chaos node can sit stably behind the tip for the whole snapshot (e.g.
+            # mid invalidateblock when the pause landed) and still pass. A block is
+            # always submitted to its earner's own RPC node first, and core-1a/2a/3a
+            # (the only earners) are never chaos-restarted or invalidated, so
+            # earner(h)'s own height is always >= h -- every height <= this snapshot's
+            # max is already folded into that earner's just-seeded balance, and no
+            # height above it is. min() would instead anchor to a lagging chaos node's
+            # height, and the first crediting pass would then re-credit heights
+            # already folded into the seeded balances -- the same double-credit
+            # failure mode as elsewhere in this file, reached through height
+            # selection here rather than a dropped PendingChange.
+            return max(reachable)
+        finally:
+            resume_node_orchestrators()
 
     async def _fund_unfunded_nodes(self):
         log.step(f"funding the {len(FUNDING_PAIRS)} nodes with no coinbase income")
@@ -232,42 +392,51 @@ class TrafficGenerator:
                 txid = await funder.rpc.call("sendtoaddress", [recipient.address, FUNDING_AMOUNT_TPC])
             except (RpcError, RpcUnreachable) as exc:
                 log.warn(f"{funder_name}: funding {recipient_name} failed ({exc}) -- {recipient_name} stays unfunded")
-                return
-            await self._apply_fee(funder, txid)
-            self._ledger[funder.name][TPC] -= FUNDING_AMOUNT_TPC
-            self._ledger[recipient.name][TPC] += FUNDING_AMOUNT_TPC
+                return None
+            return PendingChange(
+                node=funder, txids=[txid],
+                deltas=[(funder.name, TPC, -FUNDING_AMOUNT_TPC), (recipient.name, TPC, FUNDING_AMOUNT_TPC)],
+                description=f"funding {recipient_name}",
+            )
 
-        await asyncio.gather(*(fund(f, r) for f, r in FUNDING_PAIRS))
+        results = await asyncio.gather(*(fund(f, r) for f, r in FUNDING_PAIRS))
+        return [r for r in results if r is not None]
 
     async def _issue_colors(self):
         log.step("each node issuing its own colored type")
 
         async def issue(node):
             try:
-                await self._issue_color(node)
+                return await self._issue_color(node)
             except (RpcError, RpcUnreachable) as exc:
                 log.warn(f"{node.name}: initial {TOKEN_TYPE_NAMES[node.token_type]} issuance failed ({exc})"
                          " -- this node sits out colored-coin activity until a later round mints one")
+                return None
 
-        await asyncio.gather(*(issue(node) for node in self._nodes))
+        results = await asyncio.gather(*(issue(node) for node in self._nodes))
+        return [r for r in results if r is not None]
 
     async def _issue_color(self, node):
         if node.token_type == REISSUABLE:
             script_pubkey = await self._own_script_pubkey(node)
             result = await node.rpc.call("issuetoken", [REISSUABLE, TOKEN_ISSUE_AMOUNT, script_pubkey])
-            for txid in result["txids"]:
-                await self._apply_fee(node, txid)
+            txids = result["txids"]
         else:
-            txid, vout = await self._seed_plain_utxo(node)
+            seed_txid, vout = await self._seed_plain_utxo(node)
             value = 1 if node.token_type == NFT else TOKEN_ISSUE_AMOUNT
-            result = await node.rpc.call("issuetoken", [node.token_type, value, txid, vout])
-            await self._apply_fee(node, result["txid"])
+            result = await node.rpc.call("issuetoken", [node.token_type, value, seed_txid, vout])
+            # Bundled with the issuance's own txid -- the seed self-send's fee is
+            # part of the same all-or-nothing change, not credited separately.
+            txids = [seed_txid, result["txid"]]
 
         node.color_id = result["color"]
-        self._ledger[node.name][node.color_id] = (
-            1 if node.token_type == NFT else float(TOKEN_ISSUE_AMOUNT)
+        amount = 1 if node.token_type == NFT else float(TOKEN_ISSUE_AMOUNT)
+        log.info(f"{node.name}: issuing {TOKEN_TYPE_NAMES[node.token_type]} color {node.color_id} (pending confirmation)")
+        return PendingChange(
+            node=node, txids=txids,
+            deltas=[(node.name, node.color_id, amount)],
+            description=f"{TOKEN_TYPE_NAMES[node.token_type]} issuance ({node.color_id[:12]}...)",
         )
-        log.info(f"{node.name}: issued {TOKEN_TYPE_NAMES[node.token_type]} color {node.color_id}")
 
     async def _own_script_pubkey(self, node):
         address = await node.rpc.call("getnewaddress")
@@ -281,7 +450,6 @@ class TrafficGenerator:
         exact (txid, vout) of."""
         address = await node.rpc.call("getnewaddress")
         txid = await node.rpc.call("sendtoaddress", [address, SEED_UTXO_AMOUNT_TPC])
-        await self._apply_fee(node, txid)
         tx = await node.rpc.call("gettransaction", [txid])
         for detail in tx["details"]:
             if detail.get("address") == address:
@@ -292,29 +460,34 @@ class TrafficGenerator:
 
     async def _send_round(self, round_number):
         offset = 1 + ((round_number - 1) % (len(self._nodes) - 1))
-        await asyncio.gather(*(
+        results = await asyncio.gather(*(
             self._send_node_round(sender, self._nodes[(sender.index + offset) % len(self._nodes)])
             for sender in self._nodes
         ))
+        return [change for pair in results for change in pair if change is not None]
 
     async def _send_node_round(self, sender, target):
+        tpc_change = None
+        color_change = None
         try:
-            await self._send_tpc(sender, target)
-            self._successful_round_actions += 1
+            tpc_change = await self._send_tpc(sender, target)
         except (RpcError, RpcUnreachable) as exc:
             log.warn(f"{sender.name}: round TPC send skipped ({exc})")
 
         try:
-            await self._send_or_topup_color(sender, target)
-            self._successful_round_actions += 1
+            color_change = await self._send_or_topup_color(sender, target)
         except (RpcError, RpcUnreachable) as exc:
             log.warn(f"{sender.name}: round colored action failed ({exc})")
 
+        return (tpc_change, color_change)
+
     async def _send_tpc(self, sender, target):
         txid = await sender.rpc.call("sendtoaddress", [target.address, ROUND_SEND_AMOUNT_TPC])
-        await self._apply_fee(sender, txid)
-        self._ledger[sender.name][TPC] -= ROUND_SEND_AMOUNT_TPC
-        self._ledger[target.name][TPC] += ROUND_SEND_AMOUNT_TPC
+        return PendingChange(
+            node=sender, txids=[txid],
+            deltas=[(sender.name, TPC, -ROUND_SEND_AMOUNT_TPC), (target.name, TPC, ROUND_SEND_AMOUNT_TPC)],
+            description=f"round TPC send to {target.name}",
+        )
 
     async def _send_or_topup_color(self, sender, target):
         if sender.color_id is None:
@@ -322,48 +495,57 @@ class TrafficGenerator:
             # getnewaddress silently treat a null color as "no color" instead of
             # raising, so this must be checked explicitly rather than falling through
             # to them, or it'd silently send plain TPC while believing it sent a token.
-            await self._issue_color(sender)
-            return
+            return await self._issue_color(sender)
 
         balance = await sender.rpc.call("getbalance", [False, sender.color_id])
         if balance >= ROUND_SEND_AMOUNT_TOKEN:
             colored_address = await target.rpc.call("getnewaddress", ["", sender.color_id])
             txid = await sender.rpc.call("transfertoken", [colored_address, ROUND_SEND_AMOUNT_TOKEN])
-            await self._apply_fee(sender, txid)
-            self._ledger[sender.name][sender.color_id] -= ROUND_SEND_AMOUNT_TOKEN
-            self._ledger[target.name][sender.color_id] = (
-                self._ledger[target.name].get(sender.color_id, 0) + ROUND_SEND_AMOUNT_TOKEN
+            return PendingChange(
+                node=sender, txids=[txid],
+                deltas=[
+                    (sender.name, sender.color_id, -ROUND_SEND_AMOUNT_TOKEN),
+                    (target.name, sender.color_id, ROUND_SEND_AMOUNT_TOKEN),
+                ],
+                description=f"round colored transfer to {target.name} ({sender.color_id[:12]}...)",
             )
         else:
-            await self._topup_color(sender)
+            return await self._topup_color(sender)
 
     async def _topup_color(self, sender):
         if sender.token_type == REISSUABLE:
             result = await sender.rpc.call("reissuetoken", [sender.color_id, TOKEN_TOPUP_AMOUNT])
-            for txid in result["txids"]:
-                await self._apply_fee(sender, txid)
-            self._ledger[sender.name][sender.color_id] += TOKEN_TOPUP_AMOUNT
-            log.info(f"{sender.name}: topped up {sender.color_id} by reissuing {TOKEN_TOPUP_AMOUNT}")
+            log.info(f"{sender.name}: reissuing {sender.color_id} to top up by {TOKEN_TOPUP_AMOUNT} (pending confirmation)")
+            return PendingChange(
+                node=sender, txids=result["txids"],
+                deltas=[(sender.name, sender.color_id, TOKEN_TOPUP_AMOUNT)],
+                description=f"colored reissue top-up ({sender.color_id[:12]}...)",
+            )
         else:
             # NON_REISSUABLE/NFT have no reissue path (fixed supply by design) -- mint
             # an entirely new color instead. The node's "own color" moves forward.
-            await self._issue_color(sender)
-            log.info(f"{sender.name}: minted a fresh {TOKEN_TYPE_NAMES[sender.token_type]} color (old one exhausted)")
+            log.info(f"{sender.name}: minting a fresh {TOKEN_TYPE_NAMES[sender.token_type]} color (old one exhausted)")
+            return await self._issue_color(sender)
 
     # -- height polling ------------------------------------------------------------
 
     async def _wait_for_empty_mempool(self):
-        deadline = time.monotonic() + HEIGHT_POLL_TIMEOUT_SECONDS
-        while True:
-            mempools = await asyncio.gather(*(self._node_mempool(node) for node in self._nodes))
-            if all(mempool == [] for mempool in mempools):
-                return
-            if time.monotonic() >= deadline:
-                raise TrafficGenerationError(
-                    f"mempool(s) still non-empty after {HEIGHT_POLL_TIMEOUT_SECONDS}s: "
-                    f"{ {node.name: mempool for node, mempool in zip(self._nodes, mempools)} }"
-                )
-            await asyncio.sleep(HEIGHT_POLL_INTERVAL_SECONDS)
+        # Same all-7-nodes-reachable shape as _wait_for_next_block, same fix.
+        pause_node_orchestrators()
+        try:
+            deadline = time.monotonic() + HEIGHT_POLL_TIMEOUT_SECONDS
+            while True:
+                mempools = await asyncio.gather(*(self._node_mempool(node) for node in self._nodes))
+                if all(mempool == [] for mempool in mempools):
+                    return
+                if time.monotonic() >= deadline:
+                    raise TrafficGenerationError(
+                        f"mempool(s) still non-empty after {HEIGHT_POLL_TIMEOUT_SECONDS}s: "
+                        f"{ {node.name: mempool for node, mempool in zip(self._nodes, mempools)} }"
+                    )
+                await asyncio.sleep(HEIGHT_POLL_INTERVAL_SECONDS)
+        finally:
+            resume_node_orchestrators()
 
     async def _node_mempool(self, node):
         try:
@@ -372,25 +554,52 @@ class TrafficGenerator:
             return None
 
     async def _current_height(self):
-        heights = await asyncio.gather(*(node.rpc.call("getblockcount") for node in self._nodes))
-        return min(heights)
+        # Pausing chaos (see callers) stops NEW actions but can't interrupt a
+        # node already mid-downtime from an earlier one -- so this needs the same
+        # per-node tolerance _node_height already has, not a bare gather.
+        heights = await asyncio.gather(*(self._node_height(node) for node in self._nodes))
+        reachable = [h for h in heights if h is not None]
+        if not reachable:
+            raise RpcUnreachable("no node was reachable to determine the current height")
+        return min(reachable)
 
     async def _wait_for_next_block(self):
-        target = await self._current_height() + 1
-        deadline = time.monotonic() + HEIGHT_POLL_TIMEOUT_SECONDS
-        while True:
-            heights = await asyncio.gather(*(self._node_height(node) for node in self._nodes))
-            if all(height is not None and height >= target for height in heights):
-                return target
-            if time.monotonic() >= deadline:
-                raise TimeoutError(f"not all nodes reached height {target} within {HEIGHT_POLL_TIMEOUT_SECONDS}s")
-            await asyncio.sleep(HEIGHT_POLL_INTERVAL_SECONDS)
+        # Requires literally all 7 nodes to catch up -- incompatible with chaos
+        # churning core-1b/2b/3b/core-7 mid-wait (they have no cap, by design), so
+        # background chaos is paused for the span of this one wait and resumed
+        # right after, rather than loosening this method's own all-7 requirement
+        # or pausing chaos for generate_traffic.py's entire run. A node already
+        # mid-downtime when the pause lands isn't interrupted -- it finishes that
+        # downtime on its own (bounded, see node_orchestrator.py) -- which is why
+        # this still needs its own timeout below, not just the pause file alone.
+        pause_node_orchestrators()
+        try:
+            target = await self._current_height() + 1
+            deadline = time.monotonic() + HEIGHT_POLL_TIMEOUT_SECONDS
+            while True:
+                heights = await asyncio.gather(*(self._node_height(node) for node in self._nodes))
+                if all(height is not None and height >= target for height in heights):
+                    return target
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"not all nodes reached height {target} within {HEIGHT_POLL_TIMEOUT_SECONDS}s")
+                await asyncio.sleep(HEIGHT_POLL_INTERVAL_SECONDS)
+        finally:
+            resume_node_orchestrators()
 
     async def _node_height(self, node):
         try:
             return await node.rpc.call("getblockcount")
         except RpcUnreachable:
             return None
+
+    async def _all_heights(self):
+        # Per-node, not _current_height()'s min() across all 7 -- a balance-read
+        # consistency check needs to catch ANY node advancing during the read, not
+        # just whichever one happens to be the slowest. A node that wasn't the
+        # minimum before the read could still advance during it without moving
+        # the aggregate min at all, silently letting a torn read through.
+        heights = await asyncio.gather(*(self._node_height(node) for node in self._nodes))
+        return {node.name: h for node, h in zip(self._nodes, heights)}
 
     async def _next_block_with_coinbase(self):
         """_wait_for_next_block, plus crediting the ledger for every height since
@@ -403,7 +612,12 @@ class TrafficGenerator:
         actual = await self._current_height()
         for height in range(self._last_credited_height + 1, actual + 1):
             await self._credit_coinbase_for_height(height)
-        self._last_credited_height = actual
+        # max(), not a bare assignment: _current_height() takes min() across all 7
+        # nodes, and a chaos node's own invalidateblock can transiently regress its
+        # locally-reported height. A bare assignment would let that regression rewind
+        # this backward, making a later call re-credit an already-credited height.
+        # max() keeps this monotonic regardless of when a regression lands.
+        self._last_credited_height = max(self._last_credited_height, actual)
         return actual
 
     async def _credit_coinbase_for_height(self, height):
@@ -412,24 +626,28 @@ class TrafficGenerator:
         it's subsidy plus whatever transaction fees that block happened to
         include, so once real traffic is flowing it varies block to block
         (confirmed live)."""
-        by_name = {node.name: node for node in self._nodes}
-        probe = self._nodes[0]
-        blockhash = await probe.rpc.call("getblockhash", [height])
-        block = await probe.rpc.call("getblock", [blockhash])
-        coinbase_txid = block["tx"][0]
-        for name in sorted(COINBASE_EARNING_NODES):
-            try:
-                tx = await by_name[name].rpc.call("gettransaction", [coinbase_txid])
-            except RpcError:
-                continue  # not in this node's wallet -- try the next candidate
-            for detail in tx.get("details", []):
-                if detail.get("category") == "generate":
-                    self._ledger[name][TPC] += detail["amount"]
-                    return
-        raise TrafficGenerationError(
-            f"height {height}: no coinbase-earning node's wallet has a 'generate' "
-            f"transaction for {coinbase_txid}"
-        )
+        pause_node_orchestrators()
+        try:
+            by_name = {node.name: node for node in self._nodes}
+            probe = self._nodes[0]
+            blockhash = await self._call_with_retry(probe, "getblockhash", [height])
+            block = await self._call_with_retry(probe, "getblock", [blockhash])
+            coinbase_txid = block["tx"][0]
+            for name in sorted(COINBASE_EARNING_NODES):
+                try:
+                    tx = await self._call_with_retry(by_name[name], "gettransaction", [coinbase_txid])
+                except RpcError:
+                    continue  # not in this node's wallet -- try the next candidate
+                for detail in tx.get("details", []):
+                    if detail.get("category") == "generate":
+                        self._ledger[name][TPC] += detail["amount"]
+                        return
+            raise TrafficGenerationError(
+                f"height {height}: no coinbase-earning node's wallet has a 'generate' "
+                f"transaction for {coinbase_txid}"
+            )
+        finally:
+            resume_node_orchestrators()
 
     # -- balance logging / verification --------------------------------------------
 
@@ -437,23 +655,57 @@ class TrafficGenerator:
         return [node.color_id for node in self._nodes if node.color_id]
 
     async def _log_balances(self, height, label):
-        colors = await self._all_colors()
-        for node in self._nodes:
-            tpc = await node.rpc.call("getbalance", [False])
-            colored = {
-                color: await node.rpc.call("getbalance", [False, color]) for color in colors
-            }
-            log.info(f"height {height} ({label}): {node.name} TPC={tpc} {colored}")
+        # Same all-7-nodes-reachable shape as _wait_for_next_block, same fix --
+        # every node's getbalance is read here with no per-call error tolerance.
+        pause_node_orchestrators()
+        try:
+            colors = await self._all_colors()
+            for node in self._nodes:
+                tpc = await self._call_with_retry(node, "getbalance", [False])
+                colored = {
+                    color: await self._call_with_retry(node, "getbalance", [False, color]) for color in colors
+                }
+                log.info(f"height {height} ({label}): {node.name} TPC={tpc} {colored}")
+        finally:
+            resume_node_orchestrators()
 
     async def _verify_round(self, height):
-        colors = await self._all_colors()
-        for node in self._nodes:
-            actual_tpc = await node.rpc.call("getbalance", [False])
-            self._compare(height, node.name, TPC, self._ledger[node.name][TPC], actual_tpc)
-            for color in colors:
-                actual = await node.rpc.call("getbalance", [False, color])
-                expected = self._ledger[node.name].get(color, 0)
-                self._compare(height, node.name, color, expected, actual)
+        # This is the run's actual correctness check (ledger vs real balances) --
+        # same chaos-paused window, so an unreachable node can't be misread as a
+        # real balance mismatch or abort verification outright. The per-node loop
+        # below is sequential, not concurrent, so it can take long enough for a
+        # new block to land mid-loop -- nodes read before it would reflect the old
+        # height, nodes read after would reflect the new one, a torn snapshot that
+        # looks like a real mismatch. Guarded the same way as
+        # _seed_ledger_with_current_balances: re-read from scratch if the height
+        # moved during the read, discarding whatever this attempt already recorded.
+        pause_node_orchestrators()
+        try:
+            colors = await self._all_colors()
+            for attempt in range(1, HEIGHT_CONSISTENT_READ_MAX_ATTEMPTS + 1):
+                before = await self._all_heights()
+                mismatches_before = len(self._mismatches)
+                for node in self._nodes:
+                    actual_tpc = await self._call_with_retry(node, "getbalance", [False])
+                    self._compare(height, node.name, TPC, self._ledger[node.name][TPC], actual_tpc)
+                    for color in colors:
+                        actual = await self._call_with_retry(node, "getbalance", [False, color])
+                        expected = self._ledger[node.name].get(color, 0)
+                        self._compare(height, node.name, color, expected, actual)
+                after = await self._all_heights()
+                if before == after:
+                    return
+                del self._mismatches[mismatches_before:]
+                log.warn(
+                    f"height changed ({before} -> {after}) while verifying round {height} -- discarding that "
+                    f"attempt's reads and retrying for a consistent snapshot (attempt {attempt}/{HEIGHT_CONSISTENT_READ_MAX_ATTEMPTS})"
+                )
+            raise TrafficGenerationError(
+                f"height kept changing across {HEIGHT_CONSISTENT_READ_MAX_ATTEMPTS} attempts -- "
+                f"never got a stable snapshot to verify round at height {height}"
+            )
+        finally:
+            resume_node_orchestrators()
 
     def _compare(self, height, node_name, asset, expected, actual):
         # Token balances are exact integers (no fee taken from token value itself);
@@ -467,23 +719,121 @@ class TrafficGenerator:
         else:
             log.info(f"height {height}: {node_name} {asset}: {actual} (matches ledger)")
 
-    async def _apply_fee(self, node, txid):
+    async def _give_final_grace(self, pending, count_success=True):
+        """Called with whatever's still unconfirmed after settle_height's own
+        (non-final) resolve -- gives every remaining change one more block
+        before the truly final drop, regardless of sender: a plain sender
+        needing a third attempt isn't a chaos-specific problem, so the fixed
+        two-block check/settle window was never actually enough to rule that
+        out for anyone -- see doc/work-done.md.
+
+        A change whose sender is one of CHAOS_SENDER_GRACE_NODES additionally
+        waits for that sender to actually catch back up with the network
+        first (_wait_for_sender_sync: its own tip matches the network's,
+        height AND blockhash, not just height) before trusting anything it
+        reports -- a chaos node's own restart can still wipe its in-memory
+        mempool, hiding a not-yet-confirmed self-broadcast transaction from
+        gettransaction even after this extra block. Returns the height its
+        final check ran at, for the caller's own _verify_round."""
+        chaos_pending = [change for change in pending if change.node.name in CHAOS_SENDER_GRACE_NODES]
+        if chaos_pending:
+            senders = {change.node.name: change.node for change in chaos_pending}
+            await asyncio.gather(*(self._wait_for_sender_sync(node) for node in senders.values()))
+        height = await self._next_block_with_coinbase()
+        await self._resolve_pending_changes(pending, height, final=True, count_success=count_success)
+        return height
+
+    async def _wait_for_sender_sync(self, node):
+        """Polls until `node`'s own tip matches the network's reference tip --
+        height AND blockhash at that height, not just height alone (a matching
+        height with a different hash means it's still on a stale/reorged fork,
+        e.g. mid invalidateblock/reconsiderblock). core-1a is the reference:
+        never chaos-restarted (COINBASE_EARNING_NODES), so its view is always
+        trustworthy. Bounded by HEIGHT_POLL_TIMEOUT_SECONDS like every other
+        wait in this script, since a node that never converges at all is a
+        real problem, not something to wait out silently."""
+        reference = self._nodes[0]  # core-1a -- never a chaos node, always trustworthy
+        pause_node_orchestrators()
+        try:
+            deadline = time.monotonic() + HEIGHT_POLL_TIMEOUT_SECONDS
+            while True:
+                ref_height = await self._call_with_retry(reference, "getblockcount")
+                ref_hash = await self._call_with_retry(reference, "getblockhash", [ref_height])
+                node_height = await self._node_height(node)
+                if node_height is not None and node_height >= ref_height:
+                    node_hash = await self._call_with_retry(node, "getblockhash", [ref_height])
+                    if node_hash == ref_hash:
+                        return
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"{node.name}: never converged with the network (height {ref_height}, "
+                        f"hash {ref_hash}) within {HEIGHT_POLL_TIMEOUT_SECONDS}s"
+                    )
+                await asyncio.sleep(HEIGHT_POLL_INTERVAL_SECONDS)
+        finally:
+            resume_node_orchestrators()
+
+    async def _resolve_pending_changes(self, pending_changes, height, final, count_success=True):
+        """Applies each PendingChange's ledger deltas only once every one of its
+        txids has actually confirmed (see PendingChange's own docstring for why).
+        Not final: unconfirmed changes are returned for a later retry at the next
+        block height (the caller's own check/settle/grace attempts -- see
+        _give_final_grace). Final: an unconfirmed change is dropped instead --
+        logged, not credited, not counted as a successful round action -- since
+        nothing later in the run gives it another chance to confirm.
+        count_success=False for the one-time setup calls (funding/issuance) --
+        MIN_SUCCESSFUL_ACTION_FRACTION's denominator is round_count * 14 round-loop
+        actions only; folding setup successes in would let a count exceed that
+        denominator instead of meaning what it claims to."""
+        if not pending_changes:
+            return []
+        still_pending = []
+        pause_node_orchestrators()
+        try:
+            for change in pending_changes:
+                confirmed = True
+                total_fee = 0.0
+                for txid in change.txids:
+                    try:
+                        tx = await self._call_with_retry(change.node, "gettransaction", [txid])
+                    except RpcError:
+                        confirmed = False  # evicted from the wallet entirely -- lost, not just pending
+                        break
+                    if tx.get("confirmations", 0) < 1:
+                        confirmed = False
+                        break
+                    total_fee += self._extract_fee(tx)
+                if confirmed:
+                    self._ledger[change.node.name][TPC] += total_fee
+                    for node_name, asset, amount in change.deltas:
+                        self._ledger[node_name][asset] = self._ledger[node_name].get(asset, 0) + amount
+                    if count_success:
+                        self._successful_round_actions += 1
+                elif final:
+                    txids_preview = ", ".join(t[:12] for t in change.txids)
+                    log.warn(
+                        f"{change.node.name}: {change.description} ({txids_preview}...) never confirmed "
+                        f"by height {height} -- dropped, not credited"
+                    )
+                else:
+                    still_pending.append(change)
+        finally:
+            resume_node_orchestrators()
+        return still_pending
+
+    def _extract_fee(self, tx):
         # tapyrus-core's gettransaction has no top-level "fee" field here -- and the
         # fee's shape within "details" itself varies by tx type (confirmed
         # against a live node; see doc/work-done.md): a plain TPC send nests "fee"
         # inside its own category="send" entry, while a transaction that also moves a
         # colored output puts it in a separate category="fee" entry instead (and the
         # send/receive entries have no "fee" key of their own in that case).
-        tx = await node.rpc.call("gettransaction", [txid])
-        fee = 0
         for detail in tx.get("details", []):
             if detail.get("category") == "fee":
-                fee = detail["amount"]
-                break
+                return detail["amount"]
             if detail.get("category") == "send" and "fee" in detail:
-                fee = detail["fee"]
-                break
-        self._ledger[node.name][TPC] += fee
+                return detail["fee"]
+        return 0
 
 
 def parse_args():

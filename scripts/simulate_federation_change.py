@@ -85,6 +85,7 @@ from scripts.generate_dev_secrets import AggpubkeyCeremony, default_tapyrus_setu
 from scripts.lib.ceremony import CeremonyError, TapyrusSetupCeremony, extract_vss_for, require_executable  # noqa: E402
 from scripts.lib.compose import ComposeError, bring_up  # noqa: E402
 from scripts.lib.log import log  # noqa: E402
+from scripts.lib.orchestrator_control import pause_node_orchestrators, resume_node_orchestrators  # noqa: E402
 from scripts.lib.rpc import CoreRpcClient, RpcError, RpcUnreachable  # noqa: E402
 
 RPC_HOST = "127.0.0.1"
@@ -351,10 +352,19 @@ class FederationChangeSimulator:
         await self._generate_signer_set_b()
         await self._sign_off_handoff()
         await self._compute_scheduled_height()
-        self._write_configs()
-        await self._bring_up_signer_set_b()
-        await self._wait_for_rotation()
-        await self._confirm_rotation_via_rpc()
+        # Paused from the federations.toml write through RPC confirmation: a core
+        # node mid-restart exactly when _confirm_rotation_via_rpc's single,
+        # non-retrying getblockchaininfo check runs would fail the whole step
+        # spuriously. try/finally so a failure partway through still resumes chaos
+        # for the rest of the job. See scripts/lib/orchestrator_control.py.
+        pause_node_orchestrators()
+        try:
+            self._write_configs()
+            await self._bring_up_signer_set_b()
+            await self._wait_for_rotation()
+            await self._confirm_rotation_via_rpc()
+        finally:
+            resume_node_orchestrators()
         log.info(
             f"done. signer-set-b ({self._aggpubkey_b[:12]}...) took over at height "
             f"{self._scheduled_height} (confirmed via getblockchaininfo on all 7 core nodes), signed off by "
