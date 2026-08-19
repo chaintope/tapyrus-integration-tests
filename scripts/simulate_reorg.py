@@ -173,7 +173,7 @@ class ReorgSimulator:
         # natural end, so a failure partway through still leaves
         # node_orchestrator.py's chaos actions resumed afterward rather than
         # silently disabled for the rest of the job.
-        pause_node_orchestrators()
+        pause_node_orchestrators("running the reorg recipe (fork build through reconnect confirmation)")
         try:
             await self._build_group_b_fork()
             await self._restore_group_a()

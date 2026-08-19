@@ -133,7 +133,7 @@ class MaxBlockSizeChangeSimulator:
         # node mid-restart exactly when _confirm_change_via_rpc's single,
         # non-retrying getblockchaininfo check runs would fail the whole step
         # spuriously. See scripts/lib/orchestrator_control.py.
-        pause_node_orchestrators()
+        pause_node_orchestrators("max-block-size config write through RPC confirmation")
         try:
             self._write_configs()
             await self._wait_for_change()

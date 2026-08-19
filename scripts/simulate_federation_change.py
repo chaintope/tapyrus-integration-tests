@@ -355,7 +355,7 @@ class FederationChangeSimulator:
         # non-retrying getblockchaininfo check runs would fail the whole step
         # spuriously. try/finally so a failure partway through still resumes chaos
         # for the rest of the job. See scripts/lib/orchestrator_control.py.
-        pause_node_orchestrators()
+        pause_node_orchestrators("federation-change config write through RPC confirmation")
         try:
             self._write_configs()
             await self._bring_up_signer_set_b()

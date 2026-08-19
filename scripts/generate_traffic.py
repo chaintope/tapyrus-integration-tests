@@ -308,7 +308,7 @@ class TrafficGenerator:
         async def collect(node):
             node.address = await self._call_with_retry(node, "getnewaddress")
 
-        pause_node_orchestrators()
+        pause_node_orchestrators("collecting addresses")
         try:
             await asyncio.gather(*(collect(node) for node in self._nodes))
         finally:
@@ -324,7 +324,7 @@ class TrafficGenerator:
         balance (same double-credit failure mode as elsewhere)."""
         log.step("reading each node's current TPC balance to seed the ledger (not assuming a fresh 0.0 start)")
 
-        pause_node_orchestrators()
+        pause_node_orchestrators("seeding ledger balances")
         try:
             for attempt in range(1, HEIGHT_CONSISTENT_READ_MAX_ATTEMPTS + 1):
                 before = await self._all_heights()
@@ -516,7 +516,7 @@ class TrafficGenerator:
 
     async def _wait_for_empty_mempool(self):
         # Same all-7-nodes-reachable shape as _wait_for_next_block, same fix.
-        pause_node_orchestrators()
+        pause_node_orchestrators("waiting for empty mempool")
         try:
             deadline = time.monotonic() + HEIGHT_POLL_TIMEOUT_SECONDS
             while True:
@@ -557,7 +557,7 @@ class TrafficGenerator:
         # mid-downtime when the pause lands isn't interrupted -- it finishes that
         # downtime on its own (bounded, see node_orchestrator.py) -- which is why
         # this still needs its own timeout below, not just the pause file alone.
-        pause_node_orchestrators()
+        pause_node_orchestrators("waiting for next block")
         try:
             target = await self._current_height() + 1
             deadline = time.monotonic() + HEIGHT_POLL_TIMEOUT_SECONDS
@@ -614,7 +614,7 @@ class TrafficGenerator:
         it's subsidy plus whatever transaction fees that block happened to
         include, so once real traffic is flowing it varies block to block
         (confirmed live)."""
-        pause_node_orchestrators()
+        pause_node_orchestrators(f"crediting coinbase for height {height}")
         try:
             by_name = {node.name: node for node in self._nodes}
             probe = self._nodes[0]
@@ -713,7 +713,7 @@ class TrafficGenerator:
         while True:
             height, pending = await self._advance_ledger_and_resolve(pending, deadline, final=False)
 
-            pause_node_orchestrators()
+            pause_node_orchestrators(f"reading balances to verify height {height}")
             try:
                 colors = await self._all_colors()
                 balances = await asyncio.gather(*(self._fetch_node_balances(node, colors) for node in self._nodes))
@@ -779,7 +779,7 @@ class TrafficGenerator:
         wait in this script, since a node that never converges at all is a
         real problem, not something to wait out silently."""
         reference = self._nodes[0]  # core-1a -- never a chaos node, always trustworthy
-        pause_node_orchestrators()
+        pause_node_orchestrators(f"waiting for {node.name} to resync")
         try:
             deadline = time.monotonic() + HEIGHT_POLL_TIMEOUT_SECONDS
             while True:
@@ -815,7 +815,7 @@ class TrafficGenerator:
         if not pending_changes:
             return []
         still_pending = []
-        pause_node_orchestrators()
+        pause_node_orchestrators(f"resolving {len(pending_changes)} pending change(s) at height {height}")
         try:
             for change in pending_changes:
                 confirmed = True
