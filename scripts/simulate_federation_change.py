@@ -511,19 +511,24 @@ class FederationChangeSimulator:
             f"confirming aggregatePubkeys includes {self._aggpubkey_b[:12]}... at height "
             f"{self._scheduled_height} via getblockchaininfo (all 7 core nodes)"
         )
-        failures = []
-        for name in ALL_NODE_NAMES:
-            info = await self._clients[name].call("getblockchaininfo")
-            entries = info.get("aggregatePubkeys", [])
-            if any(entry.get(self._aggpubkey_b) == self._scheduled_height for entry in entries):
-                log.info(f"{name}: confirmed -- aggregatePubkeys has {{{self._aggpubkey_b[:12]}...: {self._scheduled_height}}}")
-            else:
-                failures.append(f"{name}: no aggregatePubkeys entry for {self._aggpubkey_b} at height {self._scheduled_height}, got {entries}")
+        # Checked concurrently, not one node at a time -- each node's own log line
+        # below always names it, since gather() doesn't preserve the per-node
+        # ordering a sequential loop would.
+        results = await asyncio.gather(*(self._check_node_rotation(name) for name in ALL_NODE_NAMES))
+        failures = [failure for failure in results if failure is not None]
         if failures:
             raise CeremonyError(
                 f"rotation not confirmed via RPC on {len(failures)}/{len(ALL_NODE_NAMES)} node(s):\n  "
                 + "\n  ".join(failures)
             )
+
+    async def _check_node_rotation(self, name):
+        info = await self._clients[name].call("getblockchaininfo")
+        entries = info.get("aggregatePubkeys", [])
+        if any(entry.get(self._aggpubkey_b) == self._scheduled_height for entry in entries):
+            log.info(f"{name}: confirmed -- aggregatePubkeys has {{{self._aggpubkey_b[:12]}...: {self._scheduled_height}}}")
+            return None
+        return f"{name}: no aggregatePubkeys entry for {self._aggpubkey_b} at height {self._scheduled_height}, got {entries}"
 
     # -- height polling (same liveness/stall approach as simulate_reorg.py) --------
 

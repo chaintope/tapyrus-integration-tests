@@ -2,23 +2,25 @@
 """Drive round-robin TPC + colored-coin traffic across all 7 core-* nodes and confirm
 every node's wallet balance (TPC and every colored type in play) after each block.
 
-Everything is derived from a single round count (--round-count). Each round spans 3
-block-heights, polled the same way across all 7 nodes so a slower node (core-7 is 3 P2P
-hops from any first-layer node, see docker/docker-compose.yml) never causes a race:
-  - send height:   every node concurrently sends TPC to its round-robin target, and
-                    either transfers its own colored type to the same target (enough
-                    balance) or mints more of it (not enough) -- see "Colored-coin
-                    balance shortfall" below. Broadcasting doesn't touch the ledger yet
-                    -- see "Deferred ledger crediting" below.
-  - check height:  each send's ledger delta is applied once its txid actually confirms
-                    (still-pending ones get more tries -- see "Deferred ledger
-                    crediting" below); balances are then polled and logged, not
-                    asserted -- P2P propagation to all 7 nodes isn't guaranteed
-                    complete the instant the height ticks over, so asserting here
-                    would be a false-negative risk.
-  - settle height: any send still unconfirmed here is dropped, not credited -- and
-                    balances are polled and asserted against the ledger this script
-                    has been keeping since the funding phase.
+Everything is derived from a single round count (--round-count). Each round: every
+node concurrently sends TPC to its round-robin target, and either transfers its own
+colored type to the same target (enough balance) or mints more of it (not enough) --
+see "Colored-coin balance shortfall" below. Broadcasting doesn't touch the ledger yet
+-- see "Deferred ledger crediting" below.
+
+Settling a round (_settle_and_verify) is one loop, not a fixed sequence of named
+heights. Every pass re-reads the real height fresh, re-syncs the ledger's coinbase
+crediting to it, resolves whatever sends have confirmed, then compares. It keeps
+retrying only while there's a concrete reason to expect the mismatch to resolve on
+its own -- a send still unconfirmed in some node's mempool, or the 7 nodes not yet
+agreeing on the same height -- not a fixed attempt count; a mismatch with nothing
+pending and every node already at the same height is real and gets reported.
+Bounded by SETTLE_TIMEOUT_SECONDS as a genuine-stuck backstop. Re-deriving the
+height fresh on every pass, instead of trusting one captured earlier, closes a
+real, confirmed-live bug: wall-clock time spent resolving pending changes let the
+chain -- and a coinbase-earning node's real balance -- advance past a height
+already trusted as current by the time the comparison actually ran. See
+doc/work-done.md.
 
 Deferred ledger crediting: a send/issuance whose RPC call succeeds can still be
 dropped from the mempool before it confirms -- e.g. a chaos node's own invalidateblock
@@ -26,17 +28,15 @@ racing the broadcast. Crediting the ledger the instant broadcast succeeds would 
 it permanently out of sync with reality in that case. So sends/issuances return a
 PendingChange instead of touching self._ledger directly; _resolve_pending_changes
 applies it only once every one of its txids has confirmed on-chain, and drops it --
-not counted as a successful round action either -- if it never does. Every call site
-gets three attempts (an initial check, one more at the next block, then a final grace
-block via _give_final_grace if still unconfirmed), not two -- confirmed live that even
-two isn't always enough for a perfectly valid transaction, regardless of sender. A
-change whose sender is one of CHAOS_SENDER_GRACE_NODES gets one extra safeguard on top
-of that same final grace block: _wait_for_sender_sync first -- that node's own restart
-can wipe its in-memory mempool for a not-yet-confirmed self-broadcast transaction,
-hiding it from gettransaction on that exact node even though it already confirmed on
-the network via another node's mempool copy, so this waits for objective proof the
-node caught back up (its own tip matches the network's, height AND blockhash) before
-trusting anything it reports.
+not counted as a successful round action either -- once the settle loop's own timeout
+is reached with it still unconfirmed. A change whose sender is one of
+CHAOS_SENDER_GRACE_NODES gets one extra safeguard on every settle pass:
+_wait_for_sender_sync first -- that node's own restart can wipe its in-memory
+mempool for a not-yet-confirmed self-broadcast transaction, hiding it from
+gettransaction on that exact node even though it already confirmed on the network
+via another node's mempool copy, so this waits for objective proof the node caught
+back up (its own tip matches the network's, height AND blockhash) before trusting
+anything it reports.
 
 Usage:
     ./scripts/generate_traffic.py <round-count>
@@ -101,6 +101,12 @@ RPC_READY_POLL_INTERVAL_SECONDS = 3
 # tens of seconds, so a same-height re-read on retry is expected within a couple
 # attempts, not a sign of a stuck chain.
 HEIGHT_CONSISTENT_READ_MAX_ATTEMPTS = 5
+# Overall backstop for _settle_and_verify/_settle_pending's own retry loop --
+# a genuinely stuck node (heights never converging) or a transaction that never
+# confirms needs a real bound, same as every other wait in this script. Sized
+# well above a handful of ROUND_DURATION-paced blocks (the normal case), not
+# tuned to it -- see doc/work-done.md.
+SETTLE_TIMEOUT_SECONDS = 600
 
 # (node name, host-published RPC port) -- see docker/docker-compose.yml's port mappings.
 NODES = (
@@ -118,14 +124,14 @@ NODES = (
 # before they can send anything.
 COINBASE_EARNING_NODES = {"core-1a", "core-2a", "core-3a"}
 # node_orchestrator.py's CHAOS_NODES (core-1b/2b/3b/core-7), all four -- every
-# sender gets the same final grace block (_give_final_grace) regardless of
-# membership here; when one of these is a pending change's sender, it
-# additionally waits for _wait_for_sender_sync before that final check.
-# core-2b's own CONNECT_MODE_ARGS entry (verify_seeder.py) carries
-# -persistmempool=1, but that only dumps the mempool on a clean shutdown --
-# _restart's kill() fallback and _supervise_crashes' relaunch-after-crash both
-# skip it, so core-2b isn't fully covered by the flag alone. Cheap to include
-# regardless: a near-instant sync check in the common (already-synced) case.
+# sender gets the same settle-loop retries regardless of membership here; when
+# one of these is a pending change's sender, every settle pass additionally
+# waits for _wait_for_sender_sync before resolving it. core-2b's own
+# CONNECT_MODE_ARGS entry (verify_seeder.py) carries -persistmempool=1, but
+# that only dumps the mempool on a clean shutdown -- _restart's kill()
+# fallback and _supervise_crashes' relaunch-after-crash both skip it, so
+# core-2b isn't fully covered by the flag alone. Cheap to include regardless:
+# a near-instant sync check in the common (already-synced) case.
 CHAOS_SENDER_GRACE_NODES = {"core-1b", "core-2b", "core-3b", "core-7"}
 FUNDING_PAIRS = (
     ("core-1a", "core-1b"),
@@ -152,7 +158,7 @@ TPC = "TPC"
 # purpose (one node's bad round shouldn't abort everyone else's) -- but that means a
 # systemic failure (e.g. the fallbackfee incident, see doc/work-done.md, where every
 # sendtoaddress call failed) leaves the ledger untouched right along with the real
-# balances, so _verify_round's ledger-vs-actual comparison matches trivially and the
+# balances, so _settle_and_verify's ledger-vs-actual comparison matches trivially and the
 # run exits 0 despite doing nothing. This floor catches that: at least this fraction
 # of the round_count * 14 (7 nodes x {TPC send, colored send-or-mint}) actions must
 # actually confirm on-chain (see PendingChange/_resolve_pending_changes -- broadcasting
@@ -237,39 +243,20 @@ class TrafficGenerator:
         # other 4 nodes from them, on a fresh chain where they start at 0.
         for _ in range(3):
             await self._next_block_with_coinbase()
-        # Same two-attempt check/settle tolerance as the round loop below, not a
-        # single shot -- a transaction that's perfectly fine can still need one
-        # more block to confirm. A genuinely failed tx still gets dropped, just
-        # after two tries, not one.
+        # _settle_pending keeps retrying a genuinely valid, still-unconfirmed
+        # transaction across as many blocks as SETTLE_TIMEOUT_SECONDS allows, not
+        # a fixed attempt count -- see its own docstring and doc/work-done.md.
         funding_changes = await self._fund_unfunded_nodes()
-        check_height = await self._next_block_with_coinbase()
-        funding_changes = await self._resolve_pending_changes(funding_changes, check_height, final=False, count_success=False)
-        settle_height = await self._next_block_with_coinbase()
-        funding_changes = await self._resolve_pending_changes(funding_changes, settle_height, final=False, count_success=False)
-        if funding_changes:
-            await self._give_final_grace(funding_changes, count_success=False)
+        await self._settle_pending(funding_changes, count_success=False)
 
         issuance_changes = await self._issue_colors()
-        check_height = await self._next_block_with_coinbase()
-        issuance_changes = await self._resolve_pending_changes(issuance_changes, check_height, final=False, count_success=False)
-        settle_height = await self._next_block_with_coinbase()
-        issuance_changes = await self._resolve_pending_changes(issuance_changes, settle_height, final=False, count_success=False)
-        if issuance_changes:
-            await self._give_final_grace(issuance_changes, count_success=False)
+        await self._settle_pending(issuance_changes, count_success=False)
 
         for round_number in range(1, self._round_count + 1):
             log.step(f"round {round_number}/{self._round_count}")
             await self._next_block_with_coinbase()
             pending = await self._send_round(round_number)
-            check_height = await self._next_block_with_coinbase()
-            pending = await self._resolve_pending_changes(pending, check_height, final=False)
-            await self._log_balances(check_height, "check")
-            settle_height = await self._next_block_with_coinbase()
-            pending = await self._resolve_pending_changes(pending, settle_height, final=False)
-            final_height = settle_height
-            if pending:
-                final_height = await self._give_final_grace(pending)
-            await self._verify_round(final_height)
+            await self._settle_and_verify(pending)
 
         expected_actions = self._round_count * len(self._nodes) * 2
         min_required_actions = max(1, int(expected_actions * MIN_SUCCESSFUL_ACTION_FRACTION))
@@ -579,7 +566,10 @@ class TrafficGenerator:
                 if all(height is not None and height >= target for height in heights):
                     return target
                 if time.monotonic() >= deadline:
-                    raise TimeoutError(f"not all nodes reached height {target} within {HEIGHT_POLL_TIMEOUT_SECONDS}s")
+                    stuck = {node.name: h for node, h in zip(self._nodes, heights) if h is None or h < target}
+                    raise TimeoutError(
+                        f"not all nodes reached height {target} within {HEIGHT_POLL_TIMEOUT_SECONDS}s: {stuck}"
+                    )
                 await asyncio.sleep(HEIGHT_POLL_INTERVAL_SECONDS)
         finally:
             resume_node_orchestrators()
@@ -652,94 +642,132 @@ class TrafficGenerator:
     async def _all_colors(self):
         return [node.color_id for node in self._nodes if node.color_id]
 
-    async def _log_balances(self, height, label):
-        # Same all-7-nodes-reachable shape as _wait_for_next_block, same fix --
-        # every node's getbalance is read here with no per-call error tolerance.
-        pause_node_orchestrators()
-        try:
-            colors = await self._all_colors()
-            for node in self._nodes:
-                tpc = await self._call_with_retry(node, "getbalance", [False])
-                colored = {
-                    color: await self._call_with_retry(node, "getbalance", [False, color]) for color in colors
-                }
-                log.info(f"height {height} ({label}): {node.name} TPC={tpc} {colored}")
-        finally:
-            resume_node_orchestrators()
+    async def _fetch_node_balances(self, node, colors):
+        """One node's TPC + every color balance, all fetched concurrently --
+        (tpc, [balance per color, same order as `colors`])."""
+        tpc, *color_balances = await asyncio.gather(
+            self._call_with_retry(node, "getbalance", [False]),
+            *(self._call_with_retry(node, "getbalance", [False, color]) for color in colors),
+        )
+        return tpc, color_balances
 
-    async def _verify_round(self, height):
-        # This is the run's actual correctness check (ledger vs real balances) --
-        # same chaos-paused window, so an unreachable node can't be misread as a
-        # real balance mismatch or abort verification outright. The per-node loop
-        # below is sequential, not concurrent, so it can take long enough for a
-        # new block to land mid-loop -- nodes read before it would reflect the old
-        # height, nodes read after would reflect the new one, a torn snapshot that
-        # looks like a real mismatch. Guarded the same way as
-        # _seed_ledger_with_current_balances: re-read from scratch if the height
-        # moved during the read, discarding whatever this attempt already recorded.
-        pause_node_orchestrators()
-        try:
-            colors = await self._all_colors()
-            for attempt in range(1, HEIGHT_CONSISTENT_READ_MAX_ATTEMPTS + 1):
-                before = await self._all_heights()
-                mismatches_before = len(self._mismatches)
-                for node in self._nodes:
-                    actual_tpc = await self._call_with_retry(node, "getbalance", [False])
-                    self._compare(height, node.name, TPC, self._ledger[node.name][TPC], actual_tpc)
-                    for color in colors:
-                        actual = await self._call_with_retry(node, "getbalance", [False, color])
-                        expected = self._ledger[node.name].get(color, 0)
-                        self._compare(height, node.name, color, expected, actual)
-                after = await self._all_heights()
-                if before == after:
-                    return
-                del self._mismatches[mismatches_before:]
-                log.warn(
-                    f"height changed ({before} -> {after}) while verifying round {height} -- discarding that "
-                    f"attempt's reads and retrying for a consistent snapshot (attempt {attempt}/{HEIGHT_CONSISTENT_READ_MAX_ATTEMPTS})"
-                )
-            raise TrafficGenerationError(
-                f"height kept changing across {HEIGHT_CONSISTENT_READ_MAX_ATTEMPTS} attempts -- "
-                f"never got a stable snapshot to verify round at height {height}"
-            )
-        finally:
-            resume_node_orchestrators()
+    async def _wait_for_convergence(self, deadline):
+        """Polls until every one of the 7 nodes is reachable and reports the exact
+        same height. A lagging or unreachable node isn't a real balance mismatch,
+        it's still converging -- the settle loop below only trusts a height once
+        every node agrees on it (see doc/work-done.md for why a stale, once-computed
+        height was the root cause this whole loop replaces)."""
+        while True:
+            heights = await self._all_heights()
+            reachable = {name: h for name, h in heights.items() if h is not None}
+            if len(reachable) == len(self._nodes) and len(set(reachable.values())) == 1:
+                return next(iter(reachable.values()))
+            if time.monotonic() >= deadline:
+                raise TrafficGenerationError(f"node heights never converged while settling: {heights}")
+            await asyncio.sleep(HEIGHT_POLL_INTERVAL_SECONDS)
 
-    def _compare(self, height, node_name, asset, expected, actual):
-        # Token balances are exact integers (no fee taken from token value itself);
-        # TPC has floating-point drift from repeated add/subtract, so give it a small
-        # tolerance instead of exact equality.
-        tolerance = 1e-6 if asset == TPC else 0
-        if abs(actual - expected) > tolerance:
-            message = f"height {height}: {node_name} {asset}: expected {expected}, got {actual}"
-            log.error(message)
-            self._mismatches.append(message)
-        else:
-            log.info(f"height {height}: {node_name} {asset}: {actual} (matches ledger)")
+    async def _advance_ledger_and_resolve(self, pending, deadline, final, count_success=True):
+        """One settle pass, shared by _settle_pending and _settle_and_verify: waits
+        for all 7 nodes to agree on a height, re-syncs the ledger's coinbase
+        crediting to it (every single pass, not once -- the real fix, see
+        doc/work-done.md), waits out any CHAOS_SENDER_GRACE_NODES sender's own
+        resync before trusting its mempool, then resolves whatever's still pending
+        at that height. Returns (height, still_pending)."""
+        height = await self._wait_for_convergence(deadline)
+        for h in range(self._last_credited_height + 1, height + 1):
+            await self._credit_coinbase_for_height(h)
+        self._last_credited_height = max(self._last_credited_height, height)
 
-    async def _give_final_grace(self, pending, count_success=True):
-        """Called with whatever's still unconfirmed after settle_height's own
-        (non-final) resolve -- gives every remaining change one more block
-        before the truly final drop, regardless of sender: a plain sender
-        needing a third attempt isn't a chaos-specific problem, so the fixed
-        two-block check/settle window was never actually enough to rule that
-        out for anyone -- see doc/work-done.md.
-
-        A change whose sender is one of CHAOS_SENDER_GRACE_NODES additionally
-        waits for that sender to actually catch back up with the network
-        first (_wait_for_sender_sync: its own tip matches the network's,
-        height AND blockhash, not just height) before trusting anything it
-        reports -- a chaos node's own restart can still wipe its in-memory
-        mempool, hiding a not-yet-confirmed self-broadcast transaction from
-        gettransaction even after this extra block. Returns the height its
-        final check ran at, for the caller's own _verify_round."""
         chaos_pending = [change for change in pending if change.node.name in CHAOS_SENDER_GRACE_NODES]
         if chaos_pending:
             senders = {change.node.name: change.node for change in chaos_pending}
             await asyncio.gather(*(self._wait_for_sender_sync(node) for node in senders.values()))
-        height = await self._next_block_with_coinbase()
-        await self._resolve_pending_changes(pending, height, final=True, count_success=count_success)
-        return height
+
+        still_pending = await self._resolve_pending_changes(pending, height, final=final, count_success=count_success)
+        return height, still_pending
+
+    async def _settle_pending(self, pending, count_success=True):
+        """Funding/issuance's confirm-only loop -- no ledger-vs-real-balance check
+        involved (see _settle_and_verify for that). Keeps retrying a still-pending
+        change across blocks until it confirms or SETTLE_TIMEOUT_SECONDS runs out,
+        at which point the final pass drops whatever's left instead of crediting it."""
+        deadline = time.monotonic() + SETTLE_TIMEOUT_SECONDS
+        while pending:
+            final = time.monotonic() >= deadline
+            _, pending = await self._advance_ledger_and_resolve(pending, deadline, final, count_success)
+            if pending and not final:
+                await self._wait_for_next_block()
+
+    async def _settle_and_verify(self, pending):
+        """Replaces the old fixed check/settle/grace/verify sequence with one loop.
+        Every pass compares the ledger against real balances, read in the same
+        chaos-paused window as a fresh height check (so a block landing during or
+        just before the read can't produce a torn, false-mismatch snapshot -- if
+        the height moved, this pass is discarded and the next one re-syncs to
+        wherever the chain actually is now, rather than trusting a value computed
+        earlier). Keeps looping past a real-looking mismatch only while something
+        is still pending in a node's mempool that could explain it -- not a fixed
+        attempt count. Once nothing's pending and every node agrees on height, any
+        remaining mismatch is real and gets reported."""
+        deadline = time.monotonic() + SETTLE_TIMEOUT_SECONDS
+        while True:
+            height, pending = await self._advance_ledger_and_resolve(pending, deadline, final=False)
+
+            pause_node_orchestrators()
+            try:
+                colors = await self._all_colors()
+                balances = await asyncio.gather(*(self._fetch_node_balances(node, colors) for node in self._nodes))
+                after = await self._all_heights()
+            finally:
+                resume_node_orchestrators()
+            if set(after.values()) != {height}:
+                continue  # chain moved during/before this read -- discard, resync next pass
+
+            mismatches, matches = self._diff_balances(height, colors, balances)
+            if not mismatches:
+                for line in matches:
+                    log.info(line)
+                return
+
+            if pending and time.monotonic() < deadline:
+                log.warn(
+                    f"height {height}: {len(mismatches)} mismatch(es), but {len(pending)} send(s) still "
+                    "pending confirmation -- checking again at the next block"
+                )
+                await self._wait_for_next_block()
+                continue
+
+            if pending:
+                # Deadline reached with sends still unconfirmed -- one last final=True
+                # pass to log and drop them properly (same as the old final grace
+                # block), rather than silently abandoning them while reporting the
+                # mismatches they were the whole explanation for.
+                _, pending = await self._advance_ledger_and_resolve(pending, deadline, final=True)
+
+            for line in matches:
+                log.info(line)
+            for message in mismatches:
+                log.error(message)
+            self._mismatches.extend(mismatches)
+            return
+
+    def _diff_balances(self, height, colors, balances):
+        # Token balances are exact integers (no fee taken from token value itself);
+        # TPC has floating-point drift from repeated add/subtract, so give it a
+        # small tolerance instead of exact equality. Returns (mismatches, matches)
+        # rather than logging directly -- the caller decides whether this pass is
+        # terminal (worth recording) or an explicably retryable one (discard).
+        mismatches, matches = [], []
+        for node, (actual_tpc, color_balances) in zip(self._nodes, balances):
+            pairs = [(TPC, self._ledger[node.name][TPC], actual_tpc)]
+            pairs += [(color, self._ledger[node.name].get(color, 0), actual) for color, actual in zip(colors, color_balances)]
+            for asset, expected, actual in pairs:
+                tolerance = 1e-6 if asset == TPC else 0
+                if abs(actual - expected) > tolerance:
+                    mismatches.append(f"height {height}: {node.name} {asset}: expected {expected}, got {actual}")
+                else:
+                    matches.append(f"height {height}: {node.name} {asset}: {actual} (matches ledger)")
+        return mismatches, matches
 
     async def _wait_for_sender_sync(self, node):
         """Polls until `node`'s own tip matches the network's reference tip --
@@ -775,10 +803,11 @@ class TrafficGenerator:
         """Applies each PendingChange's ledger deltas only once every one of its
         txids has actually confirmed (see PendingChange's own docstring for why).
         Not final: unconfirmed changes are returned for a later retry at the next
-        block height (the caller's own check/settle/grace attempts -- see
-        _give_final_grace). Final: an unconfirmed change is dropped instead --
+        block height (the caller's own settle loop -- see _settle_pending/
+        _settle_and_verify). Final: an unconfirmed change is dropped instead --
         logged, not credited, not counted as a successful round action -- since
-        nothing later in the run gives it another chance to confirm.
+        the settle loop's own timeout means nothing later gives it another
+        chance to confirm.
         count_success=False for the one-time setup calls (funding/issuance) --
         MIN_SUCCESSFUL_ACTION_FRACTION's denominator is round_count * 14 round-loop
         actions only; folding setup successes in would let a count exceed that
