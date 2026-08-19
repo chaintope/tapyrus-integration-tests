@@ -3,21 +3,26 @@
 Shared by every script that talks to a core-* node's RPC port: the
 topology-convergence wait (wait_for_topology.py), coinbase-address collection
 (collect_coinbase_addresses.py), traffic generation (generate_traffic.py), the reorg
-(simulate_reorg.py), and the rotation/max-block-size change confirmation steps
-(simulate_federation_change.py/simulate_maxblocksize_change.py). The per-node
-lifecycle orchestrator (not yet built) will be another consumer once it exists.
+(simulate_reorg.py), the rotation/max-block-size change confirmation steps
+(simulate_federation_change.py/simulate_maxblocksize_change.py), and the per-node
+lifecycle orchestrator (scripts/container/node_orchestrator.py).
 
 `call()` is async so a caller can poll multiple nodes concurrently (e.g. via
 asyncio.gather) instead of one at a time -- the underlying urllib call is blocking, so
 it runs in a worker thread via asyncio.to_thread rather than on the event loop itself.
+
+Auth is tapyrus-core's own auto-generated per-process cookie file (see cookie_path/
+read_cookie below), not a static password -- see doc/work-done.md.
 """
 import asyncio
 import base64
 import json
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 RPC_ID = "tapyrus-integration-tests"
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
 
 class RpcError(Exception):
@@ -30,25 +35,61 @@ class RpcUnreachable(Exception):
     "not ready yet", not a hard failure."""
 
 
+def cookie_path(name, cookie_dir=None):
+    """The shared cookie file tapyrus-core writes for node `name`
+    (docker/docker-compose.yml's ../runtime/rpc-cookies:/cookies mount,
+    entrypoint_wrapper.sh's -rpccookiefile) -- see doc/work-done.md. `cookie_dir`
+    defaults to the host-side REPO_ROOT-relative path, used by every script that
+    runs on the CI host. node_orchestrator.py runs inside a core-* container
+    instead, where REPO_ROOT resolves to /app (scripts are mounted at
+    /app/scripts), not the repo root -- it passes the container-internal /cookies
+    mount point explicitly instead, the same "container script hardcodes what it
+    knows" pattern this repo already uses for that script's own PAUSE_FILE."""
+    cookie_dir = cookie_dir or (REPO_ROOT / "runtime" / "rpc-cookies")
+    return cookie_dir / f"{name}.cookie"
+
+
+def read_cookie(path):
+    """Reads and parses a tapyrus-core cookie file (__cookie__:<64 hex chars>) into
+    (user, password). A missing file -- not written yet (node still starting up) or
+    momentarily absent mid-restart (tapyrus-core deletes it on clean shutdown, then
+    regenerates fresh on the next startup) -- is RpcUnreachable, not a hard failure,
+    so it flows through the same retry paths callers already use for an unreachable
+    RPC port."""
+    try:
+        content = path.read_text().strip()
+    except OSError as exc:
+        raise RpcUnreachable(f"cookie file {path} not readable: {exc}") from exc
+    user, _, password = content.partition(":")
+    return user, password
+
+
 class CoreRpcClient:
-    """One node's RPC endpoint. Cheap to construct -- holds no connection state of
-    its own, so a fresh instance per call (or per polling attempt) is fine.
+    """One node's RPC endpoint, authenticated via its own cookie file (resolved from
+    `name` via cookie_path() above, read fresh on every call via read_cookie() --
+    not cached at construction time, since a chaos-restarted node's cookie changes
+    on every restart). `host` is separate from `name` since it varies by caller:
+    127.0.0.1 for host-side scripts (docker-compose's published host ports), a
+    container DNS name for node_orchestrator.py's cross-node peer checks.
+    `cookie_dir` is cookie_path()'s own override, passed through unchanged -- see
+    its docstring. Cheap to construct -- holds no connection state of its own, so a
+    fresh instance per call (or per polling attempt) is fine.
     """
 
-    def __init__(self, host, port, user, password, timeout_seconds=5):
+    def __init__(self, host, port, name, timeout_seconds=5, cookie_dir=None):
         self._url = f"http://{host}:{port}/"
-        self._user = user
-        self._password = password
+        self._cookie_file = cookie_path(name, cookie_dir)
         self._timeout_seconds = timeout_seconds
 
     async def call(self, method, params=None):
         return await asyncio.to_thread(self._call_sync, method, params)
 
     def _call_sync(self, method, params):
+        user, password = read_cookie(self._cookie_file)
         body = json.dumps(
             {"jsonrpc": "1.0", "id": RPC_ID, "method": method, "params": params or []}
         ).encode()
-        credentials = base64.b64encode(f"{self._user}:{self._password}".encode()).decode()
+        credentials = base64.b64encode(f"{user}:{password}".encode()).decode()
         request = urllib.request.Request(
             self._url, data=body,
             headers={"Content-Type": "text/plain", "Authorization": f"Basic {credentials}"},

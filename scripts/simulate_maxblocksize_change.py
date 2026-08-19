@@ -31,9 +31,9 @@ Usage:
     ./scripts/simulate_maxblocksize_change.py
 
 Requires signer-set-b already active (scripts/simulate_federation_change.py's
-rotation already confirmed via RPC). Reads CORE_RPC_USER / CORE_RPC_PASS /
-ROUND_DURATION / MAX_BLOCK_SIZE_HEIGHT / MAX_BLOCK_SIZE_NEW from the environment --
-the same job-level env vars the workflow already sets for the other steps.
+rotation already confirmed via RPC). Reads ROUND_DURATION / MAX_BLOCK_SIZE_OFFSET_BLOCKS /
+MAX_BLOCK_SIZE_NEW from the environment -- the same job-level env vars the workflow
+already sets for the other steps.
 
 Why not tapyrus-core's generatetoaddress RPC (instant block mining): same reason as
 simulate_reorg.py -- no single party holds the aggregate private key by design.
@@ -114,11 +114,11 @@ def _federation_entry_toml(block_height, max_block_size, threshold, node_vss_lin
 
 
 class MaxBlockSizeChangeSimulator:
-    def __init__(self, rpc_user, rpc_pass, round_duration, height_offset, new_max_block_size):
+    def __init__(self, round_duration, height_offset, new_max_block_size):
         self._round_duration = round_duration
         self._height_offset = height_offset
         self._new_max_block_size = new_max_block_size
-        self._clients = {name: CoreRpcClient(RPC_HOST, port, rpc_user, rpc_pass) for name, port in ALL_NODES}
+        self._clients = {name: CoreRpcClient(RPC_HOST, port, name) for name, port in ALL_NODES}
         self._tapyrus_setup_bin = default_tapyrus_setup_bin()
         self._set_dir = REPO_ROOT / "secrets" / SIGNER_SET_B
         self._pubkeys = self._read_pubkeys()
@@ -263,10 +263,8 @@ class MaxBlockSizeChangeSimulator:
 
 
 async def main():
-    rpc_user = os.environ.get("CORE_RPC_USER", "rpcuser")
-    rpc_pass = os.environ.get("CORE_RPC_PASS", "rpcpassword")
     round_duration = os.environ.get("ROUND_DURATION", "60")
-    height_offset = int(os.environ.get("MAX_BLOCK_SIZE_HEIGHT", "10"))
+    height_offset = int(os.environ.get("MAX_BLOCK_SIZE_OFFSET_BLOCKS", "10"))
     new_max_block_size = int(os.environ.get("MAX_BLOCK_SIZE_NEW", "2000000"))
 
     require_executable(
@@ -274,7 +272,7 @@ async def main():
         "Build it first: ./scripts/checkout_repos.py && cd workdir/tapyrus-signer && cargo build --release",
     )
     log.step(f"simulating a max-block-size change: {new_max_block_size} takes effect {height_offset} block(s) from now")
-    simulator = MaxBlockSizeChangeSimulator(rpc_user, rpc_pass, round_duration, height_offset, new_max_block_size)
+    simulator = MaxBlockSizeChangeSimulator(round_duration, height_offset, new_max_block_size)
     await simulator.run()
 
 

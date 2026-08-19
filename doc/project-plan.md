@@ -151,6 +151,19 @@ Each of these corresponds to a step in `.github/workflows/weekly-integration-tes
   full design. Verified live: `wait_for_topology.py` converges cleanly under
   chaos, and multiple full `generate_traffic.py` runs against the chaos-supervised
   stack settled with balances matching the ledger every time, zero mismatches.
+- [x] Core-node and signer RPC auth switched from a static shared `rpcuser`/
+  `rpcpassword` to tapyrus-core's own auto-generated per-process cookie file --
+  every core-* node (plus `seeder-test-node`) writes it to a shared
+  `runtime/rpc-cookies/` mount (`scripts.lib.rpc.cookie_path`/`read_cookie`), read
+  fresh on every RPC call, not cached, since a chaos-restarted node's cookie
+  changes on every restart. Signer configs point each signer directly at its own
+  RPC target's cookie file (`rpc-endpoint-cookiefile`, `assemble_signer_configs.py`)
+  rather than resolving and baking in a value, closing the earlier
+  resolve-once-at-assembly-time staleness gap -- `tapyrus-signer` itself now reads
+  it fresh on every RPC call too. `entrypoint_wrapper.sh` re-`chmod`s each cookie
+  file to 644 in a background loop, since tapyrus-core always writes it `0600` and
+  every core-* container runs as root -- confirmed live on GitHub Actions that
+  without this, the CI host's own (non-root) reads get `PermissionError`.
 
 ## Outstanding work
 
@@ -171,22 +184,7 @@ Everything not yet implemented or not yet testable, in one place:
   enhancement itself is separate, unstarted work.
 - **`scripts/generate_traffic.py`'s hardcoded constants** (`FUNDING_AMOUNT_TPC`/
   `TOKEN_ISSUE_AMOUNT`/etc.) haven't been stress-tested at a larger round count where
-  the balance-shortfall top-up mechanic would trigger much more often.
-- **Team review/sign-off** on the design in `weekly-integration-test-plan.md`.
-- **Slack pass/fail report**: deferred by team decision -- GitHub's own built-in
-  failure notifications cover failure detection for now, and the team isn't ready
-  to provision the webhook secret yet, so this shouldn't merge as a code path that
-  stays dormant behind a secret that doesn't exist. Was built and verified
-  (`scripts/send_slack_report.py`, structurally against a local mock webhook
-  listener -- both message formats, implicated-container detection, and the
-  graceful no-webhook skip all confirmed live) before being removed rather than
-  merged. Can come back as its own PR if the team later wants channel-wide
-  visibility or a weekly heartbeat report.
-- **Core-node RPC auth** is the static `rpcuser`/`rpcpassword` (hardcoded in
-  `scripts/render_tapyrus_conf.py`, `CORE_RPC_USER`/`CORE_RPC_PASS` in the workflow's
-  `env:` block, and every script that calls `CoreRpcClient`) -- switching to cookie
-  authentication (tapyrusd's auto-generated per-run `.cookie` file) would avoid a
-  fixed shared password sitting in the conf/env for the run's lifetime.
+  the balance-shortfall top-up mechanic would trigger much more often
 
 ## Non-goals for v1
 

@@ -14,8 +14,10 @@ expected.
 Usage:
     ./scripts/render_tapyrus_conf.py [output-file]
 
-Reads NETWORK_ID / CORE_RPC_USER / CORE_RPC_PASS from the environment (same job-level
-env vars the workflow already sets for the other steps).
+Reads NETWORK_ID from the environment (same job-level env var the workflow already
+sets for the other steps). No rpcuser/rpcpassword here -- RPC auth is tapyrus-core's
+own auto-generated cookie file instead (see doc/work-done.md and
+docker/docker-compose.yml's "RPC AUTH" note).
 """
 import argparse
 import os
@@ -45,15 +47,11 @@ class TapyrusConfRenderer:
     doc/work-done.md.
     """
 
-    def __init__(self, network_id, rpc_user, rpc_pass):
+    def __init__(self, network_id):
         self._network_id = network_id
-        self._rpc_user = rpc_user
-        self._rpc_pass = rpc_pass
 
     def render(self):
         return (
-            f"rpcuser={self._rpc_user}\n"
-            f"rpcpassword={self._rpc_pass}\n"
             "bind=0.0.0.0\n"
             "rpcallowip=0.0.0.0/0\n"
             "\n"
@@ -101,11 +99,9 @@ def parse_args():
 def main():
     args = parse_args()
     network_id = os.environ.get("NETWORK_ID", "1905960821")
-    rpc_user = os.environ.get("CORE_RPC_USER", "rpcuser")
-    rpc_pass = os.environ.get("CORE_RPC_PASS", "rpcpassword")
 
     log.step(f"rendering tapyrus.conf (networkid={network_id})")
-    renderer = TapyrusConfRenderer(network_id, rpc_user, rpc_pass)
+    renderer = TapyrusConfRenderer(network_id)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(renderer.render())
     log.info(f"done. wrote {args.output}")

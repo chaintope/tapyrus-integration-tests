@@ -16,12 +16,10 @@ than taking node/port arguments.
 
 RPC host/port: host ports are docker-compose's published host-side ports (see
 docker/docker-compose.yml), reachable from the runner the same way the "Collect
-coinbase addresses" workflow step already reaches core-1a/2a/3a. CORE_RPC_USER /
-CORE_RPC_PASS env vars match the workflow's existing job-level env of the same names.
+coinbase addresses" workflow step already reaches core-1a/2a/3a.
 """
 import argparse
 import asyncio
-import os
 import sys
 import time
 from pathlib import Path
@@ -54,9 +52,7 @@ class TopologyWaiter:
     value, or gives up after timeout_seconds.
     """
 
-    def __init__(self, rpc_user, rpc_pass, timeout_seconds, poll_interval_seconds):
-        self._rpc_user = rpc_user
-        self._rpc_pass = rpc_pass
+    def __init__(self, timeout_seconds, poll_interval_seconds):
         self._timeout_seconds = timeout_seconds
         self._poll_interval_seconds = poll_interval_seconds
 
@@ -90,7 +86,7 @@ class TopologyWaiter:
         return mismatches
 
     async def _check_node(self, name, port, expected):
-        client = CoreRpcClient(RPC_HOST, port, self._rpc_user, self._rpc_pass)
+        client = CoreRpcClient(RPC_HOST, port, name)
         try:
             actual = await client.call("getconnectioncount")
         except RpcUnreachable as exc:
@@ -115,11 +111,9 @@ def parse_args():
 
 async def main():
     args = parse_args()
-    rpc_user = os.environ.get("CORE_RPC_USER", "rpcuser")
-    rpc_pass = os.environ.get("CORE_RPC_PASS", "rpcpassword")
 
     log.step(f"waiting for topology convergence (timeout {args.timeout_seconds}s)")
-    waiter = TopologyWaiter(rpc_user, rpc_pass, args.timeout_seconds, args.poll_interval_seconds)
+    waiter = TopologyWaiter(args.timeout_seconds, args.poll_interval_seconds)
     await waiter.run()
     log.info("done. all 7 nodes match the expected 1/2/1/2/1/2/3 connection-count pattern")
 

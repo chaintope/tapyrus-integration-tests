@@ -19,13 +19,9 @@ Example (the workflow's 3 first-layer nodes):
 Each port is a host-published RPC port (see docker/docker-compose.yml), reached at
 127.0.0.1 the same way wait_for_topology.py does. Writes one address per line, in the
 same order as the ports given, to --output (default: ./runtime/addrs.txt).
-
-CORE_RPC_USER / CORE_RPC_PASS env vars (defaults rpcuser / rpcpassword) match the
-workflow's existing job-level env vars of the same names.
 """
 import argparse
 import asyncio
-import os
 import sys
 import time
 from pathlib import Path
@@ -40,9 +36,18 @@ RPC_HOST = "127.0.0.1"
 DEFAULT_TIMEOUT_SECONDS = 120
 DEFAULT_POLL_INTERVAL_SECONDS = 3
 
+# Same port<->name mapping as docker/docker-compose.yml's port mappings (also
+# duplicated in wait_for_topology.py/verify_seeder.py) -- needed here to resolve
+# each port's own cookie file (scripts.lib.rpc.cookie_path), since this script's own
+# CLI only takes ports, not names.
+PORT_TO_NAME = {
+    12381: "core-1a", 12382: "core-1b", 12383: "core-2a",
+    12384: "core-2b", 12385: "core-3a", 12386: "core-3b", 12387: "core-7",
+}
 
-async def get_address(port, rpc_user, rpc_pass, timeout_seconds, poll_interval_seconds):
-    client = CoreRpcClient(RPC_HOST, port, rpc_user, rpc_pass)
+
+async def get_address(port, timeout_seconds, poll_interval_seconds):
+    client = CoreRpcClient(RPC_HOST, port, PORT_TO_NAME[port])
     deadline = time.monotonic() + timeout_seconds
     while True:
         try:
@@ -76,12 +81,10 @@ def parse_args():
 async def main():
     args = parse_args()
     output = args.output or (REPO_ROOT / "runtime" / "addrs.txt")
-    rpc_user = os.environ.get("CORE_RPC_USER", "rpcuser")
-    rpc_pass = os.environ.get("CORE_RPC_PASS", "rpcpassword")
 
     log.step(f"collecting coinbase addresses from {len(args.ports)} node(s)")
     addresses = await asyncio.gather(*(
-        get_address(port, rpc_user, rpc_pass, args.timeout_seconds, args.poll_interval_seconds)
+        get_address(port, args.timeout_seconds, args.poll_interval_seconds)
         for port in args.ports
     ))
 

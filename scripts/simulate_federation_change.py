@@ -63,9 +63,9 @@ Usage:
     ./scripts/simulate_federation_change.py
 
 Requires signer-set-a already generated and signing (same precondition as
-scripts/simulate_reorg.py). Reads CORE_RPC_USER / CORE_RPC_PASS / ROUND_DURATION /
-FEDERATION_CHANGE_HEIGHT from the environment -- the same job-level env vars the
-workflow already sets for the other steps.
+scripts/simulate_reorg.py). Reads ROUND_DURATION / FEDERATION_CHANGE_OFFSET_BLOCKS from the
+environment -- the same job-level env vars the workflow already sets for the other
+steps.
 
 Why not tapyrus-core's generatetoaddress RPC (instant block mining): same reason as
 simulate_reorg.py -- no single party holds the aggregate private key by design.
@@ -335,12 +335,10 @@ class RotationSignerConfigAssembler(SignerConfigAssembler):
 
 
 class FederationChangeSimulator:
-    def __init__(self, rpc_user, rpc_pass, round_duration, height_offset):
-        self._rpc_user = rpc_user
-        self._rpc_pass = rpc_pass
+    def __init__(self, round_duration, height_offset):
         self._round_duration = round_duration
         self._height_offset = height_offset
-        self._clients = {name: CoreRpcClient(RPC_HOST, port, rpc_user, rpc_pass) for name, port in ALL_NODES}
+        self._clients = {name: CoreRpcClient(RPC_HOST, port, name) for name, port in ALL_NODES}
         self._tapyrus_setup_bin = default_tapyrus_setup_bin()
         self._pubkeys_a = self._read_pubkeys(SIGNER_SET_A)
         self._aggpubkey_a = self._read_aggpubkey(SIGNER_SET_A)
@@ -477,7 +475,7 @@ class FederationChangeSimulator:
         assembler = RotationSignerConfigAssembler(
             entry1_nonmember, self._scheduled_height, self._signature_hex,
             self._set_dir(SIGNER_SET_B), SIGNER_THRESHOLD, self._aggpubkey_b,
-            CoreRpc(CORE_RPC_PORT, self._rpc_user, self._rpc_pass), Redis(REDIS_HOST, REDIS_PORT),
+            CoreRpc(CORE_RPC_PORT), Redis(REDIS_HOST, REDIS_PORT),
             self._round_duration,
         )
         new_indices = [i for i in range(SIGNER_COUNT) if i != REUSE_NODE_INDEX]
@@ -561,13 +559,11 @@ class FederationChangeSimulator:
             return None
 
 async def main():
-    rpc_user = os.environ.get("CORE_RPC_USER", "rpcuser")
-    rpc_pass = os.environ.get("CORE_RPC_PASS", "rpcpassword")
     round_duration = os.environ.get("ROUND_DURATION", "60")
-    height_offset = int(os.environ.get("FEDERATION_CHANGE_HEIGHT", "10"))
+    height_offset = int(os.environ.get("FEDERATION_CHANGE_OFFSET_BLOCKS", "10"))
 
     log.step(f"simulating a federation change: signer-set-b takes over {height_offset} block(s) from now")
-    simulator = FederationChangeSimulator(rpc_user, rpc_pass, round_duration, height_offset)
+    simulator = FederationChangeSimulator(round_duration, height_offset)
     await simulator.run()
 
 

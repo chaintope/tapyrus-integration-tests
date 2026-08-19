@@ -2,12 +2,15 @@
 single source of truth for each repo's default URL/ref.
 
 Read by scripts/checkout_repos.py. Override any field by exporting the matching
-environment variable before running the script -- in CI, each *_REPO_REF is wired to
-a workflow_dispatch input (core_repo_ref / signer_repo_ref / seeder_repo_ref) via a
+environment variable before running the script -- in CI, each *_REPO_URL/*_REPO_REF
+is wired to a workflow_dispatch input (core_repo_url/core_repo_ref, etc.) via a
 job-level `env:` entry in .github/workflows/weekly-integration-test.yml, which passes
 the raw input through with no literal fallback of its own -- an unset/blank input
 (schedule/pull_request/push, or a manual dispatch left blank) resolves to the
-defaults below, not a second copy of them in the workflow file.
+defaults below, not a second copy of them in the workflow file. The URL override
+exists for testing a branch that only lives on a fork (e.g. an upstream PR not yet
+merged) -- pointing *_REPO_URL at the fork with *_REPO_REF set to the branch name,
+without needing that branch to exist on the default URL at all.
 """
 import os
 

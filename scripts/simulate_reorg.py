@@ -6,10 +6,10 @@ simulated, and not just isolated-by-network-stop while leaving room for ambiguit
 
 1. Build a common baseline (all 7 nodes).
 2. Stop group A entirely. Repoint all 3 signers to group B (core-3a) and let it build
-   REORG_LENGTH blocks alone.
+   REORG_LENGTH_BLOCKS alone.
 3. Stop group B, restart group A, reset redis fresh.
 4. Repoint all 3 signers back to group A's default mapping, inject the canary
-   transaction, and let group A build its OWN REORG_LENGTH blocks -- a genuinely
+   transaction, and let group A build its OWN REORG_LENGTH_BLOCKS -- a genuinely
    different set than group B's, since group A never saw group B's blocks or the
    round-state that produced them.
 5. Reconnect group B alongside group A (both now at the same height, different tips --
@@ -30,15 +30,14 @@ Usage:
 
 Requires the 7-node topology and signer-set-a already up and converged (same
 precondition as scripts/generate_traffic.py). Reads
-CHAIN_HEIGHT_BEFORE_REORG / REORG_LENGTH / CORE_RPC_USER / CORE_RPC_PASS /
-ROUND_DURATION from the environment -- the same job-level env vars the workflow
-already sets for the other steps.
+REORG_BASELINE_HEIGHT / REORG_LENGTH_BLOCKS / ROUND_DURATION from the environment --
+the same job-level env vars the workflow already sets for the other steps.
 
-CHAIN_HEIGHT_BEFORE_REORG is a floor to wait for, not an assumed starting point (and
+REORG_BASELINE_HEIGHT is a floor to wait for, not an assumed starting point (and
 in the workflow, it's always TX_ROUND_COUNT + 2, not an independent value -- see the
-"Derive CHAIN_HEIGHT_BEFORE_REORG" step -- tying it to whatever
+"Derive REORG_BASELINE_HEIGHT" step -- tying it to whatever
 scripts/generate_traffic.py produces when that runs first in the same job). The
-baseline step waits until height >= CHAIN_HEIGHT_BEFORE_REORG, then uses whatever
+baseline step waits until height >= REORG_BASELINE_HEIGHT, then uses whatever
 height was *actually* reached -- which can be higher -- as the real reference point
 for both forks' target height. Using the literal input value instead would let
 already-elapsed height silently satisfy that target too: group A/B would "build their
@@ -104,7 +103,7 @@ HEIGHT_POLL_INTERVAL_SECONDS = 5
 # A liveness timeout, not a total-duration budget for reaching the target height:
 # _wait_for_height watches getblockchaininfo's bestblockhash and only times out if it
 # stops changing (real forward progress stalls), not because reaching the target
-# takes a while -- REORG_LENGTH can be large, and whichever group is building alone
+# takes a while -- REORG_LENGTH_BLOCKS can be large, and whichever group is building alone
 # signs with only 2 of 3 signers live (the third signer's RPC target is on the other,
 # currently-stopped group -- see doc/work-done.md's RPC-connectivity note), so
 # roughly 1 in 3 rounds produces no block at all. A flat total-duration timeout would
@@ -154,13 +153,11 @@ class ReorgError(Exception):
 
 
 class ReorgSimulator:
-    def __init__(self, rpc_user, rpc_pass, baseline_height, reorg_length, round_duration):
-        self._rpc_user = rpc_user
-        self._rpc_pass = rpc_pass
+    def __init__(self, baseline_height, reorg_length_blocks, round_duration):
         self._baseline_height = baseline_height
-        self._reorg_length = reorg_length
+        self._reorg_length_blocks = reorg_length_blocks
         self._round_duration = round_duration
-        self._clients = {name: CoreRpcClient(RPC_HOST, port, rpc_user, rpc_pass) for name, port in NODES}
+        self._clients = {name: CoreRpcClient(RPC_HOST, port, name) for name, port in NODES}
         self._group_a_tip = None
         self._group_b_tip = None
         self._canary_txid = None
@@ -191,9 +188,9 @@ class ReorgSimulator:
         await self._verify_canary_transaction_survived()
         await self._restore_default_signers()
         log.info(
-            f"done. group A's {self._reorg_length}-block fork (tip {self._group_a_tip[:12]}...) confirmed as a "
+            f"done. group A's {self._reorg_length_blocks}-block fork (tip {self._group_a_tip[:12]}...) confirmed as a "
             f"valid-fork on every node; every node -- both former groups -- converged on group B's "
-            f"{self._reorg_length + 2}-block chain (tip {self._group_b_tip[:12]}...); the canary transaction "
+            f"{self._reorg_length_blocks + 2}-block chain (tip {self._group_b_tip[:12]}...); the canary transaction "
             f"({self._canary_txid[:12]}...) confirmed only on the losing fork was not lost."
         )
 
@@ -222,7 +219,7 @@ class ReorgSimulator:
         await self._repoint_signers(GROUP_B_RPC_HOSTS)
         await start_nodes(*SIGNERS)
 
-        target = self._baseline_height + self._reorg_length
+        target = self._baseline_height + self._reorg_length_blocks
         log.step(f"group B building its fork (target height {target})")
         await self._wait_for_height(GROUP_B, target)
         self._group_b_tip = await self._clients["core-3a"].call("getbestblockhash")
@@ -257,7 +254,7 @@ class ReorgSimulator:
         # matches the verified recipe: threshold 2 is met by signer-0/signer-1 alone.
         await start_nodes(*SIGNERS)
 
-        target = self._baseline_height + self._reorg_length
+        target = self._baseline_height + self._reorg_length_blocks
         log.step(f"group A building its own, different fork (target height {target})")
         await self._wait_for_height(GROUP_A, target)
         self._group_a_tip = await self._clients["core-1a"].call("getbestblockhash")
@@ -267,7 +264,7 @@ class ReorgSimulator:
     async def _reconnect_group_b(self):
         log.step("reconnecting group B alongside group A")
         await start_nodes(*GROUP_B)
-        waiter = TopologyWaiter(self._rpc_user, self._rpc_pass, CONVERGENCE_TIMEOUT_SECONDS, HEIGHT_POLL_INTERVAL_SECONDS)
+        waiter = TopologyWaiter(CONVERGENCE_TIMEOUT_SECONDS, HEIGHT_POLL_INTERVAL_SECONDS)
         await waiter.run()
 
     async def _confirm_tie_holds(self):
@@ -289,7 +286,7 @@ class ReorgSimulator:
         # +2, not +1 -- confirmed live: core-3a still shows its own just-abandoned tip
         # as valid-headers (not yet valid-fork) after only one, one round behind every
         # other node. See this module's docstring step 6.
-        target = self._baseline_height + self._reorg_length + 2
+        target = self._baseline_height + self._reorg_length_blocks + 2
         # ALL_NODE_NAMES, not just GROUP_B -- the point of this wait is confirming
         # group A adopts group B's now-longer chain (the reorg itself), not just that
         # group B produced more blocks.
@@ -336,10 +333,10 @@ class ReorgSimulator:
             if active[0]["hash"] != self._group_b_tip:
                 failures.append(f"{name}: active tip {active[0]['hash']} doesn't match group B's {self._group_b_tip}")
                 continue
-            if forks[0]["hash"] != self._group_a_tip or forks[0]["branchlen"] != self._reorg_length:
+            if forks[0]["hash"] != self._group_a_tip or forks[0]["branchlen"] != self._reorg_length_blocks:
                 failures.append(
                     f"{name}: valid-fork tip mismatch -- expected hash {self._group_a_tip} "
-                    f"branchlen {self._reorg_length}, got {forks[0]}"
+                    f"branchlen {self._reorg_length_blocks}, got {forks[0]}"
                 )
                 continue
             log.info(f"{name}: confirmed -- active={active[0]['hash'][:12]}... valid-fork={forks[0]['hash'][:12]}... "
@@ -434,7 +431,7 @@ class ReorgSimulator:
 
         assembler = SignerConfigAssembler(
             set_dir, SIGNER_THRESHOLD, aggpubkey,
-            CoreRpc(CORE_RPC_PORT, self._rpc_user, self._rpc_pass),
+            CoreRpc(CORE_RPC_PORT),
             Redis(REDIS_HOST, REDIS_PORT),
             self._round_duration,
         )
@@ -453,7 +450,7 @@ class ReorgSimulator:
         before this call started (e.g. scripts/generate_traffic.py, if it ran first
         in the same job). Callers that derive further targets from this return value,
         not the original `target` they asked for, stay correct regardless of how much
-        the chain had already advanced -- see the CHAIN_HEIGHT_BEFORE_REORG note in
+        the chain had already advanced -- see the REORG_BASELINE_HEIGHT note in
         this script's own docstring.
 
         Watches getblockchaininfo's bestblockhash per node rather than assuming a
@@ -539,17 +536,15 @@ class ReorgSimulator:
 
 
 async def main():
-    rpc_user = os.environ.get("CORE_RPC_USER", "rpcuser")
-    rpc_pass = os.environ.get("CORE_RPC_PASS", "rpcpassword")
-    baseline_height = int(os.environ.get("CHAIN_HEIGHT_BEFORE_REORG", "30"))
-    reorg_length = int(os.environ.get("REORG_LENGTH", "10"))
+    baseline_height = int(os.environ.get("REORG_BASELINE_HEIGHT", "30"))
+    reorg_length_blocks = int(os.environ.get("REORG_LENGTH_BLOCKS", "10"))
     round_duration = os.environ.get("ROUND_DURATION", "60")
 
     log.step(
         f"simulating a reorg: baseline height {baseline_height}, group B then group A each build "
-        f"{reorg_length} block(s) alone, then group B is extended by 2 more"
+        f"{reorg_length_blocks} block(s) alone, then group B is extended by 2 more"
     )
-    simulator = ReorgSimulator(rpc_user, rpc_pass, baseline_height, reorg_length, round_duration)
+    simulator = ReorgSimulator(baseline_height, reorg_length_blocks, round_duration)
     await simulator.run()
 
 

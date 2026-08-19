@@ -29,11 +29,10 @@ for the full design, including:
 Usage (via entrypoint_wrapper.sh, not run directly):
     node_orchestrator.py --node-name=core-1a --restart-flavor=reindex -- tapyrusd <args...>
 
-Reads CORE_RPC_USER / CORE_RPC_PASS / PRNG_SEED_BASE from the environment -- same
-job-level env vars the rest of this repo's scripts already use. PRNG_SEED_BASE is
-otherwise unconsumed anywhere else in this repo (see doc/work-done.md) -- this is its
-first real use, seeded per node so all 7 don't act in lockstep, but still
-deterministic/reproducible for a given run.
+Reads PRNG_SEED_BASE from the environment -- same job-level env var the rest of this
+repo's scripts already use. Otherwise unconsumed anywhere else in this repo (see
+doc/work-done.md) -- this is its first real use, seeded per node so all 7 don't act
+in lockstep, but still deterministic/reproducible for a given run.
 """
 import asyncio
 import os
@@ -64,6 +63,11 @@ RESTART_FLAVOR_FLAGS = {
 }
 
 PAUSE_FILE = Path("/orchestrator-control/pause")
+# scripts.lib.rpc.cookie_path()'s host-side default (REPO_ROOT-relative) resolves
+# to /app/runtime/rpc-cookies in here, since scripts are mounted at /app/scripts --
+# not the actual /cookies mount (docker-compose.yml). Passed explicitly to every
+# CoreRpcClient this script constructs, same as PAUSE_FILE above.
+COOKIE_DIR = Path("/cookies")
 
 RPC_READY_TIMEOUT_SECONDS = 120
 RPC_READY_POLL_INTERVAL_SECONDS = 3
@@ -108,13 +112,11 @@ DOWNTIME_TIMEOUT_SECONDS = 90
 
 
 class NodeOrchestrator:
-    def __init__(self, node_name, restart_flavor, tapyrusd_args, rpc_user, rpc_pass, rng):
+    def __init__(self, node_name, restart_flavor, tapyrusd_args, rng):
         self._node_name = node_name
         self._restart_flavor_flag = RESTART_FLAVOR_FLAGS[restart_flavor]
         self._tapyrusd_args = tapyrusd_args
-        self._rpc_user = rpc_user
-        self._rpc_pass = rpc_pass
-        self._rpc = CoreRpcClient(RPC_HOST, RPC_PORT, rpc_user, rpc_pass)
+        self._rpc = CoreRpcClient(RPC_HOST, RPC_PORT, node_name, cookie_dir=COOKIE_DIR)
         self._rng = rng
         self._process = None
         # Guards _process itself -- both deliberate restarts and the crash
@@ -197,7 +199,7 @@ class NodeOrchestrator:
         for other in ALL_NODES:
             if other == self._node_name:
                 continue
-            client = CoreRpcClient(other, RPC_PORT, self._rpc_user, self._rpc_pass)
+            client = CoreRpcClient(other, RPC_PORT, other, cookie_dir=COOKIE_DIR)
             try:
                 return await client.call("getblockcount")
             except (RpcError, RpcUnreachable):
@@ -358,13 +360,11 @@ def parse_args(argv):
 def main():
     node_name, restart_flavor, tapyrusd_args = parse_args(sys.argv[1:])
 
-    rpc_user = os.environ.get("CORE_RPC_USER", "rpcuser")
-    rpc_pass = os.environ.get("CORE_RPC_PASS", "rpcpassword")
     seed_base = os.environ.get("PRNG_SEED_BASE", "0")
     rng = random.Random(f"{seed_base}:{node_name}")
 
     log.step(f"{node_name}: node orchestrator starting (restart flavor: {restart_flavor})")
-    orchestrator = NodeOrchestrator(node_name, restart_flavor, tapyrusd_args, rpc_user, rpc_pass, rng)
+    orchestrator = NodeOrchestrator(node_name, restart_flavor, tapyrusd_args, rng)
     asyncio.run(orchestrator.run())
 
 

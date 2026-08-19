@@ -42,8 +42,7 @@ Usage:
     ./scripts/generate_traffic.py <round-count>
 
 Requires the 7-node topology already up and converged (scripts/wait_for_topology.py)
-and signer-set-a producing blocks. CORE_RPC_USER / CORE_RPC_PASS env vars match the
-workflow's job-level env of the same names.
+and signer-set-a producing blocks.
 
 Round-robin target: node i's round R send goes to node (i + offset) mod 7, where
 offset = 1 + ((R - 1) mod 6) -- cycles through all 6 other nodes every 6 rounds and
@@ -79,7 +78,6 @@ against a real 7-node stack, and since via real GitHub Actions CI too.
 """
 import argparse
 import asyncio
-import os
 import sys
 import time
 from pathlib import Path
@@ -846,11 +844,9 @@ def parse_args():
 
 async def main():
     args = parse_args()
-    rpc_user = os.environ.get("CORE_RPC_USER", "rpcuser")
-    rpc_pass = os.environ.get("CORE_RPC_PASS", "rpcpassword")
 
     nodes = [
-        TrafficNode(index, name, CoreRpcClient(RPC_HOST, port, rpc_user, rpc_pass))
+        TrafficNode(index, name, CoreRpcClient(RPC_HOST, port, name))
         for index, (name, port) in enumerate(NODES)
     ]
 

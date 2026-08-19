@@ -14,19 +14,25 @@ on:
   # No input default: -- defaults live in the env: block below. See doc/work-done.md.
   workflow_dispatch:
     inputs:
+      core_repo_url:
+        description: 'tapyrus-core git URL (e.g. a fork, to test a branch that only exists there) -- leave blank for config/repos.py''s default'
       core_repo_ref:
         description: 'tapyrus-core ref (branch/tag/sha) -- leave blank for config/repos.py''s default'
+      signer_repo_url:
+        description: 'tapyrus-signer git URL (e.g. a fork, to test a branch that only exists there) -- leave blank for config/repos.py''s default'
       signer_repo_ref:
         description: 'tapyrus-signer ref (branch/tag/sha) -- leave blank for config/repos.py''s default'
+      seeder_repo_url:
+        description: 'tapyrus-seeder git URL (e.g. a fork, to test a branch that only exists there) -- leave blank for config/repos.py''s default'
       seeder_repo_ref:
         description: 'tapyrus-seeder ref (branch/tag/sha) -- leave blank for config/repos.py''s default'
 
       # --- transaction generation (scripts/generate_traffic.py) ---
       tx_round_count:
-        description: 'Round-robin send/check/settle cycles to run (3 block-heights and 14 transactions each); also sets the reorg baseline height (tx_round_count + 2) -- see reorg_length. Leave blank for the default -- see README.md''s variable table (defaults live in the env: block below, not restated here to avoid drift).'
+        description: 'Round-robin send/check/settle cycles to run (3 block-heights and 14 transactions each); also sets the reorg baseline height (tx_round_count + 2) -- see reorg_length_blocks. Leave blank for the default -- see README.md''s variable table (defaults live in the env: block below, not restated here to avoid drift).'
 
       # --- reorg shape ---
-      reorg_length:
+      reorg_length_blocks:
         description: 'Blocks each isolated group builds past the baseline before reconnecting at the tie. How many blocks past this the winning side needs before the reorg actually triggers is no longer an input -- simulate_reorg.py probes for it live, see doc/scripts.md. Leave blank for the default -- see README.md''s variable table.'
 
       # --- block interval ---
@@ -60,21 +66,22 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # No literal fallback -- an unset ref resolves to config/repos.py's own default.
+  # No literal fallback -- an unset url/ref resolves to config/repos.py's own default.
   DOCKER_BUILD_PLATFORM: ${{ inputs.docker_build_platform || '' }}
+  CORE_REPO_URL: ${{ inputs.core_repo_url }}
   CORE_REPO_REF: ${{ inputs.core_repo_ref }}
+  SIGNER_REPO_URL: ${{ inputs.signer_repo_url }}
   SIGNER_REPO_REF: ${{ inputs.signer_repo_ref }}
+  SEEDER_REPO_URL: ${{ inputs.seeder_repo_url }}
   SEEDER_REPO_REF: ${{ inputs.seeder_repo_ref }}
   PRNG_SEED_BASE: ${{ github.run_id }}
   NETWORK_ID: ${{ inputs.network_id || '1905960821' }}
   CORE_RPC_PORT: '12381'
-  CORE_RPC_USER: 'rpcuser'
-  CORE_RPC_PASS: 'rpcpassword'
   # Re-sized against the block-production math in doc/work-done.md's "CI timing
   # budget" note -- see there for the reasoning behind these values.
   TX_ROUND_COUNT: ${{ inputs.tx_round_count || ((github.event_name == 'pull_request' || github.event_name == 'push') && '10' || '60') }}
   ROUND_DURATION: ${{ inputs.round_duration_seconds || '30' }}
-  REORG_LENGTH: ${{ inputs.reorg_length || ((github.event_name == 'pull_request' || github.event_name == 'push') && '5' || '30') }}
+  REORG_LENGTH_BLOCKS: ${{ inputs.reorg_length_blocks || ((github.event_name == 'pull_request' || github.event_name == 'push') && '5' || '30') }}
   MAX_BLOCK_SIZE_NEW: ${{ inputs.max_block_size_new || '2000000' }}
 
 jobs:
@@ -91,15 +98,52 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Derive CHAIN_HEIGHT_BEFORE_REORG from TX_ROUND_COUNT
+      - name: Record runner environment
+        # Report only, no enforcement -- runs-on: ubuntu-latest is a floating tag
+        # GitHub repoints to a new image periodically, with its own default Docker/
+        # kernel/package versions, so a hard pinned-baseline diff would need updating
+        # every time GitHub moves it or it starts failing builds for no real reason.
+        # This just makes what actually ran on a given run visible, in the step log
+        # and as a downloadable artifact -- see doc/work-done.md.
+        run: |
+          {
+            echo "## Runner image"
+            echo "ImageOS=$ImageOS ImageVersion=$ImageVersion"
+            echo "## OS"
+            cat /etc/os-release
+            uname -a
+            echo
+            echo "## Docker"
+            docker version
+            docker compose version
+            echo
+            echo "## Python"
+            python3 --version
+            echo
+            echo "## Rust"
+            # Unlike the containerized tapyrus-signer image (pins rust:1.82-bookworm in
+            # its own Dockerfile), tapyrus-setup's build (below) runs cargo build
+            # --release directly on this runner, against whatever toolchain ubuntu-latest
+            # happens to preinstall -- unpinned, so worth recording explicitly.
+            rustc --version
+            cargo --version
+          } | tee environment.txt
+
+      - name: Upload runner environment fingerprint
+        uses: actions/upload-artifact@v4
+        with:
+          name: environment-fingerprint
+          path: environment.txt
+
+      - name: Derive REORG_BASELINE_HEIGHT from TX_ROUND_COUNT
         # env: expressions have no arithmetic -- ties the reorg baseline to TX_ROUND_COUNT.
-        run: echo "CHAIN_HEIGHT_BEFORE_REORG=$((TX_ROUND_COUNT + 2))" >> "$GITHUB_ENV"
+        run: echo "REORG_BASELINE_HEIGHT=$((TX_ROUND_COUNT + 2))" >> "$GITHUB_ENV"
 
-      - name: Derive FEDERATION_CHANGE_HEIGHT from REORG_LENGTH
-        run: echo "FEDERATION_CHANGE_HEIGHT=$REORG_LENGTH" >> "$GITHUB_ENV"
+      - name: Derive FEDERATION_CHANGE_OFFSET_BLOCKS from REORG_LENGTH_BLOCKS
+        run: echo "FEDERATION_CHANGE_OFFSET_BLOCKS=$REORG_LENGTH_BLOCKS" >> "$GITHUB_ENV"
 
-      - name: Derive MAX_BLOCK_SIZE_HEIGHT from FEDERATION_CHANGE_HEIGHT
-        run: echo "MAX_BLOCK_SIZE_HEIGHT=$FEDERATION_CHANGE_HEIGHT" >> "$GITHUB_ENV"
+      - name: Derive MAX_BLOCK_SIZE_OFFSET_BLOCKS from FEDERATION_CHANGE_OFFSET_BLOCKS
+        run: echo "MAX_BLOCK_SIZE_OFFSET_BLOCKS=$FEDERATION_CHANGE_OFFSET_BLOCKS" >> "$GITHUB_ENV"
 
       - name: Checkout tapyrus-core + tapyrus-signer + tapyrus-seeder
         run: ./scripts/checkout_repos.py
@@ -155,7 +199,7 @@ jobs:
       - name: Assemble signer configs
         run: |
           ROUND_DURATION="$ROUND_DURATION" ./scripts/assemble_signer_configs.py signer-set-a 2 \
-            /tmp/core-rpc-hosts.txt "$CORE_RPC_PORT" "$CORE_RPC_USER" "$CORE_RPC_PASS" redis 6379 /tmp/addrs.txt
+            /tmp/core-rpc-hosts.txt "$CORE_RPC_PORT" redis 6379 /tmp/addrs.txt
       - name: Bring up signers
         # --no-deps: signer-0/1/2 each depends_on a core-1a/2a/3a node
         # (docker/docker-compose.yml) -- without it, `up` also reconciles those
