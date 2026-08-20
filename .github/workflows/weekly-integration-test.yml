@@ -29,7 +29,7 @@ on:
 
       # --- transaction generation (scripts/generate_traffic.py) ---
       tx_round_count:
-        description: 'Round-robin send/check/settle cycles to run (3 block-heights and 14 transactions each); also sets the reorg baseline height (tx_round_count + 2) -- see reorg_length_blocks. Leave blank for the default -- see README.md''s variable table (defaults live in the env: block below, not restated here to avoid drift).'
+        description: 'Round-robin send/settle cycles to run (14 transactions each, then settles over however many blocks it actually takes -- no fixed block-height count); also sets the reorg baseline height (tx_round_count + 2) -- see reorg_length_blocks. Leave blank for the default -- see README.md''s variable table (defaults live in the env: block below, not restated here to avoid drift).'
 
       # --- reorg shape ---
       reorg_length_blocks:

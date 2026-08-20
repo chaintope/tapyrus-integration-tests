@@ -766,6 +766,22 @@ class TrafficGenerator:
             if not mismatches:
                 for line in matches:
                     log.info(line)
+                # Balances already match, but something's still unconfirmed --
+                # the chaos mempool-wipe corner (_wait_for_sender_sync's own
+                # docstring) can make a pending change invisible to balances
+                # without it having actually confirmed. This return drops
+                # `pending` for good (the caller doesn't carry it into the next
+                # round), so if it confirms later, a future round's comparison
+                # would show an unexplained "real" mismatch with nothing pointing
+                # back to this. Logged here so that failure is diagnosable from
+                # this line alone instead of a container-log archaeology session.
+                for change in pending:
+                    txids_preview = ", ".join(t[:12] for t in change.txids)
+                    log.warn(
+                        f"height {height}: balances matched the ledger, but {change.node.name}: "
+                        f"{change.description} ({txids_preview}...) is still unconfirmed and won't be "
+                        "tracked further -- if it confirms later, expect an unexplained mismatch downstream"
+                    )
                 return
 
             if pending and time.monotonic() < deadline:
