@@ -515,18 +515,47 @@ class TrafficGenerator:
     # -- height polling ------------------------------------------------------------
 
     async def _wait_for_empty_mempool(self):
-        # Same all-7-nodes-reachable shape as _wait_for_next_block, same fix.
+        """Waits for every node's mempool to clear -- not against a flat
+        HEIGHT_POLL_TIMEOUT_SECONDS clock, since that can't tell "still needs one
+        more round" apart from "genuinely stuck": both look identical as a single
+        non-empty mempool snapshot. Keeps waiting past that window as long as the
+        chain height is still advancing (concrete evidence blocks are still being
+        produced, giving whatever's pending more chances to confirm); only raises
+        once height itself has been frozen for HEIGHT_POLL_TIMEOUT_SECONDS straight.
+        Bounded overall by SETTLE_TIMEOUT_SECONDS regardless, so a chain that keeps
+        limping forward without ever actually clearing the mempool still terminates.
+
+        Confirmed live: a run failed here with a mempool dump that looked exactly
+        like a transaction just needing one more block -- root cause was actually 2
+        of 3 signers having silently died moments earlier (see simulate_reorg.py's
+        _restore_default_signers/wait_for_running), leaving height completely
+        frozen for the entire wait. The old flat timeout produced the identical
+        error message either way, with no way to tell which case it was. See
+        doc/work-done.md."""
         pause_node_orchestrators("waiting for empty mempool")
         try:
-            deadline = time.monotonic() + HEIGHT_POLL_TIMEOUT_SECONDS
+            overall_deadline = time.monotonic() + SETTLE_TIMEOUT_SECONDS
+            last_height = await self._current_height()
+            frozen_since = time.monotonic()
             while True:
                 mempools = await asyncio.gather(*(self._node_mempool(node) for node in self._nodes))
                 if all(mempool == [] for mempool in mempools):
                     return
-                if time.monotonic() >= deadline:
+                height = await self._current_height()
+                if height != last_height:
+                    last_height = height
+                    frozen_since = time.monotonic()
+                now = time.monotonic()
+                dump = {node.name: mempool for node, mempool in zip(self._nodes, mempools)}
+                if now - frozen_since >= HEIGHT_POLL_TIMEOUT_SECONDS:
                     raise TrafficGenerationError(
-                        f"mempool(s) still non-empty after {HEIGHT_POLL_TIMEOUT_SECONDS}s: "
-                        f"{ {node.name: mempool for node, mempool in zip(self._nodes, mempools)} }"
+                        f"mempool(s) still non-empty and height frozen at {height} for "
+                        f"{HEIGHT_POLL_TIMEOUT_SECONDS}s: {dump}"
+                    )
+                if now >= overall_deadline:
+                    raise TrafficGenerationError(
+                        f"mempool(s) still non-empty after {SETTLE_TIMEOUT_SECONDS}s overall, even "
+                        f"though height kept advancing (last seen {height}): {dump}"
                     )
                 await asyncio.sleep(HEIGHT_POLL_INTERVAL_SECONDS)
         finally:

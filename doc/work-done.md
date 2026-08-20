@@ -374,6 +374,44 @@ does.
   own fresh `HEIGHT_POLL_TIMEOUT_SECONDS` window regardless of which pass it
   is, and the outer `SETTLE_TIMEOUT_SECONDS` deadline is used only to decide
   whether a given pass should be the final one.
+- **`generate_traffic.py`'s `_wait_for_empty_mempool` failed with a mempool
+  dump that looked exactly like "one more block would fix it" -- root cause
+  was 2 of 3 signers having silently died, leaving the chain completely
+  frozen for the whole wait, not a routing/timing quirk.** Traced through a
+  real CI failure via container logs: `simulate_reorg.py`'s canary
+  transaction (`core-1a -> core-1b`, confirmed only on group A's now-losing
+  fork) correctly reverted to pending on `core-1a`/`1b`/`2a`/`2b` when they
+  reorged onto group B's winning chain -- `core-3a`/`3b`/`core-7` never saw
+  it at all, since they were never on group A's fork and a reorg-restored
+  mempool entry isn't re-relayed to peers the way a fresh broadcast is
+  (confirmed: the original broadcast logged `Relaying wtx`, the reorg-restore
+  re-entry didn't). That part is expected. What wasn't: chain height stayed
+  frozen at the same value for the entire 180s wait -- `docker-signer-0-1.log`
+  and `docker-signer-1-1.log` both end mid-run with `Signer Node was stopped
+  by SIGTERM` and never show a restart, while `docker-signer-2-1.log` alone
+  shows the normal restart sequence. With a 2-of-3 threshold, round signing
+  cannot complete with one signer alive, regardless of which master gets
+  selected -- confirmed against the signer logs: 5 separate round attempts
+  across master indices 0/1/2 in that window, none reaching "Round Success".
+  Root cause: `start_nodes()` (`scripts/lib/compose.py`) only checks that
+  `docker compose up -d` itself exited 0, which proves Docker launched the
+  containers, nothing about whether the process inside stayed up -- no
+  service has a `restart:` policy, so a startup crash (or the runner killing
+  it under resource pressure) just leaves the container silently `Exited`.
+  `simulate_reorg.py`'s `_restore_default_signers` saw success and moved on,
+  with the actual failure only surfacing minutes later in a completely
+  different script. Fixed two ways: `wait_for_running()` added to
+  `scripts/lib/compose.py`, polling `docker compose ps --status running`
+  after `start_nodes()` and raising with the specific service name(s) that
+  never came up -- wired into `_restore_default_signers` specifically, the
+  confirmed failure site, not retrofitted into every `start_nodes` call
+  site. And defense in depth in `generate_traffic.py`: `_wait_for_empty_mempool`
+  no longer fails on a flat `HEIGHT_POLL_TIMEOUT_SECONDS` clock -- it keeps
+  waiting past that as long as chain height is still advancing (real evidence
+  of progress), only raising once height itself has been frozen for
+  `HEIGHT_POLL_TIMEOUT_SECONDS`, bounded overall by `SETTLE_TIMEOUT_SECONDS`.
+  A flat timeout couldn't distinguish "still needs one more round" from
+  "genuinely stuck" -- both produce an identical non-empty-mempool snapshot.
 - **`core-3b`, not just `core-7`, can legitimately see group A's abandoned fork
   after a reorg reconnect.** Two propagation paths matter, not just P2P
   adjacency: a signer submits its own mastered block directly to its RPC
