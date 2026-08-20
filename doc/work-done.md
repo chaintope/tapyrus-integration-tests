@@ -285,6 +285,17 @@ does.
   excludes both. `51.51.51.0/24` is an arbitrary block confirmed to fall outside
   every exclusion (see Lessons learnt above). If this ever needs to change, pick a
   different block and re-check it against that exclusion list.
+- **Per-node RPC checks fetch concurrently, not in a sequential loop, wherever
+  every node's result is independent** (`generate_traffic.py`'s
+  `_settle_and_verify` via `_fetch_node_balances`;
+  `simulate_federation_change.py`/`simulate_maxblocksize_change.py`'s rotation/
+  max-block-size confirmation; `verify_seeder.py`'s peer-discovery poll). Beyond
+  the obvious wall-clock win, `_settle_and_verify` specifically also shrinks the
+  window a new block could land inside mid-read (still guarded by its own
+  re-read-if-height-moved check, just less likely to need it). Every one of these
+  log lines names the node it's about -- `asyncio.gather()` doesn't preserve the
+  per-node ordering a sequential loop would, so a log with several nodes' output
+  interleaved needs that to stay readable.
 
 ## Lessons learnt
 
@@ -299,21 +310,16 @@ does.
   own timeout caught it. Fixed by persisting every env var any `docker compose`
   call depends on (`GENESIS_BLOCK_WITH_SIG`/`SEEDER_IP`/`CORE_*_ARGS`) to
   `$GITHUB_ENV` once, in `verify_seeder.py`, rather than patching each call site.
-- **A `PendingChange` (`generate_traffic.py`) can look "never confirmed" and get
-  dropped even though it actually did confirm on-chain** -- surfaced several
-  ways across real runs: crediting the ledger before confirmation instead of
-  after; a bare `_last_credited_height` assignment that a transient height
-  regression could rewind; a chaos node's own restart hiding a self-broadcast
-  tx from its own `gettransaction` view; and plain senders never getting more
-  than two confirmation attempts. Current design: every pending change gets
-  three attempts (check, settle, then one final grace block) before being
-  dropped for real (`_resolve_pending_changes`/`_give_final_grace`); every one
-  of `node_orchestrator.py`'s `CHAOS_NODES` is in `CHAOS_SENDER_GRACE_NODES`
-  (including `core-2b`, whose `-persistmempool=1` only covers a clean
-  shutdown, not its kill-fallback or crash-relaunch paths) and additionally
-  waits for its own tip to match the network's (height AND blockhash) before
-  that final check (`_wait_for_sender_sync`), since a restart can hide a
-  confirmed tx from just that one node's view.
+- **A `PendingChange` (`generate_traffic.py`) used to be able to look "never
+  confirmed" and get dropped even though it actually did confirm on-chain** --
+  surfaced several ways across real runs: crediting the ledger before
+  confirmation instead of after; a bare `_last_credited_height` assignment
+  that a transient height regression could rewind; a chaos node's own restart
+  hiding a self-broadcast tx from its own `gettransaction` view; and plain
+  senders never getting more than two confirmation attempts. The fixed-attempt
+  check/settle/grace design that grew out of chasing each of those (three
+  attempts, plus a `CHAOS_SENDER_GRACE_NODES` tip-sync check before the final
+  one) was itself later replaced outright -- see the settle-loop entry below.
 - **`_seed_ledger_with_current_balances` anchored the seeded ledger to
   `min()` across nodes, not `max()`** -- the same double-credit failure mode
   as above, a different path in: the consistency check only requires each
@@ -323,6 +329,51 @@ does.
   `max()`: a block is always submitted to its earner's own RPC node first,
   and the 3 earners are never chaos-restarted, so every height up to the
   snapshot's max is already folded into that earner's seeded balance.
+- **The check/settle/grace design above was itself still capable of a false
+  mismatch, traced to a real CI failure (`core-2a` off by exactly +50 TPC at
+  height 110, one run's only mismatch).** `_verify_round(height)` trusted a
+  `height` captured once, earlier, by whichever `_next_block_with_coinbase()`
+  call computed it -- but real wall-clock time inside `_resolve_pending_changes`
+  (RPC round-trips per pending change) could pass before `_verify_round`
+  actually read balances. `getbalance()` reflects the chain *at query time*,
+  so if another block landed in that gap, the real wallet already reflected
+  its coinbase while the ledger, credited only through the older `height`,
+  did not -- the before/after retry only guarded against the height moving
+  *during* its own read, never against it having already moved before the
+  read started, so a fully self-consistent read could still be compared
+  against a stale ledger and pass as a real mismatch. Confirmed via container
+  logs: height 111 (`core-2a`'s own next block, empty, `fees: 0`) landed one
+  second before the settle check ran -- 50 TPC is exactly a fee-less coinbase.
+  Fixed by replacing the whole check/settle/grace/verify sequence with one
+  loop (`_settle_and_verify`/`_settle_pending`, both built on the shared
+  `_advance_ledger_and_resolve`): every pass re-reads each node's real height,
+  requires all 7 to agree before trusting it, and re-syncs coinbase crediting
+  to that height immediately before comparing. Retrying past an apparent
+  mismatch is now conditioned on *why* it might still resolve (a send still
+  unconfirmed in some node's mempool, or nodes not yet converged) rather than
+  a fixed attempt count; a mismatch with nothing pending and every node
+  already converged is real and gets reported immediately. Also generalizes
+  the old `CHAOS_SENDER_GRACE_NODES`-only `_wait_for_sender_sync` safeguard to
+  run on every settle pass, not just a final grace block.
+- **The settle loop above could itself die on a misleading convergence error
+  instead of producing its own final diagnostics, caught on review before a
+  live failure.** `_advance_ledger_and_resolve` took the caller's overall
+  `SETTLE_TIMEOUT_SECONDS` deadline and passed it straight into
+  `_wait_for_convergence` -- fine while there was still time left, but once
+  that deadline had already passed (exactly the case for the final `final=True`
+  pass, and for the very last non-final pass immediately before it),
+  `_wait_for_convergence` checked convergence exactly once and, unless the 7
+  nodes happened to agree at that precise instant, raised
+  `TrafficGenerationError("node heights never converged while settling")` --
+  which propagates straight out of `run()`, replacing the mismatch-list/
+  dropped-pending-change logging this pass exists to produce with a
+  convergence error that misdescribes what actually happened. Fixed by no
+  longer conflating "how long to wait for the 7 nodes to agree on a height
+  this one pass" with "how long to keep retrying past a mismatch overall" --
+  `_advance_ledger_and_resolve` now always gives `_wait_for_convergence` its
+  own fresh `HEIGHT_POLL_TIMEOUT_SECONDS` window regardless of which pass it
+  is, and the outer `SETTLE_TIMEOUT_SECONDS` deadline is used only to decide
+  whether a given pass should be the final one.
 - **`core-3b`, not just `core-7`, can legitimately see group A's abandoned fork
   after a reorg reconnect.** Two propagation paths matter, not just P2P
   adjacency: a signer submits its own mastered block directly to its RPC

@@ -415,18 +415,19 @@ file reads/writes, no subprocess or network I/O to run concurrently.
 
 Drives round-robin TPC + colored-coin traffic across all 7 nodes and confirms every
 node's wallet balance (TPC and every colored type in play) after each block. Everything
-is derived from a single `--round-count`: each round spans 3 block-heights (send, check,
-settle), polled the same way across all 7 nodes -- see the script's own docstring for
-the full design (funding the 4 nodes with no coinbase income, the per-node colored-type
-assignment, and the balance-shortfall top-up mechanic). Implemented as `TrafficNode` +
-`TrafficGenerator`.
+is derived from a single `--round-count`: each round sends, then settles via one
+convergence loop (`_settle_and_verify`, see `doc/scripts.md`'s design-decisions bullet
+above and `doc/work-done.md`), polled the same way across all 7 nodes -- see the
+script's own docstring for the full design (funding the 4 nodes with no coinbase
+income, the per-node colored-type assignment, and the balance-shortfall top-up
+mechanic). Implemented as `TrafficNode` + `TrafficGenerator`.
 
 - **Usage**: `./scripts/generate_traffic.py <round-count>`
 - Requires the 7-node topology already converged (`wait_for_topology.py`) and
   signer-set-a producing blocks.
-- **Output**: none written to disk -- verification results are logged; a settle-height
-  balance mismatch raises `TrafficGenerationError` (non-zero exit) after all rounds run,
-  listing every mismatch found, not just the first.
+- **Output**: none written to disk -- verification results are logged; a real (not
+  pending-explained) balance mismatch raises `TrafficGenerationError` (non-zero exit)
+  after all rounds run, listing every mismatch found, not just the first.
 - Verified end-to-end against a real 7-node stack (`round_count=3`, all three
   colored-coin types, all 7 nodes' TPC -- coinbase-earning ones included).
 - **Requires `fallbackfee` set** (see `render_tapyrus_conf.py` above, which sets
@@ -467,15 +468,20 @@ assignment, and the balance-shortfall top-up mechanic). Implemented as `TrafficN
   so two blocks landing between polls don't leave one uncredited). The reward
   itself is not a flat amount -- subsidy plus whatever transaction fees that
   block happened to include, confirmed live.
-- **A still-pending change gets one more block's grace before the truly final
-  drop, regardless of sender**: `_give_final_grace` is called with whatever's
-  still unconfirmed after settle-height's own (non-final) check, waits for one
-  more block, then makes the actual final confirmation check there. A change
-  whose sender is in `CHAOS_SENDER_GRACE_NODES` (all 4 of `node_orchestrator.py`'s
-  `CHAOS_NODES`) additionally calls `_wait_for_sender_sync` first (waits for that node's own
-  tip to match the network's, height and blockhash, against `core-1a` as
-  reference). Wired into both the setup phase (funding/issuance) and every
-  round. See `doc/work-done.md` for why.
+- **Settling a round is one convergence loop, not a fixed attempt count**:
+  `_settle_and_verify`/`_settle_pending` (both built on the shared
+  `_advance_ledger_and_resolve`) re-read each node's real height, require all
+  7 to agree before trusting it, and re-sync the ledger's coinbase crediting
+  to that height immediately before comparing -- every single pass, not once.
+  A mismatch keeps getting retried only while there's a concrete reason to
+  expect it to resolve (a send still unconfirmed in some node's mempool, or
+  the nodes not yet converged); otherwise it's real and gets reported. A
+  change whose sender is in `CHAOS_SENDER_GRACE_NODES` (all 4 of
+  `node_orchestrator.py`'s `CHAOS_NODES`) additionally calls
+  `_wait_for_sender_sync` on every pass (waits for that node's own tip to
+  match the network's, height and blockhash, against `core-1a` as reference).
+  Wired into both the setup phase (funding/issuance, via `_settle_pending`)
+  and every round (via `_settle_and_verify`). See `doc/work-done.md` for why.
 
 ## `scripts/simulate_reorg.py`
 

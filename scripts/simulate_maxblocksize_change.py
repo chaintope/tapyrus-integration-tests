@@ -133,7 +133,7 @@ class MaxBlockSizeChangeSimulator:
         # node mid-restart exactly when _confirm_change_via_rpc's single,
         # non-retrying getblockchaininfo check runs would fail the whole step
         # spuriously. See scripts/lib/orchestrator_control.py.
-        pause_node_orchestrators()
+        pause_node_orchestrators("max-block-size config write through RPC confirmation")
         try:
             self._write_configs()
             await self._wait_for_change()
@@ -214,19 +214,24 @@ class MaxBlockSizeChangeSimulator:
             f"{self._scheduled_height} via getblockchaininfo (all 7 core nodes)"
         )
         expected_key = str(self._new_max_block_size)
-        failures = []
-        for name in ALL_NODE_NAMES:
-            info = await self._clients[name].call("getblockchaininfo")
-            entries = info.get("maxBlockSizes", [])
-            if any(entry.get(expected_key) == self._scheduled_height for entry in entries):
-                log.info(f"{name}: confirmed -- maxBlockSizes has {{{expected_key}: {self._scheduled_height}}}")
-            else:
-                failures.append(f"{name}: no maxBlockSizes entry for {expected_key} at height {self._scheduled_height}, got {entries}")
+        # Checked concurrently, not one node at a time -- each node's own log line
+        # below always names it, since gather() doesn't preserve the per-node
+        # ordering a sequential loop would.
+        results = await asyncio.gather(*(self._check_node_max_block_size(name, expected_key) for name in ALL_NODE_NAMES))
+        failures = [failure for failure in results if failure is not None]
         if failures:
             raise CeremonyError(
                 f"max-block-size change not confirmed via RPC on {len(failures)}/{len(ALL_NODE_NAMES)} node(s):\n  "
                 + "\n  ".join(failures)
             )
+
+    async def _check_node_max_block_size(self, name, expected_key):
+        info = await self._clients[name].call("getblockchaininfo")
+        entries = info.get("maxBlockSizes", [])
+        if any(entry.get(expected_key) == self._scheduled_height for entry in entries):
+            log.info(f"{name}: confirmed -- maxBlockSizes has {{{expected_key}: {self._scheduled_height}}}")
+            return None
+        return f"{name}: no maxBlockSizes entry for {expected_key} at height {self._scheduled_height}, got {entries}"
 
     # -- height polling (same liveness/stall approach as the other simulate_*.py scripts) --
 

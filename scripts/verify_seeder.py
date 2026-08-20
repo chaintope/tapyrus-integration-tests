@@ -273,15 +273,17 @@ class SeederVerifier:
         discovered = set()
         deadline = time.monotonic() + PEER_DISCOVERY_TIMEOUT_SECONDS
         while len(discovered) < len(CORE_NODES):
+            # Every not-yet-discovered node checked concurrently, not one at a
+            # time -- each node's own log line below always names it, since
+            # gather() doesn't preserve the per-node ordering a sequential loop
+            # would.
+            pending = [n for n in CORE_NODES if n not in discovered]
+            results = await asyncio.gather(*(self._check_node_peers(clients[n], n) for n in pending))
             counts = {}
-            for n in CORE_NODES:
-                if n in discovered:
-                    continue
-                peers = await clients[n].call("getpeerinfo")
-                counts[n] = len(peers)
-                if any(p.get("subver") != SEEDER_SUBVER for p in peers):
+            for n, peer_count, has_real_peer in results:
+                counts[n] = peer_count
+                if has_real_peer:
                     discovered.add(n)
-                    log.info(f"{n}: confirmed a real core-node peer (not the seeder) came from -addseeder")
             if len(discovered) >= len(CORE_NODES):
                 break
             if time.monotonic() >= deadline:
@@ -292,6 +294,13 @@ class SeederVerifier:
                 )
             await asyncio.sleep(PEER_DISCOVERY_POLL_INTERVAL_SECONDS)
         log.info("confirmed: every core node discovered at least one real peer organically via -addseeder")
+
+    async def _check_node_peers(self, client, name):
+        peers = await client.call("getpeerinfo")
+        has_real_peer = any(p.get("subver") != SEEDER_SUBVER for p in peers)
+        if has_real_peer:
+            log.info(f"{name}: confirmed a real core-node peer (not the seeder) came from -addseeder")
+        return name, len(peers), has_real_peer
 
     async def _wait_for_seeder_convergence_all_7(self, node_ips):
         # addseeder mode: core-7 has no -connect at all here, so it listens like the
