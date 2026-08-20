@@ -666,14 +666,24 @@ class TrafficGenerator:
                 raise TrafficGenerationError(f"node heights never converged while settling: {heights}")
             await asyncio.sleep(HEIGHT_POLL_INTERVAL_SECONDS)
 
-    async def _advance_ledger_and_resolve(self, pending, deadline, final, count_success=True):
+    async def _advance_ledger_and_resolve(self, pending, final, count_success=True):
         """One settle pass, shared by _settle_pending and _settle_and_verify: waits
         for all 7 nodes to agree on a height, re-syncs the ledger's coinbase
         crediting to it (every single pass, not once -- the real fix, see
         doc/work-done.md), waits out any CHAOS_SENDER_GRACE_NODES sender's own
         resync before trusting its mempool, then resolves whatever's still pending
-        at that height. Returns (height, still_pending)."""
-        height = await self._wait_for_convergence(deadline)
+        at that height. Returns (height, still_pending).
+
+        _wait_for_convergence always gets its own fresh HEIGHT_POLL_TIMEOUT_SECONDS
+        window here, never the caller's overall settle deadline (SETTLE_TIMEOUT_SECONDS,
+        _settle_pending/_settle_and_verify) -- conflating "how long to wait for the 7
+        nodes to agree on a height this one pass" with "how long to keep retrying past
+        a mismatch overall" meant a convergence check could be entered with a deadline
+        that had already expired (likely on the very pass that was supposed to produce
+        this run's final diagnostics), raising a misleading convergence error that
+        pre-empted the mismatch/drop logging this pass exists to produce instead of
+        actually doing its job. See doc/work-done.md."""
+        height = await self._wait_for_convergence(time.monotonic() + HEIGHT_POLL_TIMEOUT_SECONDS)
         for h in range(self._last_credited_height + 1, height + 1):
             await self._credit_coinbase_for_height(h)
         self._last_credited_height = max(self._last_credited_height, height)
@@ -694,7 +704,7 @@ class TrafficGenerator:
         deadline = time.monotonic() + SETTLE_TIMEOUT_SECONDS
         while pending:
             final = time.monotonic() >= deadline
-            _, pending = await self._advance_ledger_and_resolve(pending, deadline, final, count_success)
+            _, pending = await self._advance_ledger_and_resolve(pending, final, count_success)
             if pending and not final:
                 await self._wait_for_next_block()
 
@@ -711,7 +721,7 @@ class TrafficGenerator:
         remaining mismatch is real and gets reported."""
         deadline = time.monotonic() + SETTLE_TIMEOUT_SECONDS
         while True:
-            height, pending = await self._advance_ledger_and_resolve(pending, deadline, final=False)
+            height, pending = await self._advance_ledger_and_resolve(pending, final=False)
 
             pause_node_orchestrators(f"reading balances to verify height {height}")
             try:
@@ -742,7 +752,7 @@ class TrafficGenerator:
                 # pass to log and drop them properly (same as the old final grace
                 # block), rather than silently abandoning them while reporting the
                 # mismatches they were the whole explanation for.
-                _, pending = await self._advance_ledger_and_resolve(pending, deadline, final=True)
+                _, pending = await self._advance_ledger_and_resolve(pending, final=True)
 
             for line in matches:
                 log.info(line)

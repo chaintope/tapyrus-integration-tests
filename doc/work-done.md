@@ -355,6 +355,25 @@ does.
   already converged is real and gets reported immediately. Also generalizes
   the old `CHAOS_SENDER_GRACE_NODES`-only `_wait_for_sender_sync` safeguard to
   run on every settle pass, not just a final grace block.
+- **The settle loop above could itself die on a misleading convergence error
+  instead of producing its own final diagnostics, caught on review before a
+  live failure.** `_advance_ledger_and_resolve` took the caller's overall
+  `SETTLE_TIMEOUT_SECONDS` deadline and passed it straight into
+  `_wait_for_convergence` -- fine while there was still time left, but once
+  that deadline had already passed (exactly the case for the final `final=True`
+  pass, and for the very last non-final pass immediately before it),
+  `_wait_for_convergence` checked convergence exactly once and, unless the 7
+  nodes happened to agree at that precise instant, raised
+  `TrafficGenerationError("node heights never converged while settling")` --
+  which propagates straight out of `run()`, replacing the mismatch-list/
+  dropped-pending-change logging this pass exists to produce with a
+  convergence error that misdescribes what actually happened. Fixed by no
+  longer conflating "how long to wait for the 7 nodes to agree on a height
+  this one pass" with "how long to keep retrying past a mismatch overall" --
+  `_advance_ledger_and_resolve` now always gives `_wait_for_convergence` its
+  own fresh `HEIGHT_POLL_TIMEOUT_SECONDS` window regardless of which pass it
+  is, and the outer `SETTLE_TIMEOUT_SECONDS` deadline is used only to decide
+  whether a given pass should be the final one.
 - **`core-3b`, not just `core-7`, can legitimately see group A's abandoned fork
   after a reorg reconnect.** Two propagation paths matter, not just P2P
   adjacency: a signer submits its own mastered block directly to its RPC
