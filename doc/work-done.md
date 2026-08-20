@@ -92,6 +92,22 @@ does.
   image periodically, with its own default Docker/kernel/package versions, no
   pin in this repo's control. A hard baseline diff would need updating every
   time GitHub moves it or start failing builds for no real reason. So it just captures the runner image identity (`ImageOS`/`ImageVersion` -- the exact `actions/runner-images` release), OS/kernel, Docker, Python, and Rust versions into the step log and an `environment-fingerprint` artifact on every run -- no dump of every installed package, just the toolchains this repo's own build actually depends on. Rust is captured deliberately, not redundantly with Python's explicit `setup-python` pin: `cargo build --release` (building `tapyrus-setup` for the offline ceremony) runs directly on this runner against whatever toolchain it happens to preinstall, unlike the containerized `tapyrus-signer:integration-test` image, which pins `rust:1.82-bookworm` in its own Dockerfile.
+- **"Collect logs" also captures each container's `docker inspect` state
+  (`container-states.txt`), not just its stdout/stderr.** `docker logs` alone
+  can't show a container got OOM-killed -- a killed process doesn't get a
+  chance to log anything on its way out, confirmed live: two signer
+  containers' logs simply stopped mid-run with no error line (see Lessons
+  learnt). `State.OOMKilled`/`ExitCode`/`FinishedAt` answer that directly,
+  but only exist while the container does -- captured in the same step as
+  the logs themselves, before Teardown's `docker compose down` removes it.
+- **A background "Start system load logger" step writes a timestamped
+  host-level `loadavg`/memory line every 5s for the whole job**
+  (`system-load.log`, folded into the same artifact by "Collect logs"), to
+  correlate against container/CI-step timestamps if something dies with no
+  error of its own -- was the runner under real CPU/memory pressure at that
+  moment, or not. Host-level (`/proc/loadavg`, `free`), not per-container
+  `docker stats` -- simple and enough to answer that question, and both
+  tools are already present on `ubuntu-latest` with no install needed.
 - **`generate_traffic.py` needs `fallbackfee` enabled.** `-fallbackfee` defaults to
   disabled, so `estimatesmartfee` fails with no fee history on a new chain. `render_tapyrus_conf.py` sets `fallbackfee=0.0002`, `dbcache=64`, `maxorphantx=20`, and `mempoolexpiry=2` -- all sized down from mainnet defaults for a small, short-lived CI chain.
 - **`generate_traffic.py`'s round-count-only design**: everything derives from
