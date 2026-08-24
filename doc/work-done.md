@@ -390,6 +390,20 @@ does.
   own fresh `HEIGHT_POLL_TIMEOUT_SECONDS` window regardless of which pass it
   is, and the outer `SETTLE_TIMEOUT_SECONDS` deadline is used only to decide
   whether a given pass should be the final one.
+- **A chaos restart racing a fresh broadcast from that same node can orphan
+  the transaction on the sender alone, even with `_wait_for_sender_sync` in
+  place.** That check only proves the node's chain *tip* caught up with the
+  network -- not that a transaction it broadcast right before dying ever
+  actually left the building, and the node's wallet re-recognizing its own
+  pending transaction after restart (persisted wallet data) doesn't mean it
+  re-announced it to anyone. Fixed by calling `resendwallettransactions` on
+  every `CHAOS_SENDER_GRACE_NODES` sender right after `_wait_for_sender_sync`,
+  on every settle pass -- tapyrus-core's RPC that immediately force-relays a
+  wallet's unconfirmed transactions, documented as "intended only for
+  testing." Its automatic counterpart is deliberately unusable here: only
+  transactions 5+ minutes old, on a random up-to-30-minute interval, "to
+  avoid giving away that these are our own transactions" -- fine for a real
+  wallet, useless inside this script's own timeouts.
 - **`generate_traffic.py`'s `_wait_for_empty_mempool` failed with a mempool
   dump that looked exactly like "one more block would fix it" -- root cause
   was 2 of 3 signers having silently died, leaving the chain completely

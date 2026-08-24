@@ -478,10 +478,12 @@ mechanic). Implemented as `TrafficNode` + `TrafficGenerator`.
   the nodes not yet converged); otherwise it's real and gets reported. A
   change whose sender is in `CHAOS_SENDER_GRACE_NODES` (all 4 of
   `node_orchestrator.py`'s `CHAOS_NODES`) additionally calls
-  `_wait_for_sender_sync` on every pass (waits for that node's own tip to
-  match the network's, height and blockhash, against `core-1a` as reference).
-  Wired into both the setup phase (funding/issuance, via `_settle_pending`)
-  and every round (via `_settle_and_verify`). See `doc/work-done.md` for why.
+  `_wait_for_sender_sync` (waits for that node's own tip to match the
+  network's, height and blockhash) then `_resend_wallet_transactions`
+  (`resendwallettransactions` RPC, forces a fresh re-announce of anything that
+  node still has unconfirmed) on every pass. Wired into both the setup phase
+  (funding/issuance, via `_settle_pending`) and every round (via
+  `_settle_and_verify`). See `doc/work-done.md` for why.
 
 ## `scripts/simulate_reorg.py`
 
