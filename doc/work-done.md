@@ -92,6 +92,22 @@ does.
   image periodically, with its own default Docker/kernel/package versions, no
   pin in this repo's control. A hard baseline diff would need updating every
   time GitHub moves it or start failing builds for no real reason. So it just captures the runner image identity (`ImageOS`/`ImageVersion` -- the exact `actions/runner-images` release), OS/kernel, Docker, Python, and Rust versions into the step log and an `environment-fingerprint` artifact on every run -- no dump of every installed package, just the toolchains this repo's own build actually depends on. Rust is captured deliberately, not redundantly with Python's explicit `setup-python` pin: `cargo build --release` (building `tapyrus-setup` for the offline ceremony) runs directly on this runner against whatever toolchain it happens to preinstall, unlike the containerized `tapyrus-signer:integration-test` image, which pins `rust:1.82-bookworm` in its own Dockerfile.
+- **"Collect logs" also captures each container's `docker inspect` state
+  (`container-states.txt`), not just its stdout/stderr.** `docker logs` alone
+  can't show a container got OOM-killed -- a killed process doesn't get a
+  chance to log anything on its way out, confirmed live: two signer
+  containers' logs simply stopped mid-run with no error line (see Lessons
+  learnt). `State.OOMKilled`/`ExitCode`/`FinishedAt` answer that directly,
+  but only exist while the container does -- captured in the same step as
+  the logs themselves, before Teardown's `docker compose down` removes it.
+- **A background "Start system load logger" step writes a timestamped
+  host-level `loadavg`/memory line every 5s for the whole job**
+  (`system-load.log`, folded into the same artifact by "Collect logs"), to
+  correlate against container/CI-step timestamps if something dies with no
+  error of its own -- was the runner under real CPU/memory pressure at that
+  moment, or not. Host-level (`/proc/loadavg`, `free`), not per-container
+  `docker stats` -- simple and enough to answer that question, and both
+  tools are already present on `ubuntu-latest` with no install needed.
 - **`generate_traffic.py` needs `fallbackfee` enabled.** `-fallbackfee` defaults to
   disabled, so `estimatesmartfee` fails with no fee history on a new chain. `render_tapyrus_conf.py` sets `fallbackfee=0.0002`, `dbcache=64`, `maxorphantx=20`, and `mempoolexpiry=2` -- all sized down from mainnet defaults for a small, short-lived CI chain.
 - **`generate_traffic.py`'s round-count-only design**: everything derives from
@@ -374,6 +390,44 @@ does.
   own fresh `HEIGHT_POLL_TIMEOUT_SECONDS` window regardless of which pass it
   is, and the outer `SETTLE_TIMEOUT_SECONDS` deadline is used only to decide
   whether a given pass should be the final one.
+- **`generate_traffic.py`'s `_wait_for_empty_mempool` failed with a mempool
+  dump that looked exactly like "one more block would fix it" -- root cause
+  was 2 of 3 signers having silently died, leaving the chain completely
+  frozen for the whole wait, not a routing/timing quirk.** Traced through a
+  real CI failure via container logs: `simulate_reorg.py`'s canary
+  transaction (`core-1a -> core-1b`, confirmed only on group A's now-losing
+  fork) correctly reverted to pending on `core-1a`/`1b`/`2a`/`2b` when they
+  reorged onto group B's winning chain -- `core-3a`/`3b`/`core-7` never saw
+  it at all, since they were never on group A's fork and a reorg-restored
+  mempool entry isn't re-relayed to peers the way a fresh broadcast is
+  (confirmed: the original broadcast logged `Relaying wtx`, the reorg-restore
+  re-entry didn't). That part is expected. What wasn't: chain height stayed
+  frozen at the same value for the entire 180s wait -- `docker-signer-0-1.log`
+  and `docker-signer-1-1.log` both end mid-run with `Signer Node was stopped
+  by SIGTERM` and never show a restart, while `docker-signer-2-1.log` alone
+  shows the normal restart sequence. With a 2-of-3 threshold, round signing
+  cannot complete with one signer alive, regardless of which master gets
+  selected -- confirmed against the signer logs: 5 separate round attempts
+  across master indices 0/1/2 in that window, none reaching "Round Success".
+  Root cause: `start_nodes()` (`scripts/lib/compose.py`) only checks that
+  `docker compose up -d` itself exited 0, which proves Docker launched the
+  containers, nothing about whether the process inside stayed up -- no
+  service has a `restart:` policy, so a startup crash (or the runner killing
+  it under resource pressure) just leaves the container silently `Exited`.
+  `simulate_reorg.py`'s `_restore_default_signers` saw success and moved on,
+  with the actual failure only surfacing minutes later in a completely
+  different script. Fixed two ways: `wait_for_running()` added to
+  `scripts/lib/compose.py`, polling `docker compose ps --status running`
+  after `start_nodes()` and raising with the specific service name(s) that
+  never came up -- wired into `_restore_default_signers` specifically, the
+  confirmed failure site, not retrofitted into every `start_nodes` call
+  site. And defense in depth in `generate_traffic.py`: `_wait_for_empty_mempool`
+  no longer fails on a flat `HEIGHT_POLL_TIMEOUT_SECONDS` clock -- it keeps
+  waiting past that as long as chain height is still advancing (real evidence
+  of progress), only raising once height itself has been frozen for
+  `HEIGHT_POLL_TIMEOUT_SECONDS`, bounded overall by `SETTLE_TIMEOUT_SECONDS`.
+  A flat timeout couldn't distinguish "still needs one more round" from
+  "genuinely stuck" -- both produce an identical non-empty-mempool snapshot.
 - **`core-3b`, not just `core-7`, can legitimately see group A's abandoned fork
   after a reorg reconnect.** Two propagation paths matter, not just P2P
   adjacency: a signer submits its own mastered block directly to its RPC

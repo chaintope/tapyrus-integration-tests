@@ -86,7 +86,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.assemble_signer_configs import CoreRpc, Redis, SignerConfigAssembler  # noqa: E402
-from scripts.lib.compose import ComposeError, recreate_fresh, start_nodes, stop_nodes  # noqa: E402
+from scripts.lib.compose import ComposeError, recreate_fresh, start_nodes, stop_nodes, wait_for_running  # noqa: E402
 from scripts.lib.log import log  # noqa: E402
 from scripts.lib.orchestrator_control import pause_node_orchestrators, resume_node_orchestrators  # noqa: E402
 from scripts.lib.rpc import CoreRpcClient, RpcError, RpcUnreachable  # noqa: E402
@@ -406,11 +406,16 @@ class ReorgSimulator:
         would sit in group A's mempools forever, since nothing would be running to
         ever mine it. Confirmed live: this is exactly what made a later
         generate_traffic.py invocation's mempool-emptiness wait hang for its full
-        timeout, no matter how long that timeout was raised to.
+        timeout, no matter how long that timeout was raised to -- traced that time
+        to start_nodes() itself: `docker compose up -d` exiting 0 only means Docker
+        launched the containers, not that tapyrus-signerd stayed up afterward, and
+        2 of 3 signers had silently died seconds later with no restart: policy to
+        recover them and nothing checking. wait_for_running closes that gap here.
         """
         log.step("restoring signers to their default RPC mapping and leaving them running")
         await self._repoint_signers(GROUP_A_RPC_HOSTS)
         await start_nodes(*SIGNERS)
+        await wait_for_running(*SIGNERS)
 
     # -- signer repointing --------------------------------------------------------
 

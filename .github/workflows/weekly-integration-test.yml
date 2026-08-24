@@ -29,7 +29,7 @@ on:
 
       # --- transaction generation (scripts/generate_traffic.py) ---
       tx_round_count:
-        description: 'Round-robin send/check/settle cycles to run (3 block-heights and 14 transactions each); also sets the reorg baseline height (tx_round_count + 2) -- see reorg_length_blocks. Leave blank for the default -- see README.md''s variable table (defaults live in the env: block below, not restated here to avoid drift).'
+        description: 'Round-robin send/settle cycles to run (14 transactions each, then settles over however many blocks it actually takes -- no fixed block-height count); also sets the reorg baseline height (tx_round_count + 2) -- see reorg_length_blocks. Leave blank for the default -- see README.md''s variable table (defaults live in the env: block below, not restated here to avoid drift).'
 
       # --- reorg shape ---
       reorg_length_blocks:
@@ -97,6 +97,29 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+
+      - name: Start system load logger
+        # A timestamped host-level CPU/memory line every 5s, for the whole job --
+        # to correlate against container logs and this same log's own timestamps
+        # if a container dies with no error of its own (see "Collect logs" below
+        # and doc/work-done.md): was the runner under real memory/CPU pressure at
+        # that moment, or not. Host-level, not per-container docker stats --
+        # simple and enough to answer that question; /proc/loadavg and `free` are
+        # both already present on ubuntu-latest, no extra install, and cheap
+        # enough (a few microseconds) that 5s -- close to generate_traffic.py's
+        # own RPC poll cadence (HEIGHT_POLL_INTERVAL_SECONDS=3) -- adds no
+        # measurable overhead to the actual test run, while still catching a
+        # brief spike a coarser interval could step right over. Backgrounded for
+        # the run's duration; stopped and folded into the logs artifact in
+        # "Collect logs".
+        run: |
+          (
+            while true; do
+              echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) loadavg=$(cut -d' ' -f1-3 /proc/loadavg) $(free -m | awk '/^Mem:/ {print "mem="$3"MB/"$2"MB"}')"
+              sleep 5
+            done
+          ) > system-load.log 2>&1 &
+          echo $! > /tmp/system-load-logger.pid
 
       - name: Record runner environment
         # Report only, no enforcement -- runs-on: ubuntu-latest is a floating tag
@@ -231,12 +254,27 @@ jobs:
         run: ./scripts/generate_traffic.py 5
 
       - name: Collect logs
+        # container-states.txt: docker logs alone can't show a container got
+        # OOM-killed -- a killed process doesn't get a chance to log anything on
+        # its way out (confirmed live: two signer containers' logs just stopped
+        # cold, no error line, see doc/work-done.md). docker inspect's
+        # State.OOMKilled/ExitCode/FinishedAt answer that directly, but only while
+        # the container still exists -- captured here, before Teardown's
+        # `docker compose down` removes it.
         if: always()
         run: |
           mkdir -p logs
+          if [ -f /tmp/system-load-logger.pid ]; then
+            kill "$(cat /tmp/system-load-logger.pid)" 2>/dev/null || true
+          fi
+          mv system-load.log logs/system-load.log 2>/dev/null || true
           cd docker
+          : > ../logs/container-states.txt
           for c in $(docker compose ps -a --format '{{.Name}}'); do
             docker logs "$c" > "../logs/$c.log" 2>&1 || true
+            docker inspect --format \
+              '{{.Name}} status={{.State.Status}} exitCode={{.State.ExitCode}} oomKilled={{.State.OOMKilled}} startedAt={{.State.StartedAt}} finishedAt={{.State.FinishedAt}}' \
+              "$c" >> ../logs/container-states.txt 2>&1 || true
           done
       - name: Upload logs
         if: always()

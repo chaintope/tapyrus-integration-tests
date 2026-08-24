@@ -16,9 +16,11 @@ Usage:
     await start_nodes(*SIGNERS)
     await bring_up("signer-b-1", "signer-b-2")     # services with no container yet
     await recreate_fresh("redis")                  # force a genuinely fresh instance
+    await wait_for_running(*SIGNERS)                # confirm they're still up, not just that `up` exited 0
 """
 import asyncio
 import subprocess
+import time
 from pathlib import Path
 
 from scripts.lib.log import log
@@ -80,3 +82,41 @@ async def recreate_fresh(*service_names):
     should stay safe by default if it's ever pointed at a service that has one.
     """
     await compose("up", "-d", "--force-recreate", "--no-deps", *service_names)
+
+
+async def wait_for_running(*service_names, timeout_seconds=30, poll_interval_seconds=2):
+    """Confirms every one of these already-started services is still actually
+    running -- `docker compose up -d` exiting 0 (compose()'s only success check)
+    means Docker successfully launched the containers, nothing more; it says
+    nothing about whether the process inside stayed alive afterward. No service in
+    docker-compose.yml has a `restart:` policy, so a startup crash (a transient
+    dependency race, or the runner itself killing it under resource pressure) just
+    leaves the container Exited, silently, with `up` having already reported
+    success. Confirmed live: simulate_reorg.py's _restore_default_signers saw
+    exactly this -- 2 of 3 signers died seconds after "starting", undetected, and
+    the first sign of trouble was a completely different script (generate_traffic.py)
+    hanging its full mempool-wait timeout minutes later with no diagnostic pointing
+    back here. See doc/work-done.md.
+
+    Deliberately a liveness check only (container still running), not a deeper
+    health check (e.g. confirming round-signing is actually progressing) -- this
+    repo has no compose-level healthchecks yet (see doc/work-done.md's Known
+    issues), and liveness is what the confirmed failure needed."""
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        process = await asyncio.create_subprocess_exec(
+            "docker", "compose", "ps", "--status", "running", "--format", "{{.Service}}", *service_names,
+            cwd=str(DOCKER_DIR), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await process.communicate()
+        if process.returncode != 0:
+            raise ComposeError(str(subprocess.CalledProcessError(
+                process.returncode, ("docker", "compose", "ps", *service_names), stdout, stderr
+            )))
+        running = set(stdout.decode().split())
+        missing = [name for name in service_names if name not in running]
+        if not missing:
+            return
+        if time.monotonic() >= deadline:
+            raise ComposeError(f"{missing} never reached (or fell out of) a running state within {timeout_seconds}s")
+        await asyncio.sleep(poll_interval_seconds)
