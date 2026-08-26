@@ -30,13 +30,16 @@ PendingChange instead of touching self._ledger directly; _resolve_pending_change
 applies it only once every one of its txids has confirmed on-chain, and drops it --
 not counted as a successful round action either -- once the settle loop's own timeout
 is reached with it still unconfirmed. A change whose sender is one of
-CHAOS_SENDER_GRACE_NODES gets one extra safeguard on every settle pass:
+CHAOS_SENDER_GRACE_NODES gets two extra safeguards on every settle pass:
 _wait_for_sender_sync first -- that node's own restart can wipe its in-memory
 mempool for a not-yet-confirmed self-broadcast transaction, hiding it from
 gettransaction on that exact node even though it already confirmed on the network
 via another node's mempool copy, so this waits for objective proof the node caught
 back up (its own tip matches the network's, height AND blockhash) before trusting
-anything it reports.
+anything it reports -- then _resend_wallet_transactions, forcing a fresh
+re-announce of anything that node still has unconfirmed, since a restart racing
+that node's own broadcast can cut the relay off before it ever reaches a peer in
+the first place.
 
 Usage:
     ./scripts/generate_traffic.py <round-count>
@@ -721,9 +724,32 @@ class TrafficGenerator:
         if chaos_pending:
             senders = {change.node.name: change.node for change in chaos_pending}
             await asyncio.gather(*(self._wait_for_sender_sync(node) for node in senders.values()))
+            await asyncio.gather(*(self._resend_wallet_transactions(node) for node in senders.values()))
 
         still_pending = await self._resolve_pending_changes(pending, height, final=final, count_success=count_success)
         return height, still_pending
+
+    async def _resend_wallet_transactions(self, node):
+        """Explicitly re-announces `node`'s own still-unconfirmed transactions to
+        its current peers (resendwallettransactions), not tapyrus-core's automatic
+        periodic rebroadcast -- that one only fires for transactions 5+ minutes old
+        and on a random up-to-30-minute cadence, deliberately, "to avoid giving
+        away that these are our own transactions" (src/wallet/wallet.cpp), which
+        makes it useless inside this script's own timeouts. A chaos restart landing
+        in the same instant as a fresh broadcast from that same node can cut the
+        relay off before it reaches any peer -- the node's own wallet still knows
+        about the transaction once it's back (persisted), but nothing else on the
+        network will unless it's re-announced. _wait_for_sender_sync alone only
+        proves the node's chain tip caught up with the network, not that a
+        transaction it broadcast right before dying ever actually left the
+        building. Best-effort -- RpcError here (e.g. -walletbroadcast disabled,
+        though nothing in this repo sets that) shouldn't abort the settle pass
+        over what's meant as a freebie on top of _wait_for_sender_sync. See
+        doc/work-done.md."""
+        try:
+            await self._call_with_retry(node, "resendwallettransactions")
+        except RpcError:
+            pass
 
     async def _settle_pending(self, pending, count_success=True):
         """Funding/issuance's confirm-only loop -- no ledger-vs-real-balance check
