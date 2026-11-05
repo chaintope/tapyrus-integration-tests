@@ -24,12 +24,18 @@ implemented vs. still outstanding.
 
 The workflow (`weekly-integration-test.yml`) has two trigger shapes:
 
-- **`schedule`** (Sunday 03:00 UTC / Sunday 12:00 noon JST) and **`workflow_dispatch`**
-  (on demand) run the full-scale scenario -- the defaults in the variable table below.
+- **`workflow_call`** from `chaintope/tapyrus-core`'s weekly schedule (Sunday 12:17 UTC /
+  Sunday 21:17 JST) and **`workflow_dispatch`** (on demand) run the full-scale scenario
+  -- the defaults in the variable table below.
 - **`pull_request`** and **`push`** to `main` (path-filtered to `scripts/**`,
   `docker/**`, `config/**`, `.github/workflows/**`) run the same job at a smaller
   "smoke" scale, so a change to this repo's own scripts/compose/workflow is validated
   before the following Sunday's run rather than after. See `doc/work-done.md` for why.
+
+A called run's scale follows the caller's event, and the caller's job only runs on its
+schedule. The run appears in the caller's Actions tab, and the variable table's defaults
+apply. The caller must use `@main`, because a called run always gets the default branch's
+scripts. The job is skipped in every other repo, including forks of this one.
 
 A single `integration-test` job runs these steps in order:
 
@@ -38,7 +44,8 @@ A single `integration-test` job runs these steps in order:
    configurable, see below.
 2. **Build Docker images** for `tapyrus-core`, `tapyrus-signer`, and `tapyrus-seeder`
    from the checkouts.
-3. **Offline ceremony for signer-set-a**: build the `tapyrus-setup` binary, then run
+3. **Offline ceremony for signer-set-a**: copy the `tapyrus-setup` binary out of the
+   signer image, then run
    `scripts/generate_dev_secrets.py` to produce the aggregated public key (no containers
    involved yet).
 4. **Genesis signing**: build the unsigned genesis via `tapyrus-genesis`, then sign it
@@ -94,10 +101,10 @@ untested or unbuilt.
 ## Variables available to change during a run
 
 Every variable below is a `workflow_dispatch` input. `workflow_dispatch` input
-`default:` fields can't hold an expression, and `schedule`/`pull_request`/`push` runs
-have no `inputs` context to read one from anyway, so no default is set on the inputs
+`default:` fields can't hold an expression, and `workflow_call`/`pull_request`/`push` runs
+have no inputs to read one from anyway, so no default is set on the inputs
 themselves. Two different mechanisms supply one when a field is left blank (a manual
-dispatch run that leaves a field blank gets the same value schedule does either way):
+dispatch run that leaves a field blank gets the same value a called run does either way):
 
 - `core_repo_url`/`core_repo_ref`, `signer_repo_url`/`signer_repo_ref`,
   `seeder_repo_url`/`seeder_repo_ref` fall back to [`config/repos.py`](config/repos.py)'s
@@ -128,7 +135,6 @@ input; the rest fall back straight to their `env:` literal on every trigger,
 | `reorg_length_blocks` | `30` (`5` on pull_request/push) | Blocks each isolated group builds past the baseline, alone, before reconnecting at the tie (`scripts/simulate_reorg.py`: group B builds first while group A is stopped entirely, then group A builds its own, genuinely different set while group B is stopped). Group B is then always extended by exactly 2 more blocks to win (not 1 -- `core-3a` produced group A's original tip itself, so it needs a second block to reclassify that tip as `valid-fork` instead of `valid-headers`) -- not configurable, and not probed for -- see `doc/scripts.md` |
 | `round_duration_seconds` | `30` | `tapyrus-signerd` round-duration (block interval) -- verified clean, see `doc/work-done.md`'s Lessons learnt (`10` is confirmed to hit transient `InvalidBlock` errors) |
 | `network_id` | `1905960821` | Tapyrus network id (prod mode, see `doc/work-done.md`), used by every core-* node's rendered `tapyrus.conf` and the `genesis.<id>` file `tapyrusd` looks for |
-| `docker_build_platform` | *(empty, runner-native)* | Docker `--platform` for image builds -- local verification only ever used `linux/arm64` |
 
 `FEDERATION_CHANGE_OFFSET_BLOCKS` is always `REORG_LENGTH_BLOCKS` (computed by the "Derive
 FEDERATION_CHANGE_OFFSET_BLOCKS from REORG_LENGTH_BLOCKS" workflow step), and `MAX_BLOCK_SIZE_OFFSET_BLOCKS`

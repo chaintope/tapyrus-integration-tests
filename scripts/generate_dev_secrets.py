@@ -23,7 +23,8 @@ doc/weekly-integration-test-plan.md section 3a's --xfield signing flow):
     ./scripts/generate_dev_secrets.py signer-set-b 3 2
 
 tapyrus-setup-bin defaults to workdir/tapyrus-signer/target/release/tapyrus-setup
-(i.e. built via checkout_repos.py + `cargo build --release` there first).
+(i.e. built via checkout_repos.py + `cargo build --release` there first; see
+doc/work-done.md's Lessons learnt for GCC 15 or newer and macOS).
 
 Output layout (all under ./secrets/, which is gitignored -- nothing here is ever
 meant to be committed):
@@ -169,7 +170,8 @@ def parse_args():
 TAPYRUS_SETUP_BUILD_HINT = (
     "Build it first, e.g.:\n"
     "  ./scripts/checkout_repos.py   # if not already checked out\n"
-    "  cd workdir/tapyrus-signer && cargo build --release"
+    "  cd workdir/tapyrus-signer && cargo build --release\n"
+    "With GCC 15 or newer, or on macOS, see doc/work-done.md's Lessons learnt first."
 )
 
 

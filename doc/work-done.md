@@ -91,7 +91,7 @@ does.
   `runs-on: ubuntu-latest` is a floating tag -- GitHub repoints it to a new
   image periodically, with its own default Docker/kernel/package versions, no
   pin in this repo's control. A hard baseline diff would need updating every
-  time GitHub moves it or start failing builds for no real reason. So it just captures the runner image identity (`ImageOS`/`ImageVersion` -- the exact `actions/runner-images` release), OS/kernel, Docker, Python, and Rust versions into the step log and an `environment-fingerprint` artifact on every run -- no dump of every installed package, just the toolchains this repo's own build actually depends on. Rust is captured deliberately, not redundantly with Python's explicit `setup-python` pin: `cargo build --release` (building `tapyrus-setup` for the offline ceremony) runs directly on this runner against whatever toolchain it happens to preinstall, unlike the containerized `tapyrus-signer:integration-test` image, which pins `rust:1.82-bookworm` in its own Dockerfile.
+  time GitHub moves it or start failing builds for no real reason. So it just captures the runner image identity (`ImageOS`/`ImageVersion` -- the exact `actions/runner-images` release), OS/kernel, Docker, and Python versions into the step log and an `environment-fingerprint` artifact on every run -- no dump of every installed package, just the tools this job runs on the runner. No Rust or C compiler is recorded because nothing compiles on the runner: `tapyrus-setup` is copied out of the `tapyrus-signer:integration-test` image, which pins `rust:1.82-bookworm` in its own Dockerfile.
 - **"Collect logs" also captures each container's `docker inspect` state
   (`container-states.txt`), not just its stdout/stderr.** `docker logs` alone
   can't show a container got OOM-killed -- a killed process doesn't get a
@@ -178,7 +178,7 @@ does.
   while still raising `RpcError` for any other RPC error.
 - **`workflow_dispatch` inputs have no `default:`.**
   `workflow_dispatch.inputs.*.default` can't hold an expression, and
-  `schedule`/`pull_request`/`push` have no `inputs` context at all -- so every
+  `workflow_call`/`pull_request`/`push` have no inputs at all -- so every
   default lives in the `env:` block's `inputs.x || 'literal'` fallback instead.
 - **`pull_request`/`push` smoke trigger** validates changes to `scripts/**`,
   `docker/**`, `config/**`, or the workflow itself before merge, at reduced scale
@@ -457,6 +457,15 @@ does.
 - **Building `tapyrus-signer` outside Docker on macOS** also needs
   `brew install gmp` + `LIBRARY_PATH=/opt/homebrew/lib`, for the linker to find
   the system `libgmp`.
+- **Building `tapyrus-signer` outside Docker with GCC 15 or newer** fails in the
+  GMP bundled by `gmp-mpfr-sys`, whose configure checks don't pass under GCC's
+  `gnu23` default. Build with `CFLAGS="-O2 -std=gnu17" cargo build --release`.
+  Keep the `-O2`: once `CFLAGS` is set, GMP's configure uses it as given, so
+  without it GMP is silently unoptimised. `CFLAGS` also reaches every other C
+  dependency in the build, such as `secp256k1-sys`, and its `-O2` overrides the
+  `-O3` they would otherwise get in release builds. The workaround can go once
+  `gmp-mpfr-sys` bundles a GMP that builds under C23. CI isn't affected, because
+  it copies `tapyrus-setup` out of the signer image.
 - **How `tapyrus-seeder` discovers nodes** (`scripts/verify_seeder.py`):
   1. DNS-seed crawling is a direct per-address liveness test (VERSION/VERACK +
      `getaddr`), not gossip.

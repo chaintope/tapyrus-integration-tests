@@ -66,7 +66,7 @@ see the root `README.md`'s variable table (`core_repo_ref` / `signer_repo_ref` /
 default)` when constructed: if the CI workflow has already exported the variable (via
 its job-level `env:` block, itself driven by the matching `workflow_dispatch` input),
 that value wins; otherwise the default here applies -- so this file's defaults are
-also what a schedule-triggered run (no `inputs` context) and any local/manual
+also what a run called from tapyrus-core (no inputs) and any local/manual
 invocation fall back to.
 
 - `SIGNER_REPO_URL` / `SIGNER_REPO_REF` -- default
@@ -114,7 +114,8 @@ step's output (e.g. `aggregate` needs every signer's `createnodevss` result firs
 - **Usage**: `./scripts/generate_dev_secrets.py <set-name> <node-count> <threshold> [tapyrus-setup-bin]`
 - **Example**: `./scripts/generate_dev_secrets.py signer-set-a 3 2`
 - `tapyrus-setup-bin` defaults to `workdir/tapyrus-signer/target/release/tapyrus-setup`
-  (build it first with `cd workdir/tapyrus-signer && cargo build --release`).
+  (build it first with `cd workdir/tapyrus-signer && cargo build --release`; with GCC 15
+  or newer, see the `CFLAGS` workaround in `doc/work-done.md`).
 - **Guards**: refuses to run if `threshold > node-count`, if the binary isn't
   found/executable (prints the build instructions), or if `secrets/<set-name>/` already
   has generated keys (remove the directory first to regenerate).

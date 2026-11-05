@@ -81,7 +81,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.assemble_signer_configs import CoreRpc, Redis, SignerConfigAssembler  # noqa: E402
-from scripts.generate_dev_secrets import AggpubkeyCeremony, default_tapyrus_setup_bin  # noqa: E402
+from scripts.generate_dev_secrets import TAPYRUS_SETUP_BUILD_HINT, AggpubkeyCeremony, default_tapyrus_setup_bin  # noqa: E402
 from scripts.lib.ceremony import CeremonyError, TapyrusSetupCeremony, extract_vss_for, require_executable  # noqa: E402
 from scripts.lib.compose import ComposeError, bring_up  # noqa: E402
 from scripts.lib.log import log  # noqa: E402
@@ -98,9 +98,7 @@ REDIS_HOST = "redis"
 REDIS_PORT = "6379"
 HEIGHT_POLL_INTERVAL_SECONDS = 5
 # Same liveness-timeout approach as simulate_reorg.py's _wait_for_height (see that
-# script for the full rationale) -- duplicated rather than shared, matching this
-# repo's existing per-script self-containment (each ceremony script already has its
-# own default_tapyrus_setup_bin/TAPYRUS_SETUP_BUILD_HINT, etc.).
+# script for the full rationale) -- duplicated rather than shared.
 STALL_TIMEOUT_ROUND_MULTIPLIER = 4
 MIN_STALL_TIMEOUT_SECONDS = 180
 
@@ -399,10 +397,7 @@ class FederationChangeSimulator:
             f"generating signer-set-b's aggpubkey ({SIGNER_COUNT} signers, threshold {SIGNER_THRESHOLD}, "
             f"node-{REUSE_NODE_INDEX} shared with signer-set-a)"
         )
-        require_executable(
-            self._tapyrus_setup_bin,
-            "Build it first: ./scripts/checkout_repos.py && cd workdir/tapyrus-signer && cargo build --release",
-        )
+        require_executable(self._tapyrus_setup_bin, TAPYRUS_SETUP_BUILD_HINT)
         set_dir = self._set_dir(SIGNER_SET_B)
         if (set_dir / "pubkeys.txt").exists():
             raise CeremonyError(f"{set_dir} already has generated keys -- remove it first to regenerate")

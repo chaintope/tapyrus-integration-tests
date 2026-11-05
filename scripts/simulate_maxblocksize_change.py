@@ -47,7 +47,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.generate_dev_secrets import default_tapyrus_setup_bin  # noqa: E402
+from scripts.generate_dev_secrets import TAPYRUS_SETUP_BUILD_HINT, default_tapyrus_setup_bin  # noqa: E402
 from scripts.lib.ceremony import CeremonyError, extract_vss_for, require_executable  # noqa: E402
 from scripts.lib.log import log  # noqa: E402
 from scripts.lib.orchestrator_control import pause_node_orchestrators, resume_node_orchestrators  # noqa: E402
@@ -272,10 +272,7 @@ async def main():
     height_offset = int(os.environ.get("MAX_BLOCK_SIZE_OFFSET_BLOCKS", "10"))
     new_max_block_size = int(os.environ.get("MAX_BLOCK_SIZE_NEW", "2000000"))
 
-    require_executable(
-        default_tapyrus_setup_bin(),
-        "Build it first: ./scripts/checkout_repos.py && cd workdir/tapyrus-signer && cargo build --release",
-    )
+    require_executable(default_tapyrus_setup_bin(), TAPYRUS_SETUP_BUILD_HINT)
     log.step(f"simulating a max-block-size change: {new_max_block_size} takes effect {height_offset} block(s) from now")
     simulator = MaxBlockSizeChangeSimulator(round_duration, height_offset, new_max_block_size)
     await simulator.run()
